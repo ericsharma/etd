@@ -210,7 +210,15 @@ async fn bells_run_the_notify_command() {
     env.insert("MM_CONFIG_DIR".into(), node.config().display().to_string());
     env.insert("XDG_STATE_HOME".into(), node.dir.path().join("state").display().to_string());
     let command = format!("echo \"$ETD_KIND|$ETD_SESSION|$ETD_BODY\" >> '{}'", notes.display());
-    let follower = tokio::spawn(etd::events::follow(env.clone(), command));
+    // A machine alone in its network: its own session's bell is pushed here.
+    let files = tempfile::tempdir().unwrap();
+    let paths = Paths::at(files.path().into());
+    let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+    etd::network::ensure(&paths, endpoint.id(), "hub").unwrap();
+    let state = server::State::new(paths, env.clone());
+    state.set_notify_command(command);
+    let _router = server::serve(endpoint, state.clone());
+    let follower = tokio::spawn(etd::events::follow(state));
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // Nobody attached: the bell is worth a note.

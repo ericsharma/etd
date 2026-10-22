@@ -60,6 +60,11 @@ pub async fn check_host(env: &Env, host: &str) -> anyhow::Result<()> {
     }
 }
 
+/// `mm` is on the login environment's PATH.
+pub fn available(env: &Env) -> bool {
+    env.get("PATH").is_some_and(|path| std::env::split_paths(path).any(|d| d.join("mm").is_file()))
+}
+
 pub fn agent_local(env: &Env) -> Command {
     let mut cmd = command(env, "mm");
     cmd.arg("agent");

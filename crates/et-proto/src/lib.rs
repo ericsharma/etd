@@ -58,6 +58,23 @@ pub enum Request {
     NetworkUpdate { network: network::Signed },
     /// An invite link for a new member of `kind` (any member).
     Invite { kind: network::Kind },
+    /// A session on the sending machine wants someone (machines only). A
+    /// machine with a push command runs it; others ignore it.
+    Notify { note: Note },
+    /// The app is open until `until` (Unix seconds): no pushes until then
+    /// (devices only). The app sends it every 20 s while open.
+    Foreground { until: u64 },
+}
+
+/// What a push says. `machine` is the network's name for the machine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Note {
+    /// `bell`, `notify` or `exit`.
+    pub kind: String,
+    pub machine: String,
+    pub session: String,
+    pub title: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

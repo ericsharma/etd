@@ -44,14 +44,52 @@ pub struct State {
     live: Mutex<HashMap<EndpointId, (String, Vec<Connection>)>>,
     /// Recent `Pair`/`Join` tries, per device.
     tries: Mutex<HashMap<EndpointId, Vec<Instant>>>,
+    /// The push command (`$ETD_NOTIFY_COMMAND`), if this machine sends pushes.
+    notify: OnceLock<String>,
+    /// Until when (Unix seconds) each device said the app is open.
+    foreground: Mutex<HashMap<EndpointId, u64>>,
 }
+
+/// The longest a single `Foreground` holds pushes back.
+const FOREGROUND_MAX: u64 = 120;
 
 impl State {
     pub fn new(paths: Paths, env: Env) -> Arc<Self> {
-        Arc::new(Self { paths, env, endpoint: OnceLock::new(), live: Mutex::default(), tries: Mutex::default() })
+        Arc::new(Self {
+            paths,
+            env,
+            endpoint: OnceLock::new(),
+            live: Mutex::default(),
+            tries: Mutex::default(),
+            notify: OnceLock::new(),
+            foreground: Mutex::default(),
+        })
     }
 
-    fn endpoint(&self) -> &Endpoint {
+    /// This machine sends pushes with `command`.
+    pub fn set_notify_command(&self, command: String) {
+        let _ = self.notify.set(command);
+    }
+
+    pub(crate) fn notify_command(&self) -> Option<&str> {
+        self.notify.get().map(String::as_str)
+    }
+
+    /// A device said the app is open, and that time has not passed.
+    pub(crate) fn app_open(&self) -> bool {
+        let now = config::now_secs();
+        self.foreground.lock().unwrap().values().any(|until| *until > now)
+    }
+
+    pub(crate) fn paths(&self) -> &Paths {
+        &self.paths
+    }
+
+    pub(crate) fn env(&self) -> &Env {
+        &self.env
+    }
+
+    pub(crate) fn endpoint(&self) -> &Endpoint {
         self.endpoint.get().expect("set by serve")
     }
 
@@ -127,12 +165,18 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
     let signed = network::ensure(&paths, endpoint.id(), &tmux::host_name())?;
     info!("network {}: {} member(s)", signed.network.name, signed.network.members().count());
     let state_paths = paths.clone();
-    // Notifications for manymux sessions (see events.rs).
-    if let Some(command) = std::env::var("ETD_NOTIFY_COMMAND").ok().filter(|c| !c.trim().is_empty()) {
-        tokio::spawn(events::follow(env.clone(), command));
-    }
+    let has_mm = mm::available(&env);
     let state = State::new(paths, env);
+    if let Some(command) = std::env::var("ETD_NOTIFY_COMMAND").ok().filter(|c| !c.trim().is_empty()) {
+        state.set_notify_command(command);
+    }
     let router = serve(endpoint.clone(), state.clone());
+    // Pushes for manymux sessions (events.rs): follow this machine's node.
+    if has_mm {
+        tokio::spawn(events::follow(state.clone()));
+    } else {
+        info!("no manymux (mm) here: no pushes for manymux sessions from this machine");
+    }
     let status_path = state.paths.status();
     let watcher = tokio::spawn(watch(endpoint.clone(), state, tmux_text));
     // etd-ssh (manymux's MM_SSH) reaches the other machines through this.
@@ -392,6 +436,17 @@ async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: Sen
             }
             Err(e) => Response::Error(format!("{e:#}")),
         },
+        Request::Notify { .. } if kind != Kind::Machine => Response::Error("only machines send notes".into()),
+        Request::Notify { note } => {
+            debug!("note from {}: {} {}/{}", peer.fmt_short(), note.kind, note.machine, note.session);
+            events::deliver(state, &note).await;
+            Response::Pong
+        }
+        Request::Foreground { until } => {
+            let until = until.min(config::now_secs() + FOREGROUND_MAX);
+            state.foreground.lock().unwrap().insert(peer, until);
+            Response::Pong
+        }
         Request::Invite { kind } => {
             match pair::invite_url(&state.paths, &state.endpoint().addr(), &tmux::host_name(), kind) {
                 Ok(url) => Response::Invitation { url },
