@@ -1,0 +1,12 @@
+[package]
+name = "et-proto"
+description = "Wire types and framing for et/1, the E.T. ↔ etd protocol over iroh."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+iroh.workspace = true
+postcard.workspace = true
+serde.workspace = true
+anyhow.workspace = true

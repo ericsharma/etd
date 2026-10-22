@@ -1,0 +1,18 @@
+[package]
+name = "etd"
+description = "Reach tmux on this machine from E.T. over iroh."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+et-proto = { path = "../et-proto" }
+iroh.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json = "1"
+dirs = "6"
+libc = "0.2"

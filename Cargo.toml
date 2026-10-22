@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/et-proto", "crates/etd"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+iroh = { version = "1.4", default-features = false, features = ["tls-ring"] }
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "time", "sync", "signal"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
