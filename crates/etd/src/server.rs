@@ -1,6 +1,7 @@
 //! The iroh side: pair devices, accept paired devices, serve et/1 streams.
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,9 @@ const PAIR_WINDOW: Duration = Duration::from_secs(60);
 /// How often the network document goes to the other machines even when
 /// nothing changed here (one that was down catches up).
 const RESEND_EVERY: u32 = 150; // × WATCH_EVERY = 5 minutes
+/// After a send to some machine failed: try again this soon, then twice as
+/// long each time, up to `RESEND_EVERY`.
+const RETRY_FIRST: u32 = 5; // × WATCH_EVERY = 10 seconds
 
 #[derive(Debug)]
 pub struct State {
@@ -219,7 +223,16 @@ pub async fn watch(endpoint: Endpoint, state: Arc<State>, tmux: String) {
     // manymux's machine list follows the network only when asked: until a
     // user's machines are in the network, that list may hold ssh names.
     let manage_mm_hosts = std::env::var("ETD_MANYMUX_HOSTS").is_ok_and(|v| v == "1");
+    // A machine that missed the document (down, or restarting for a join)
+    // gets it again soon, not only at the 5-minute resend.
+    let failed = Arc::new(AtomicBool::new(false));
+    let mut retry_at: Option<u32> = None;
+    let mut backoff = RETRY_FIRST;
     loop {
+        if failed.swap(false, Ordering::Relaxed) {
+            retry_at = Some(ticks.wrapping_add(backoff));
+            backoff = (backoff * 2).min(RESEND_EVERY);
+        }
         match network::load(&state.paths) {
             Ok(Some(signed)) => {
                 state.apply_revokes(&signed.network);
@@ -233,10 +246,19 @@ pub async fn watch(endpoint: Endpoint, state: Arc<State>, tmux: String) {
                         _ => {}
                     }
                 }
-                if sent.as_ref() != Some(&signed) || ticks.is_multiple_of(RESEND_EVERY) {
-                    let endpoint = endpoint.clone();
-                    let doc = signed.clone();
-                    tokio::spawn(async move { network::push(&endpoint, &doc).await });
+                let changed = sent.as_ref() != Some(&signed);
+                let retry_due = retry_at == Some(ticks);
+                if changed || retry_due || ticks.is_multiple_of(RESEND_EVERY) {
+                    if changed {
+                        backoff = RETRY_FIRST;
+                    }
+                    retry_at = None;
+                    let (endpoint, doc, failed) = (endpoint.clone(), signed.clone(), failed.clone());
+                    tokio::spawn(async move {
+                        if !network::push(&endpoint, &doc).await {
+                            failed.store(true, Ordering::Relaxed);
+                        }
+                    });
                     sent = Some(signed);
                 }
             }

@@ -217,7 +217,8 @@ pub async fn join(endpoint: &Endpoint, paths: &Paths, url: &str, name: &str) -> 
 
 /// Sends `signed` to every other machine of the network. Errors are logged:
 /// a machine that is down gets it on its next contact.
-pub async fn push(endpoint: &Endpoint, signed: &Signed) {
+/// True if every machine got it.
+pub async fn push(endpoint: &Endpoint, signed: &Signed) -> bool {
     let me = endpoint.id();
     let mut tasks = tokio::task::JoinSet::new();
     for id in signed.network.machines().map(|m| m.id).filter(|id| *id != me) {
@@ -225,12 +226,18 @@ pub async fn push(endpoint: &Endpoint, signed: &Signed) {
         let signed = signed.clone();
         tasks.spawn(async move {
             match push_one(&endpoint, id, signed).await {
-                Ok(()) => debug!("network sent to {}", id.fmt_short()),
-                Err(e) => warn!("network not sent to {}: {e:#}", id.fmt_short()),
+                Ok(()) => {
+                    debug!("network sent to {}", id.fmt_short());
+                    true
+                }
+                Err(e) => {
+                    warn!("network not sent to {}: {e:#}", id.fmt_short());
+                    false
+                }
             }
         });
     }
-    tasks.join_all().await;
+    tasks.join_all().await.into_iter().all(|sent| sent)
 }
 
 async fn push_one(endpoint: &Endpoint, id: EndpointId, signed: Signed) -> anyhow::Result<()> {
