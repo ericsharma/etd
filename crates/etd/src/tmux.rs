@@ -21,7 +21,7 @@ const ENV_MARKER: &str = "__ETD_ENV__";
 /// The login shell's environment, else this process's own.
 pub async fn login_env() -> Env {
     let own: Env = std::env::vars().collect();
-    let shell = own.get("SHELL").cloned().unwrap_or_else(|| "/bin/sh".into());
+    let shell = own.get("SHELL").cloned().or_else(passwd_shell).unwrap_or_else(|| "/bin/sh".into());
     // The marker skips anything a profile prints before `env` runs.
     let script = format!("printf '\\n{ENV_MARKER}\\n'; env -0");
     let run = Command::new(&shell).args(["-l", "-c", &script]).stdin(Stdio::null()).stderr(Stdio::null()).output();
@@ -44,6 +44,20 @@ pub async fn login_env() -> Env {
     let Some((_, vars)) = text.split_once(&format!("\n{ENV_MARKER}\n")) else { return own };
     let env: Env = vars.split('\0').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.into(), v.into())).collect();
     if env.contains_key("PATH") { env } else { own }
+}
+
+/// The login shell from the user database. Service managers (launchd) may
+/// start etd without `$SHELL`.
+fn passwd_shell() -> Option<String> {
+    // SAFETY: getpwuid returns null or a pointer to static storage, read at once.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_shell.is_null() {
+            return None;
+        }
+        let shell = std::ffi::CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned();
+        (!shell.is_empty()).then_some(shell)
+    }
 }
 
 fn uid() -> u32 {

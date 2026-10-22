@@ -3,4 +3,5 @@ pub mod config;
 pub mod ops;
 pub mod pair;
 pub mod server;
+pub mod service;
 pub mod tmux;

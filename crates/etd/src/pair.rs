@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use et_proto::Ticket;
-use iroh::EndpointAddr;
+use iroh::{EndpointAddr, TransportAddr};
 use qrcode::render::unicode::Dense1x2;
 use qrcode::QrCode;
 use sha2::{Digest, Sha256};
@@ -51,6 +51,24 @@ fn remove_expired(paths: &Paths) {
             let _ = fs::remove_file(entry.path());
         }
     }
+}
+
+/// Makes a ticket for `addr` and prints it: a QR code with instructions, or
+/// only the link.
+pub fn print(paths: &Paths, addr: &EndpointAddr, host_name: &str, url_only: bool) -> anyhow::Result<()> {
+    // Only the relay: direct addresses (bridges, VPNs) make the QR code too
+    // big, and hole punching finds the direct path after the first connect.
+    let addr = EndpointAddr::new(addr.id).with_addrs(addr.relay_urls().cloned().map(TransportAddr::Relay));
+    let url = create(paths, addr, host_name.to_string())?.to_url()?;
+    if url_only {
+        println!("{url}");
+    } else {
+        println!("{}", qr(&url)?);
+        println!("Scan with the iPhone camera to add {host_name} to E.T.");
+        println!("Valid for {} minutes, for one device.\n", TTL.as_secs() / 60);
+        println!("Or paste this link in E.T.:\n{url}\n");
+    }
+    Ok(())
 }
 
 /// The QR code as terminal text (two rows of modules per line).

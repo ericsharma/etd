@@ -93,7 +93,8 @@ impl State {
 }
 
 /// Binds the endpoint and serves until SIGINT or SIGTERM.
-pub async fn run(paths: Paths, key: SecretKey) -> anyhow::Result<()> {
+/// `show_pairing`: print a pairing QR code once online (a first run by hand).
+pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Result<()> {
     let env = tmux::login_env().await;
     let tmux_text = match tmux::find(&env).await {
         TmuxStatus::Found(t) => format!("{} ({}), TMUX_TMPDIR={}", t.path, t.version, t.tmpdir.as_deref().unwrap_or("default")),
@@ -111,6 +112,7 @@ pub async fn run(paths: Paths, key: SecretKey) -> anyhow::Result<()> {
         .bind()
         .await?;
     info!("endpoint id: {}", endpoint.id());
+    let state_paths = paths.clone();
     let state = State::new(paths, env);
     let router = serve(endpoint.clone(), state.clone());
     let status_path = state.paths.status();
@@ -119,6 +121,11 @@ pub async fn run(paths: Paths, key: SecretKey) -> anyhow::Result<()> {
         warn!("no relay after {ONLINE_TIMEOUT:?}; direct connections only until it comes up");
     }
     info!("online; run `etd pair` to add a device");
+    if show_pairing {
+        if let Err(e) = pair::print(&state_paths, &endpoint.addr(), &tmux::host_name(), false) {
+            warn!("pairing code: {e:#}");
+        }
+    }
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {

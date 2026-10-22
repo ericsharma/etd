@@ -1,12 +1,16 @@
+use std::io::IsTerminal;
+
 use anyhow::{bail, Context};
 use etd::config::{self, Paths};
-use etd::{pair, server};
+use etd::{pair, server, service};
 use iroh::EndpointId;
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "\
 usage:
-  etd                     run the daemon
+  etd                     run the daemon (shows a QR code if no device is paired yet)
+  etd install             run etd as a user service (systemd or launchd) and start it
+  etd uninstall           stop and remove the user service
   etd pair [--url]        show a QR code that adds a device (valid 10 minutes, one use)
   etd status              show the daemon's id, addresses, and connected devices
   etd clients             list paired devices
@@ -28,7 +32,9 @@ async fn main() -> anyhow::Result<()> {
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] | ["run"] => {
             let key = config::load_or_create_key(&paths.key())?;
-            server::run(paths, key).await
+            // The out-of-the-box path: run `etd` by hand, scan, done.
+            let show_pairing = config::load_clients(&paths)?.is_empty() && std::io::stdout().is_terminal();
+            server::run(paths, key, show_pairing).await
         }
         ["pair", rest @ ..] => {
             let url_only = match rest {
@@ -37,21 +43,10 @@ async fn main() -> anyhow::Result<()> {
                 _ => bail!("{USAGE}"),
             };
             let status = config::running_status(&paths)?.context("etd is not running; start it first (run `etd`)")?;
-            // Only the relay: direct addresses (bridges, VPNs) make the QR code too
-            // big, and hole punching finds the direct path after the first connect.
-            let addr = iroh::EndpointAddr::new(status.addr.id).with_addrs(status.addr.relay_urls().cloned().map(iroh::TransportAddr::Relay));
-            let ticket = pair::create(&paths, addr, status.host_name.clone())?;
-            let url = ticket.to_url()?;
-            if url_only {
-                println!("{url}");
-            } else {
-                println!("{}", pair::qr(&url)?);
-                println!("Scan with the iPhone camera to add {} to E.T.", status.host_name);
-                println!("Valid for {} minutes, for one device.\n", pair::TTL.as_secs() / 60);
-                println!("Or paste this link in E.T.:\n{url}");
-            }
-            Ok(())
+            pair::print(&paths, &status.addr, &status.host_name, url_only)
         }
+        ["install"] => service::install(&paths),
+        ["uninstall"] => service::uninstall(),
         ["status"] => {
             let Some(s) = config::running_status(&paths)? else {
                 println!("etd is not running");
