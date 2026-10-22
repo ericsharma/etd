@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{self, Paths, Status};
 use crate::tmux::{self, Env};
-use crate::{mm, ops, pair};
+use crate::{events, mm, ops, pair};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -114,6 +114,10 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
         .await?;
     info!("endpoint id: {}", endpoint.id());
     let state_paths = paths.clone();
+    // Notifications for manymux sessions (see events.rs).
+    if let Some(command) = std::env::var("ETD_NOTIFY_COMMAND").ok().filter(|c| !c.trim().is_empty()) {
+        tokio::spawn(events::follow(env.clone(), command));
+    }
     let state = State::new(paths, env);
     let router = serve(endpoint.clone(), state.clone());
     let status_path = state.paths.status();

@@ -19,9 +19,9 @@ libc = "0.2"
 sha2 = "0.10"
 getrandom = "0.3"
 qrcode = { version = "0.14", default-features = false }
+# The manymux protocol (client core, no PTYs): etd reads its own event feed
+# for notifications. Same commit as nixos-config's manymux input (v0.2.2).
+manymux = { git = "https://github.com/rayfish/manymux", rev = "ee00f0786ea67ad65e780a9b47e554461f009c50", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
-# The manymux protocol, to talk to `mm agent` through etd in tests. Same
-# commit as nixos-config's manymux input (v0.2.2).
-manymux = { git = "https://github.com/rayfish/manymux", rev = "ee00f0786ea67ad65e780a9b47e554461f009c50", default-features = false }

@@ -195,3 +195,39 @@ async fn manymux_through_etd() {
         other => panic!("{other:?}"),
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bells_run_the_notify_command() {
+    let Some(real) = real_mm() else {
+        eprintln!("skipped: no `mm` on PATH");
+        return;
+    };
+    let node = Node::start(&real);
+    let notes = node.dir.path().join("notes");
+    let mut env: etd::tmux::Env = std::env::vars().filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE").collect();
+    env.insert("PATH".into(), format!("{}:{}", node.bin().display(), env["PATH"]));
+    env.insert("MM_CONFIG_DIR".into(), node.config().display().to_string());
+    env.insert("XDG_STATE_HOME".into(), node.dir.path().join("state").display().to_string());
+    let command = format!("echo \"$ETD_KIND|$ETD_SESSION|$ETD_BODY\" >> '{}'", notes.display());
+    let follower = tokio::spawn(etd::events::follow(env.clone(), command));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Nobody attached: the bell is worth a note.
+    let new = Command::new(node.bin().join("mm"))
+        .args(["new", "-d", "-n", "ringer", "sh", "-c", "sleep 1; printf '\\a'; sleep 3"])
+        .envs(env.iter())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(new.status.success(), "mm new: {}", String::from_utf8_lossy(&new.stderr));
+    let mut seen = String::new();
+    for _ in 0..100 {
+        seen = std::fs::read_to_string(&notes).unwrap_or_default();
+        if seen.contains("bell|ringer|") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    follower.abort();
+    assert!(seen.contains("bell|ringer|"), "notes: {seen:?}");
+}
