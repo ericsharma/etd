@@ -14,6 +14,8 @@ use iroh::endpoint::{RecvStream, SendStream};
 use iroh::EndpointAddr;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+pub mod network;
+
 pub const ALPN: &[u8] = b"et/1";
 
 /// Frames larger than this are refused.
@@ -46,6 +48,16 @@ pub enum Request {
     ExecOn { host: String, script: String },
     /// The machines this machine's manymux node watches (`mm hosts`).
     Machines,
+    /// Join this machine's network with an invite's secret. A device that is
+    /// not a member may send this (as `Pair`). `Pair` is `Join` with
+    /// `kind: Device`.
+    Join { secret: [u8; 32], name: String, kind: network::Kind },
+    /// The network document (any member).
+    Network,
+    /// A newer document from another machine of the network (machines only).
+    NetworkUpdate { network: network::Signed },
+    /// An invite link for a new member of `kind` (any member).
+    Invite { kind: network::Kind },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,6 +86,11 @@ pub enum Response {
     /// `mm agent` started; `ControlFrame`s follow.
     AgentStarted,
     Machines(Vec<String>),
+    /// The network after the join. `network_key`: the network key's secret
+    /// half, for a machine only.
+    Joined { network: network::Signed, network_key: Option<[u8; 32]> },
+    NetworkDoc(network::Signed),
+    Invitation { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

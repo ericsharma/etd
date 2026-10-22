@@ -11,7 +11,7 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use et_proto::{read_frame, write_frame, ControlFrame, Request, Response, ALPN};
-use etd::config::{self, Paths};
+use etd::config::Paths;
 use etd::server;
 use iroh::endpoint::{presets, Connection};
 use iroh::{Endpoint, EndpointAddr, SecretKey};
@@ -154,10 +154,11 @@ async fn manymux_through_etd() {
     let files = tempfile::tempdir().unwrap();
     let paths = Paths::at(files.path().into());
     let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+    etd::network::ensure(&paths, endpoint.id(), "hub").unwrap();
     let state = server::State::new(paths.clone(), env);
     let _router = server::serve(endpoint.clone(), state);
     let phone = SecretKey::generate();
-    config::add_client(&paths, phone.public(), "phone").unwrap();
+    etd::network::admit(&paths, endpoint.id(), phone.public(), "phone", et_proto::network::Kind::Device).unwrap();
     let port = endpoint.bound_sockets().iter().find(|a| a.is_ipv4()).unwrap().port();
     let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
     let client = Endpoint::builder(presets::Minimal).secret_key(phone).bind().await.unwrap();

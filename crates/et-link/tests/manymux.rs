@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use et_link::{Link, MmAttachment, MmEventKind, MmOutput, MmSpawn, RemoteHost};
 use et_proto::ALPN;
-use etd::config::{self, Paths};
+use etd::config::Paths;
 use etd::server;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
@@ -129,12 +129,13 @@ async fn manymux_through_et_link() {
     let files = tempfile::tempdir().unwrap();
     let paths = Paths::at(files.path().into());
     let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+    etd::network::ensure(&paths, endpoint.id(), "hub").unwrap();
     let _router = server::serve(endpoint.clone(), server::State::new(paths.clone(), env));
     let phone = SecretKey::generate();
-    config::add_client(&paths, phone.public(), "phone").unwrap();
+    etd::network::admit(&paths, endpoint.id(), phone.public(), "phone", et_proto::network::Kind::Device).unwrap();
     let port = endpoint.bound_sockets().iter().find(|a| a.is_ipv4()).unwrap().port();
     let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
-    let url = etd::pair::create(&paths, addr, "hub".into()).unwrap().to_url().unwrap();
+    let url = etd::pair::create(&paths, addr, "hub".into(), et_proto::network::Kind::Device).unwrap().to_url().unwrap();
     let link = Link::from_endpoint(Endpoint::builder(presets::Minimal).secret_key(phone).bind().await.unwrap());
     let paired = link.pair(url, "phone".into()).await.unwrap();
     let host: Arc<RemoteHost> = link.connect(paired.endpoint_id, None).await.unwrap();

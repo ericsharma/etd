@@ -1,10 +1,11 @@
 //! The iroh side: pair devices, accept paired devices, serve et/1 streams.
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use et_proto::network::{Kind, Network, Signed};
 use et_proto::{read_frame, write_frame, ControlFrame, HostInfo, Request, Response, Target, TmuxStatus, ALPN};
 use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -16,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{self, Paths, Status};
 use crate::tmux::{self, Env};
-use crate::{events, mm, ops, pair};
+use crate::{events, mm, network, ops, pair};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -29,19 +30,29 @@ const PAIR_TIMEOUT: Duration = Duration::from_secs(10);
 const PAIR_TRIES: usize = 5;
 const PAIR_WINDOW: Duration = Duration::from_secs(60);
 
+/// How often the network document goes to the other machines even when
+/// nothing changed here (one that was down catches up).
+const RESEND_EVERY: u32 = 150; // × WATCH_EVERY = 5 minutes
+
 #[derive(Debug)]
 pub struct State {
     paths: Paths,
     env: Env,
-    /// Open connections of paired devices, for revokes and `etd status`.
+    /// Set by `serve`: for invites (our address) and for sending the network.
+    endpoint: OnceLock<Endpoint>,
+    /// Open connections of members, for revokes and `etd status`.
     live: Mutex<HashMap<EndpointId, (String, Vec<Connection>)>>,
-    /// Recent `Pair` tries, per device.
+    /// Recent `Pair`/`Join` tries, per device.
     tries: Mutex<HashMap<EndpointId, Vec<Instant>>>,
 }
 
 impl State {
     pub fn new(paths: Paths, env: Env) -> Arc<Self> {
-        Arc::new(Self { paths, env, live: Mutex::default(), tries: Mutex::default() })
+        Arc::new(Self { paths, env, endpoint: OnceLock::new(), live: Mutex::default(), tries: Mutex::default() })
+    }
+
+    fn endpoint(&self) -> &Endpoint {
+        self.endpoint.get().expect("set by serve")
     }
 
     fn add_live(&self, id: EndpointId, name: &str, conn: &Connection) {
@@ -72,12 +83,11 @@ impl State {
         true
     }
 
-    /// Closes connections of devices that are no longer in `clients.json`.
-    fn apply_revokes(&self) {
-        let Ok(clients) = config::load_clients(&self.paths) else { return };
+    /// Closes connections of members that are no longer in the network.
+    fn apply_revokes(&self, network: &Network) {
         let mut live = self.live.lock().unwrap();
         live.retain(|id, (name, conns)| {
-            let keep = clients.iter().any(|c| c.id == *id);
+            let keep = network.member(id).is_some();
             if !keep {
                 info!("{name} ({}) revoked: closing {} connection(s)", id.fmt_short(), conns.len());
                 for conn in conns.iter() {
@@ -113,6 +123,9 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
         .bind()
         .await?;
     info!("endpoint id: {}", endpoint.id());
+    // The first start makes the network (and moves paired devices into it).
+    let signed = network::ensure(&paths, endpoint.id(), &tmux::host_name())?;
+    info!("network {}: {} member(s)", signed.network.name, signed.network.members().count());
     let state_paths = paths.clone();
     // Notifications for manymux sessions (see events.rs).
     if let Some(command) = std::env::var("ETD_NOTIFY_COMMAND").ok().filter(|c| !c.trim().is_empty()) {
@@ -125,9 +138,9 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
     if tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await.is_err() {
         warn!("no relay after {ONLINE_TIMEOUT:?}; direct connections only until it comes up");
     }
-    info!("online; run `etd pair` to add a device");
+    info!("online; run `etd invite` to add a device, `etd invite --machine` to add a machine");
     if show_pairing {
-        if let Err(e) = pair::print(&state_paths, &endpoint.addr(), &tmux::host_name(), false) {
+        if let Err(e) = pair::print(&state_paths, &endpoint.addr(), &tmux::host_name(), Kind::Device, false) {
             warn!("pairing code: {e:#}");
         }
     }
@@ -144,15 +157,32 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
     Ok(())
 }
 
-/// Accepts et/1 on `endpoint`. Revokes and status run in [`watch`].
+/// Accepts et/1 on `endpoint`. Revokes, status and network sync run in [`watch`].
 pub fn serve(endpoint: Endpoint, state: Arc<State>) -> Router {
+    let _ = state.endpoint.set(endpoint.clone());
     Router::builder(endpoint).accept(ALPN, Handler(state)).spawn()
 }
 
-/// Applies revokes and writes `status.json`, every `WATCH_EVERY`.
+/// Every `WATCH_EVERY`: applies revokes, sends a changed network document to
+/// the other machines (and every 5 minutes anyway), writes `status.json`.
 pub async fn watch(endpoint: Endpoint, state: Arc<State>, tmux: String) {
+    let mut sent: Option<Signed> = None;
+    let mut ticks = 0u32;
     loop {
-        state.apply_revokes();
+        match network::load(&state.paths) {
+            Ok(Some(signed)) => {
+                state.apply_revokes(&signed.network);
+                if sent.as_ref() != Some(&signed) || ticks.is_multiple_of(RESEND_EVERY) {
+                    let endpoint = endpoint.clone();
+                    let doc = signed.clone();
+                    tokio::spawn(async move { network::push(&endpoint, &doc).await });
+                    sent = Some(signed);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!("network: {e:#}"),
+        }
+        ticks = ticks.wrapping_add(1);
         let status = Status {
             pid: std::process::id(),
             version: env!("CARGO_PKG_VERSION").into(),
@@ -176,15 +206,16 @@ impl ProtocolHandler for Handler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let state = &self.0;
         let id = conn.remote_id();
-        // Read on each connection, so pairings and revokes apply at once.
-        let clients = config::load_clients(&state.paths).unwrap_or_else(|e| {
+        // Read on each connection, so joins and revokes apply at once.
+        let network = network::load(&state.paths).unwrap_or_else(|e| {
             warn!("{e:#}");
-            Vec::new()
+            None
         });
-        let name = match clients.into_iter().find(|c| c.id == id) {
-            Some(client) => client.name,
-            None => match pairing(state, &conn).await {
-                Some(name) => name,
+        let member = network.as_ref().and_then(|s| s.network.member(&id)).map(|m| (m.name.to_string(), m.kind));
+        let (name, kind) = match member {
+            Some(member) => member,
+            None => match admission(state, &conn).await {
+                Some(member) => member,
                 None => return Ok(()),
             },
         };
@@ -200,7 +231,7 @@ impl ProtocolHandler for Handler {
             };
             let state = state.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_stream(&state, send, recv).await {
+                if let Err(e) = serve_stream(&state, id, kind, send, recv).await {
                     debug!("stream ended: {e:#}");
                 }
             });
@@ -210,9 +241,17 @@ impl ProtocolHandler for Handler {
     }
 }
 
-/// An unpaired device: its first stream must be a valid `Pair`. Returns the
-/// device name when it is now paired; otherwise the connection is closed.
-async fn pairing(state: &State, conn: &Connection) -> Option<String> {
+fn kind_word(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Machine => "machine",
+        Kind::Device => "device",
+    }
+}
+
+/// Not a member: the first stream must be `Join` (or `Pair`, a device's join)
+/// with a valid invite secret. Returns the new member's name and kind;
+/// otherwise the connection is closed.
+async fn admission(state: &State, conn: &Connection) -> Option<(String, Kind)> {
     let id = conn.remote_id();
     let first = tokio::time::timeout(PAIR_TIMEOUT, async {
         let (send, mut recv) = conn.accept_bi().await.ok()?;
@@ -224,32 +263,53 @@ async fn pairing(state: &State, conn: &Connection) -> Option<String> {
         conn.close(1u32.into(), b"not paired");
         return None;
     };
-    let reply = match request {
-        Request::Pair { secret, device_name } => {
-            if !state.may_try_pairing(id) {
-                Err("too many tries; wait a minute".to_string())
-            } else if !pair::redeem(&state.paths, &secret) {
-                Err("this pairing code is wrong, used, or expired; run `etd pair` again".to_string())
-            } else {
-                let name = if device_name.trim().is_empty() { id.fmt_short().to_string() } else { device_name.trim().to_string() };
-                match config::add_client(&state.paths, id, &name) {
-                    Ok(()) => Ok(name),
-                    Err(e) => Err(format!("save device: {e:#}")),
-                }
-            }
-        }
+    // `Pair` (the app's) answers `Paired`; `Join` answers `Joined`.
+    let (secret, name, wanted, is_pair) = match request {
+        Request::Pair { secret, device_name } => (secret, device_name, Kind::Device, true),
+        Request::Join { secret, name, kind } => (secret, name, kind, false),
         _ => {
             info!("refused {}: not paired", id.fmt_short());
             conn.close(1u32.into(), b"not paired");
             return None;
         }
     };
+    let me = state.endpoint().id();
+    let reply = if !state.may_try_pairing(id) {
+        Err("too many tries; wait a minute".to_string())
+    } else {
+        match pair::redeem(&state.paths, &secret) {
+            None => Err("this invite is wrong, used, or expired; run `etd invite` again".to_string()),
+            Some(kind) if kind != wanted => {
+                Err(format!("this invite is for a {}, not a {}", kind_word(kind), kind_word(wanted)))
+            }
+            Some(kind) => {
+                let name = if name.trim().is_empty() { id.fmt_short().to_string() } else { name };
+                match network::admit(&state.paths, me, id, &name, kind) {
+                    Ok(signed) => {
+                        let name = signed.network.member(&id).map(|m| m.name.to_string()).unwrap_or(name);
+                        Ok((name, kind, signed))
+                    }
+                    Err(e) => Err(format!("{e:#}")),
+                }
+            }
+        }
+    };
     match reply {
-        Ok(name) => {
-            info!("paired {name} ({})", id.fmt_short());
-            let _ = write_frame(&mut send, &Response::Paired { host_name: tmux::host_name() }).await;
+        Ok((name, kind, signed)) => {
+            info!("{name} ({}) joined as a {}", id.fmt_short(), kind_word(kind));
+            let response = if is_pair {
+                Response::Paired { host_name: tmux::host_name() }
+            } else {
+                // A machine gets the network key: it may change the network.
+                let network_key = match kind {
+                    Kind::Machine => network::load_key(&state.paths).ok().flatten().map(|k| k.to_bytes()),
+                    Kind::Device => None,
+                };
+                Response::Joined { network: signed, network_key }
+            };
+            let _ = write_frame(&mut send, &response).await;
             let _ = send.finish();
-            Some(name)
+            Some((name, kind))
         }
         Err(why) => {
             info!("pairing refused for {}: {why}", id.fmt_short());
@@ -263,7 +323,7 @@ async fn pairing(state: &State, conn: &Connection) -> Option<String> {
     }
 }
 
-async fn serve_stream(state: &State, mut send: SendStream, mut recv: RecvStream) -> anyhow::Result<()> {
+async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: SendStream, mut recv: RecvStream) -> anyhow::Result<()> {
     let Some(request) = read_frame::<Request>(&mut recv).await? else { return Ok(()) };
     match &request {
         Request::Upload { path, len } => debug!("request: Upload {path} ({len} bytes)"),
@@ -296,6 +356,31 @@ async fn serve_stream(state: &State, mut send: SendStream, mut recv: RecvStream)
             Ok(()) => ops::exec(&state.env, &mm::exec_on_script(&state.env, &host, &script)).await,
             Err(e) => Response::Error(format!("{e:#}")),
         },
+        Request::Join { .. } => Response::Error("already a member of this network".into()),
+        Request::Network => match network::load(&state.paths) {
+            Ok(Some(signed)) => Response::NetworkDoc(signed),
+            Ok(None) => Response::Error("no network yet".into()),
+            Err(e) => Response::Error(format!("{e:#}")),
+        },
+        // Only machines change the network (D1).
+        Request::NetworkUpdate { .. } if kind != Kind::Machine => {
+            Response::Error("only machines send network updates".into())
+        }
+        Request::NetworkUpdate { network } => match network::apply(&state.paths, &network) {
+            Ok(changed) => {
+                if changed {
+                    info!("network updated by {}", peer.fmt_short());
+                }
+                Response::Pong
+            }
+            Err(e) => Response::Error(format!("{e:#}")),
+        },
+        Request::Invite { kind } => {
+            match pair::invite_url(&state.paths, &state.endpoint().addr(), &tmux::host_name(), kind) {
+                Ok(url) => Response::Invitation { url },
+                Err(e) => Response::Error(format!("{e:#}")),
+            }
+        }
         Request::Machines => match mm::machines(&state.env).await {
             Ok(list) => Response::Machines(list),
             Err(e) => Response::Error(format!("{e:#}")),

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use et_link::{Link, LinkError};
 use et_proto::ALPN;
-use etd::config::{self, Paths};
+use etd::config::Paths;
 use etd::{pair, server};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
@@ -24,12 +24,13 @@ async fn link_end_to_end() {
         .collect();
     let paths = Paths::at(files.path().into());
     let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+    etd::network::ensure(&paths, endpoint.id(), "hub").unwrap();
     let state = server::State::new(paths.clone(), env);
     let _router = server::serve(endpoint.clone(), state.clone());
     let watcher = tokio::spawn(server::watch(endpoint.clone(), state, "test".into()));
     let port = endpoint.bound_sockets().iter().find(|a| a.is_ipv4()).unwrap().port();
     let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
-    let url = pair::create(&paths, addr, "testhost".into()).unwrap().to_url().unwrap();
+    let url = pair::create(&paths, addr, "testhost".into(), et_proto::network::Kind::Device).unwrap().to_url().unwrap();
 
     // Pair, then use the same connection's machine by id.
     let link = phone().await;
@@ -51,7 +52,7 @@ async fn link_end_to_end() {
     assert!(matches!(other.pair(url, "other".into()).await, Err(LinkError::PairingRefused { .. })));
 
     // A revoke closes the open connection with NotPaired.
-    config::remove_clients(&paths, "test phone").unwrap();
+    etd::network::revoke(&paths, endpoint.id(), "test phone").unwrap();
     let why = tokio::time::timeout(Duration::from_secs(5), host.closed()).await.expect("closed after revoke");
     assert!(matches!(why, LinkError::NotPaired { .. }), "{why:?}");
 

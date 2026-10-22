@@ -67,7 +67,7 @@ impl Daemon {
     }
 
     fn ticket_secret(&self) -> [u8; 32] {
-        pair::create(&self.paths, self.addr(), "test".into()).unwrap().secret
+        pair::create(&self.paths, self.addr(), "test".into(), et_proto::network::Kind::Device).unwrap().secret
     }
 }
 
@@ -101,6 +101,7 @@ async fn daemon_end_to_end() {
 
     let paths = Paths::at(files.path().into());
     let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+    etd::network::ensure(&paths, endpoint.id(), "hub").unwrap();
     let state = server::State::new(paths.clone(), env);
     let _router = server::serve(endpoint.clone(), state.clone());
     let watcher = tokio::spawn(server::watch(endpoint.clone(), state, "test".into()));
@@ -120,8 +121,10 @@ async fn daemon_end_to_end() {
     let secret = daemon.ticket_secret();
     let (_phone_ep, conn, reply) = pair_with(&daemon, &phone, secret, "phone").await;
     assert!(matches!(reply, Response::Paired { .. }), "{reply:?}");
-    let clients = config::load_clients(&daemon.paths).unwrap();
-    assert_eq!(clients.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["phone"]);
+    let network = etd::network::load(&daemon.paths).unwrap().unwrap().network;
+    let devices: Vec<String> =
+        network.members().filter(|m| m.kind == et_proto::network::Kind::Device).map(|m| m.name.to_string()).collect();
+    assert_eq!(devices, ["phone"]);
     let other = SecretKey::generate();
     let (_e, _c, reply) = pair_with(&daemon, &other, secret, "other").await;
     assert!(matches!(reply, Response::Rejected(_)), "a used secret must fail: {reply:?}");
@@ -198,7 +201,7 @@ async fn daemon_end_to_end() {
     assert_eq!(status.connected, ["phone"]);
 
     // Revoke closes the open connection.
-    assert_eq!(config::remove_clients(&daemon.paths, "phone").unwrap().len(), 1);
+    assert_eq!(etd::network::revoke(&daemon.paths, daemon.endpoint.id(), "phone").unwrap().len(), 1);
     let reason = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await.expect("closed after revoke");
     assert!(format!("{reason}").contains("revoked"), "{reason}");
 

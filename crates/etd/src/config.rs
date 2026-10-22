@@ -39,8 +39,24 @@ impl Paths {
         self.config.join("secret.key")
     }
 
+    /// Paired devices before the network existed; moved into it once.
     pub fn clients(&self) -> PathBuf {
         self.config.join("clients.json")
+    }
+
+    /// The signed network document.
+    pub fn network(&self) -> PathBuf {
+        self.config.join("network.json")
+    }
+
+    /// The network key's secret half (machines only).
+    pub fn network_key(&self) -> PathBuf {
+        self.config.join("network.key")
+    }
+
+    /// Held while the network document is read, changed and written.
+    pub fn network_lock(&self) -> PathBuf {
+        self.config.join("network.lock")
     }
 
     pub fn pending(&self) -> PathBuf {

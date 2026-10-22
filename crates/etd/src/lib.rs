@@ -2,6 +2,7 @@
 pub mod config;
 pub mod events;
 pub mod mm;
+pub mod network;
 pub mod ops;
 pub mod pair;
 pub mod server;
