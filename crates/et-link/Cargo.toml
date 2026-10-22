@@ -20,6 +20,10 @@ iroh.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 uniffi = { version = "0.32", features = ["cli", "tokio"] }
+serde.workspace = true
+# The manymux client core (no PTYs). Same commit as nixos-config's manymux
+# input (v0.2.2); a bump changes both.
+manymux = { git = "https://github.com/rayfish/manymux", rev = "ee00f0786ea67ad65e780a9b47e554461f009c50", default-features = false }
 
 [dev-dependencies]
 etd = { path = "../etd" }

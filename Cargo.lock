@@ -800,6 +800,8 @@ dependencies = [
  "et-proto",
  "etd",
  "iroh",
+ "manymux",
+ "serde",
  "tempfile",
  "tokio",
  "uniffi",

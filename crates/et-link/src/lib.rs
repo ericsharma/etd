@@ -14,6 +14,9 @@ use iroh::endpoint::{presets, ConnectionError, QuicTransportConfig, RecvStream, 
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use tokio::sync::Mutex;
 
+mod mm;
+pub use mm::*;
+
 uniffi::setup_scaffolding!();
 
 const KEEP_ALIVE: Duration = Duration::from_secs(5);

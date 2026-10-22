@@ -289,7 +289,7 @@ async fn serve_stream(state: &State, mut send: SendStream, mut recv: RecvStream)
         Request::Upload { path, len } => ops::upload(&state.env, &path, len, &mut recv).await,
         Request::Agent { host } => return agent(state, host, send, recv).await,
         Request::ExecOn { host, script } => match mm::check_host(&state.env, &host).await {
-            Ok(()) => ops::exec(&state.env, &mm::exec_on_script(&host, &script)).await,
+            Ok(()) => ops::exec(&state.env, &mm::exec_on_script(&state.env, &host, &script)).await,
             Err(e) => Response::Error(format!("{e:#}")),
         },
         Request::Machines => match mm::machines(&state.env).await {

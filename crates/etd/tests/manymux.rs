@@ -59,6 +59,8 @@ impl Node {
         let child = Command::new(bin.join("mm"))
             .args(["daemon", "--no-notify"])
             .env("MM_CONFIG_DIR", dir.path().join("config"))
+            // The node logs to $XDG_STATE_HOME/manymux: keep it out of the real one.
+            .env("XDG_STATE_HOME", dir.path().join("state"))
             // The node reaches watched machines with `ssh`: the stub.
             .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
             .env_remove("TMUX")
