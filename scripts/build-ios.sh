@@ -35,5 +35,6 @@ for t in "${TARGETS[@]}"; do
 done
 rm -rf "$PKG/EtLinkFFI.xcframework"
 xcodebuild -create-xcframework "${args[@]}" -output "$PKG/EtLinkFFI.xcframework"
+mkdir -p "$PKG/Sources/EtLink"
 cp "$GEN/et_link.swift" "$PKG/Sources/EtLink/et_link.swift"
 echo "OK: $PKG/EtLinkFFI.xcframework + Sources/EtLink/et_link.swift"
