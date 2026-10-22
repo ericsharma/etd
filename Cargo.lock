@@ -829,6 +829,7 @@ dependencies = [
  "iroh",
  "libc",
  "manymux",
+ "postcard",
  "qrcode",
  "serde",
  "serde_json",

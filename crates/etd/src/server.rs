@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{self, Paths, Status};
 use crate::tmux::{self, Env};
-use crate::{events, mm, network, ops, pair};
+use crate::{events, local, mm, network, ops, pair};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -135,6 +135,8 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
     let router = serve(endpoint.clone(), state.clone());
     let status_path = state.paths.status();
     let watcher = tokio::spawn(watch(endpoint.clone(), state, tmux_text));
+    // etd-ssh (manymux's MM_SSH) reaches the other machines through this.
+    let local = local::spawn(endpoint.clone(), state_paths.clone());
     if tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await.is_err() {
         warn!("no relay after {ONLINE_TIMEOUT:?}; direct connections only until it comes up");
     }
@@ -152,6 +154,8 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
     }
     info!("stopping");
     watcher.abort();
+    local.abort();
+    local::remove(&state_paths);
     let _ = std::fs::remove_file(status_path);
     router.shutdown().await?;
     Ok(())

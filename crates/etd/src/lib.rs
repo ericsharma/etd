@@ -1,6 +1,7 @@
 //! etd: reach tmux on this machine from E.T. over iroh.
 pub mod config;
 pub mod events;
+pub mod local;
 pub mod mm;
 pub mod network;
 pub mod ops;
