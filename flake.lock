@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "manymux": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792329746,
+        "narHash": "sha256-gCK68CXHvz5MhRBomft6doBvRIwhAv4blezmknXZWZw=",
+        "owner": "rayfish",
+        "repo": "manymux",
+        "rev": "ee00f0786ea67ad65e780a9b47e554461f009c50",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rayfish",
+        "ref": "v0.2.2",
+        "repo": "manymux",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1792502884,
@@ -18,6 +35,7 @@
     },
     "root": {
       "inputs": {
+        "manymux": "manymux",
         "nixpkgs": "nixpkgs"
       }
     }
