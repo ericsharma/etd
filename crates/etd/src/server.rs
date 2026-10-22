@@ -172,10 +172,23 @@ pub fn serve(endpoint: Endpoint, state: Arc<State>) -> Router {
 pub async fn watch(endpoint: Endpoint, state: Arc<State>, tmux: String) {
     let mut sent: Option<Signed> = None;
     let mut ticks = 0u32;
+    // manymux's machine list follows the network only when asked: until a
+    // user's machines are in the network, that list may hold ssh names.
+    let manage_mm_hosts = std::env::var("ETD_MANYMUX_HOSTS").is_ok_and(|v| v == "1");
     loop {
         match network::load(&state.paths) {
             Ok(Some(signed)) => {
                 state.apply_revokes(&signed.network);
+                if sent.as_ref() != Some(&signed) && manage_mm_hosts {
+                    let me = endpoint.id();
+                    let names: Vec<String> =
+                        signed.network.machines().filter(|m| m.id != me).map(|m| m.name.to_string()).collect();
+                    match mm::hosts_file(&state.env).map(|path| mm::write_hosts(&path, &names)) {
+                        Some(Ok(true)) => info!("manymux machines: {}", names.join(", ")),
+                        Some(Err(e)) => warn!("manymux hosts.toml: {e:#}"),
+                        _ => {}
+                    }
+                }
                 if sent.as_ref() != Some(&signed) || ticks.is_multiple_of(RESEND_EVERY) {
                     let endpoint = endpoint.clone();
                     let doc = signed.clone();
