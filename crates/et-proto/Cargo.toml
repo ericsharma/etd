@@ -10,3 +10,4 @@ iroh.workspace = true
 postcard.workspace = true
 serde.workspace = true
 anyhow.workspace = true
+data-encoding = "2"

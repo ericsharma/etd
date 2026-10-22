@@ -1,41 +1,105 @@
-//! The iroh side: accept paired devices, serve et/1 streams.
-use std::path::PathBuf;
+//! The iroh side: pair devices, accept paired devices, serve et/1 streams.
+use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use et_proto::{read_frame, write_frame, ControlFrame, HostInfo, Request, Response, Target, TmuxStatus, ALPN};
 use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, SecretKey};
+use iroh::{Endpoint, EndpointId, SecretKey};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::config;
+use crate::config::{self, Paths, Status};
 use crate::tmux::{self, Env};
+use crate::{ops, pair};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_CHUNK: usize = 64 * 1024;
+/// How often revokes are applied and `status.json` is written.
+const WATCH_EVERY: Duration = Duration::from_secs(2);
+/// Time for an unpaired device to send its `Pair` request.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(10);
+const PAIR_TRIES: usize = 5;
+const PAIR_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
-struct State {
-    home: PathBuf,
+pub struct State {
+    paths: Paths,
     env: Env,
+    /// Open connections of paired devices, for revokes and `etd status`.
+    live: Mutex<HashMap<EndpointId, (String, Vec<Connection>)>>,
+    /// Recent `Pair` tries, per device.
+    tries: Mutex<HashMap<EndpointId, Vec<Instant>>>,
 }
 
-#[derive(Debug, Clone)]
-struct Handler(Arc<State>);
-
-pub async fn run(home: PathBuf, key: SecretKey) -> anyhow::Result<()> {
-    let env = tmux::login_env().await;
-    match tmux::find(&env).await {
-        TmuxStatus::Found(t) => info!("tmux: {} ({}), TMUX_TMPDIR={}", t.path, t.version, t.tmpdir.as_deref().unwrap_or("default")),
-        TmuxStatus::NotFound(why) => warn!("tmux not found yet: {why}"),
+impl State {
+    pub fn new(paths: Paths, env: Env) -> Arc<Self> {
+        Arc::new(Self { paths, env, live: Mutex::default(), tries: Mutex::default() })
     }
+
+    fn add_live(&self, id: EndpointId, name: &str, conn: &Connection) {
+        let mut live = self.live.lock().unwrap();
+        let entry = live.entry(id).or_insert_with(|| (name.to_string(), Vec::new()));
+        entry.1.push(conn.clone());
+    }
+
+    fn remove_live(&self, id: EndpointId, conn: &Connection) {
+        let mut live = self.live.lock().unwrap();
+        if let Some((_, conns)) = live.get_mut(&id) {
+            conns.retain(|c| c.stable_id() != conn.stable_id());
+            if conns.is_empty() {
+                live.remove(&id);
+            }
+        }
+    }
+
+    /// False after `PAIR_TRIES` tries within `PAIR_WINDOW`.
+    fn may_try_pairing(&self, id: EndpointId) -> bool {
+        let mut tries = self.tries.lock().unwrap();
+        let list = tries.entry(id).or_default();
+        list.retain(|t| t.elapsed() < PAIR_WINDOW);
+        if list.len() >= PAIR_TRIES {
+            return false;
+        }
+        list.push(Instant::now());
+        true
+    }
+
+    /// Closes connections of devices that are no longer in `clients.json`.
+    fn apply_revokes(&self) {
+        let Ok(clients) = config::load_clients(&self.paths) else { return };
+        let mut live = self.live.lock().unwrap();
+        live.retain(|id, (name, conns)| {
+            let keep = clients.iter().any(|c| c.id == *id);
+            if !keep {
+                info!("{name} ({}) revoked: closing {} connection(s)", id.fmt_short(), conns.len());
+                for conn in conns.iter() {
+                    conn.close(2u32.into(), b"revoked");
+                }
+            }
+            keep
+        });
+    }
+
+    fn connected_names(&self) -> Vec<String> {
+        self.live.lock().unwrap().values().map(|(name, _)| name.clone()).collect()
+    }
+}
+
+/// Binds the endpoint and serves until SIGINT or SIGTERM.
+pub async fn run(paths: Paths, key: SecretKey) -> anyhow::Result<()> {
+    let env = tmux::login_env().await;
+    let tmux_text = match tmux::find(&env).await {
+        TmuxStatus::Found(t) => format!("{} ({}), TMUX_TMPDIR={}", t.path, t.version, t.tmpdir.as_deref().unwrap_or("default")),
+        TmuxStatus::NotFound(why) => format!("not found yet: {why}"),
+    };
+    info!("tmux: {tmux_text}");
     let transport = QuicTransportConfig::builder()
         .keep_alive_interval(KEEP_ALIVE)
         .max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?))
@@ -47,53 +111,153 @@ pub async fn run(home: PathBuf, key: SecretKey) -> anyhow::Result<()> {
         .bind()
         .await?;
     info!("endpoint id: {}", endpoint.id());
-    let router = Router::builder(endpoint.clone()).accept(ALPN, Handler(Arc::new(State { home, env }))).spawn();
+    let state = State::new(paths, env);
+    let router = serve(endpoint.clone(), state.clone());
+    let status_path = state.paths.status();
+    let watcher = tokio::spawn(watch(endpoint.clone(), state, tmux_text));
     if tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await.is_err() {
         warn!("no relay after {ONLINE_TIMEOUT:?}; direct connections only until it comes up");
     }
-    info!("addr: {:?}", endpoint.addr());
-    tokio::signal::ctrl_c().await?;
+    info!("online; run `etd pair` to add a device");
+
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
     info!("stopping");
+    watcher.abort();
+    let _ = std::fs::remove_file(status_path);
     router.shutdown().await?;
     Ok(())
 }
 
+/// Accepts et/1 on `endpoint`. Revokes and status run in [`watch`].
+pub fn serve(endpoint: Endpoint, state: Arc<State>) -> Router {
+    Router::builder(endpoint).accept(ALPN, Handler(state)).spawn()
+}
+
+/// Applies revokes and writes `status.json`, every `WATCH_EVERY`.
+pub async fn watch(endpoint: Endpoint, state: Arc<State>, tmux: String) {
+    loop {
+        state.apply_revokes();
+        let status = Status {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            host_name: tmux::host_name(),
+            addr: endpoint.addr(),
+            tmux: tmux.clone(),
+            connected: state.connected_names(),
+            updated: config::now_secs(),
+        };
+        if let Err(e) = config::write_json(&state.paths.status(), &status) {
+            warn!("write status: {e:#}");
+        }
+        tokio::time::sleep(WATCH_EVERY).await;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Handler(Arc<State>);
+
 impl ProtocolHandler for Handler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        let state = &self.0;
         let id = conn.remote_id();
-        // Read on each connection, so `etd allow` and revokes apply at once.
-        let clients = config::load_clients(&self.0.home).unwrap_or_else(|e| {
+        // Read on each connection, so pairings and revokes apply at once.
+        let clients = config::load_clients(&state.paths).unwrap_or_else(|e| {
             warn!("{e:#}");
             Vec::new()
         });
-        let Some(client) = clients.into_iter().find(|c| c.id == id) else {
-            info!("refused {}: not paired", id.fmt_short());
-            conn.close(1u32.into(), b"not paired");
-            return Ok(());
+        let name = match clients.into_iter().find(|c| c.id == id) {
+            Some(client) => client.name,
+            None => match pairing(state, &conn).await {
+                Some(name) => name,
+                None => return Ok(()),
+            },
         };
-        info!("{} ({}) connected", client.name, id.fmt_short());
+        info!("{name} ({}) connected", id.fmt_short());
+        state.add_live(id, &name, &conn);
         loop {
             let (send, recv) = match conn.accept_bi().await {
                 Ok(streams) => streams,
                 Err(e) => {
-                    info!("{} disconnected: {e}", client.name);
+                    info!("{name} disconnected: {e}");
                     break;
                 }
             };
-            let state = self.0.clone();
+            let state = state.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve(&state, send, recv).await {
+                if let Err(e) = serve_stream(&state, send, recv).await {
                     debug!("stream ended: {e:#}");
                 }
             });
         }
+        state.remove_live(id, &conn);
         Ok(())
     }
 }
 
-async fn serve(state: &State, mut send: SendStream, mut recv: RecvStream) -> anyhow::Result<()> {
+/// An unpaired device: its first stream must be a valid `Pair`. Returns the
+/// device name when it is now paired; otherwise the connection is closed.
+async fn pairing(state: &State, conn: &Connection) -> Option<String> {
+    let id = conn.remote_id();
+    let first = tokio::time::timeout(PAIR_TIMEOUT, async {
+        let (send, mut recv) = conn.accept_bi().await.ok()?;
+        let request = read_frame::<Request>(&mut recv).await.ok()??;
+        Some((send, request))
+    })
+    .await;
+    let Ok(Some((mut send, request))) = first else {
+        conn.close(1u32.into(), b"not paired");
+        return None;
+    };
+    let reply = match request {
+        Request::Pair { secret, device_name } => {
+            if !state.may_try_pairing(id) {
+                Err("too many tries; wait a minute".to_string())
+            } else if !pair::redeem(&state.paths, &secret) {
+                Err("this pairing code is wrong, used, or expired; run `etd pair` again".to_string())
+            } else {
+                let name = if device_name.trim().is_empty() { id.fmt_short().to_string() } else { device_name.trim().to_string() };
+                match config::add_client(&state.paths, id, &name) {
+                    Ok(()) => Ok(name),
+                    Err(e) => Err(format!("save device: {e:#}")),
+                }
+            }
+        }
+        _ => {
+            info!("refused {}: not paired", id.fmt_short());
+            conn.close(1u32.into(), b"not paired");
+            return None;
+        }
+    };
+    match reply {
+        Ok(name) => {
+            info!("paired {name} ({})", id.fmt_short());
+            let _ = write_frame(&mut send, &Response::Paired { host_name: tmux::host_name() }).await;
+            let _ = send.finish();
+            Some(name)
+        }
+        Err(why) => {
+            info!("pairing refused for {}: {why}", id.fmt_short());
+            let _ = write_frame(&mut send, &Response::Rejected(why)).await;
+            let _ = send.finish();
+            // Give the reply time to arrive before the close.
+            let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
+            conn.close(1u32.into(), b"pairing refused");
+            None
+        }
+    }
+}
+
+async fn serve_stream(state: &State, mut send: SendStream, mut recv: RecvStream) -> anyhow::Result<()> {
     let Some(request) = read_frame::<Request>(&mut recv).await? else { return Ok(()) };
-    debug!("request: {request:?}");
+    match &request {
+        Request::Upload { path, len } => debug!("request: Upload {path} ({len} bytes)"),
+        Request::Pair { device_name, .. } => debug!("request: Pair from {device_name}"),
+        other => debug!("request: {other:?}"),
+    }
     let reply = match request {
         Request::Hello { .. } => Response::HostInfo(HostInfo {
             host_name: tmux::host_name(),
@@ -111,6 +275,10 @@ async fn serve(state: &State, mut send: SendStream, mut recv: RecvStream) -> any
         },
         Request::Control { target } => return control(state, target, send, recv).await,
         Request::Ping => Response::Pong,
+        // Already paired.
+        Request::Pair { .. } => Response::Paired { host_name: tmux::host_name() },
+        Request::Exec { script } => ops::exec(&state.env, &script).await,
+        Request::Upload { path, len } => ops::upload(&state.env, &path, len, &mut recv).await,
     };
     write_frame(&mut send, &reply).await?;
     send.finish()?;
@@ -135,6 +303,9 @@ async fn control(state: &State, target: Target, mut send: SendStream, mut recv: 
     };
     // TERM=et-ios marks E.T.'s control clients (#{client_termname}).
     cmd.env("TERM", "et-ios").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    if let Ok(home) = ops::home(&state.env) {
+        cmd.current_dir(home);
+    }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {

@@ -88,7 +88,9 @@ fn is_executable(path: &str) -> bool {
 /// A tmux command with the login environment and the found socket directory.
 pub fn command(env: &Env, tmux: &TmuxInstall) -> Command {
     let mut cmd = Command::new(&tmux.path);
-    cmd.env_clear().envs(env).stdin(Stdio::null());
+    // $TMUX wins over TMUX_TMPDIR. If etd starts inside a tmux pane, an
+    // inherited $TMUX would send every command to that pane's server.
+    cmd.env_clear().envs(env).env_remove("TMUX").env_remove("TMUX_PANE").stdin(Stdio::null());
     match &tmux.tmpdir {
         Some(dir) => cmd.env("TMUX_TMPDIR", dir),
         None => cmd.env_remove("TMUX_TMPDIR"),
