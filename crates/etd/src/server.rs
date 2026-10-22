@@ -10,12 +10,13 @@ use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendS
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointId, SecretKey};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::config::{self, Paths, Status};
 use crate::tmux::{self, Env};
-use crate::{ops, pair};
+use crate::{mm, ops, pair};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -286,6 +287,15 @@ async fn serve_stream(state: &State, mut send: SendStream, mut recv: RecvStream)
         Request::Pair { .. } => Response::Paired { host_name: tmux::host_name() },
         Request::Exec { script } => ops::exec(&state.env, &script).await,
         Request::Upload { path, len } => ops::upload(&state.env, &path, len, &mut recv).await,
+        Request::Agent { host } => return agent(state, host, send, recv).await,
+        Request::ExecOn { host, script } => match mm::check_host(&state.env, &host).await {
+            Ok(()) => ops::exec(&state.env, &mm::exec_on_script(&host, &script)).await,
+            Err(e) => Response::Error(format!("{e:#}")),
+        },
+        Request::Machines => match mm::machines(&state.env).await {
+            Ok(list) => Response::Machines(list),
+            Err(e) => Response::Error(format!("{e:#}")),
+        },
     };
     write_frame(&mut send, &reply).await?;
     send.finish()?;
@@ -294,7 +304,7 @@ async fn serve_stream(state: &State, mut send: SendStream, mut recv: RecvStream)
 
 /// `tmux -C` without a PTY (et-ios SPEC.md §2.1 step 4). When the phone closes
 /// its side, tmux's stdin closes and tmux detaches; the session keeps running.
-async fn control(state: &State, target: Target, mut send: SendStream, mut recv: RecvStream) -> anyhow::Result<()> {
+async fn control(state: &State, target: Target, mut send: SendStream, recv: RecvStream) -> anyhow::Result<()> {
     let tmux = match tmux::find(&state.env).await {
         TmuxStatus::Found(t) => t,
         TmuxStatus::NotFound(why) => {
@@ -309,27 +319,53 @@ async fn control(state: &State, target: Target, mut send: SendStream, mut recv: 
         Target::AttachOrCreate(name) => cmd.args(["-C", "new-session", "-A", "-s", name]),
     };
     // TERM=et-ios marks E.T.'s control clients (#{client_termname}).
-    cmd.env("TERM", "et-ios").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    cmd.env("TERM", "et-ios");
+    pipe(state, cmd, Response::ControlStarted, &format!("tmux -C {target:?}"), send, recv).await
+}
+
+/// `mm agent` here, or `ssh <host> mm agent` for a machine the node watches.
+/// etd does not read the manymux protocol; it only moves the bytes.
+async fn agent(state: &State, host: Option<String>, mut send: SendStream, recv: RecvStream) -> anyhow::Result<()> {
+    let label = format!("mm agent on {}", host.as_deref().unwrap_or("this machine"));
+    let cmd = match host {
+        None => mm::agent_local(&state.env),
+        Some(host) => match mm::check_host(&state.env, &host).await {
+            Ok(()) => mm::agent_remote(&state.env, &host),
+            Err(e) => {
+                write_frame(&mut send, &Response::Error(format!("{e:#}"))).await?;
+                send.finish()?;
+                return Ok(());
+            }
+        },
+    };
+    pipe(state, cmd, Response::AgentStarted, &label, send, recv).await
+}
+
+/// Runs `cmd` with its stdin fed from the phone, and its stdout and stderr
+/// sent down as `ControlFrame`s, then `Exit`. When the phone closes its side,
+/// stdin closes: tmux detaches, `mm agent` ends; the sessions keep running.
+async fn pipe(state: &State, mut cmd: Command, started: Response, label: &str, mut send: SendStream, mut recv: RecvStream) -> anyhow::Result<()> {
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     if let Ok(home) = ops::home(&state.env) {
         cmd.current_dir(home);
     }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            write_frame(&mut send, &Response::Error(format!("start tmux: {e}"))).await?;
+            write_frame(&mut send, &Response::Error(format!("start {label}: {e}"))).await?;
             send.finish()?;
             return Ok(());
         }
     };
-    write_frame(&mut send, &Response::ControlStarted).await?;
-    info!("tmux -C {target:?} started");
+    write_frame(&mut send, &started).await?;
+    info!("{label} started");
 
-    let mut stdin = child.stdin.take().context("tmux stdin")?;
-    let mut stdout = child.stdout.take().context("tmux stdout")?;
-    let stderr = child.stderr.take().context("tmux stderr")?;
+    let mut stdin = child.stdin.take().context("stdin")?;
+    let mut stdout = child.stdout.take().context("stdout")?;
+    let stderr = child.stderr.take().context("stderr")?;
     let (frames, mut frames_rx) = mpsc::channel::<ControlFrame>(64);
 
-    // Phone → tmux. Ends when the phone finishes or drops the stream.
+    // Phone → process. Ends when the phone finishes or drops the stream.
     let up = tokio::spawn(async move {
         let mut buf = vec![0u8; READ_CHUNK];
         while let Ok(Some(n)) = recv.read(&mut buf).await {
@@ -337,7 +373,7 @@ async fn control(state: &State, target: Target, mut send: SendStream, mut recv: 
                 break;
             }
         }
-        // Dropping stdin sends EOF: tmux detaches.
+        // Dropping stdin sends EOF: tmux detaches, mm agent ends.
     });
     let out_frames = frames.clone();
     let out = tokio::spawn(async move {
@@ -371,7 +407,7 @@ async fn control(state: &State, target: Target, mut send: SendStream, mut recv: 
     let _ = err.await;
     let status = child.wait().await?;
     up.abort();
-    info!("tmux -C exited: {status}");
+    info!("{label} exited: {status}");
     if let Ok(Some(mut send)) = writer.await {
         write_frame(&mut send, &ControlFrame::Exit(status.code())).await?;
         send.finish()?;

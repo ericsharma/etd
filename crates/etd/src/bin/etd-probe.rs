@@ -16,6 +16,8 @@ usage: etd-probe [--relay-only] <command>
   ping <etd-id>                   one request round trip
   sessions <etd-id>               list tmux sessions
   exec <etd-id> <script>          run a shell script, print output and exit code
+  machines <etd-id>               the machines manymux there watches
+  exec-on <etd-id> <host> <script> run a shell script on one of those machines
   upload <etd-id> <file> <path>   upload a local file to a path in the remote home
   attach <etd-id> <session>       print tmux -C output; stdin lines are tmux commands
   bench <etd-id> <session> [n]    time n tmux command round trips (default 20)
@@ -69,6 +71,16 @@ async fn main() -> anyhow::Result<()> {
             println!("{:?} in {:?}", call(&conn, Request::Ping).await?, t.elapsed());
         }
         ("sessions", []) => println!("{:#?}", call(&conn, Request::ListSessions).await?),
+        ("machines", []) => println!("{:?}", call(&conn, Request::Machines).await?),
+        ("exec-on", [host, script @ ..]) if !script.is_empty() => {
+            match call(&conn, Request::ExecOn { host: host.to_string(), script: script.join(" ") }).await? {
+                Response::ExecResult { output, exit_code, .. } => {
+                    print!("{}", String::from_utf8_lossy(&output));
+                    eprintln!("exit code {exit_code:?}");
+                }
+                other => println!("{other:?}"),
+            }
+        }
         ("exec", script) if !script.is_empty() => match call(&conn, Request::Exec { script: script.join(" ") }).await? {
             Response::ExecResult { output, exit_code, truncated } => {
                 print!("{}", String::from_utf8_lossy(&output));

@@ -1,0 +1,195 @@
+//! `Agent`, `ExecOn` and `Machines` against a throwaway manymux node.
+//!
+//! Isolation: every `mm` here is a wrapper that always passes
+//! `--socket <temp>`, with `MM_CONFIG_DIR=<temp>`, and `ssh` is a stub that
+//! runs the remote command on this machine. The real node
+//! (`/tmp/manymux-<uid>`) and the real machines are never reached.
+use std::net::{Ipv4Addr, SocketAddr};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::time::Duration;
+
+use et_proto::{read_frame, write_frame, ControlFrame, Request, Response, ALPN};
+use etd::config::{self, Paths};
+use etd::server;
+use iroh::endpoint::{presets, Connection};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
+
+fn real_mm() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|d| d.join("mm")).find(|p| p.is_file())
+}
+
+fn script(path: &Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A manymux node on its own socket, stopped on drop.
+struct Node {
+    dir: tempfile::TempDir,
+    child: Child,
+}
+
+impl Node {
+    fn bin(&self) -> PathBuf {
+        self.dir.path().join("bin")
+    }
+
+    fn config(&self) -> PathBuf {
+        self.dir.path().join("config")
+    }
+
+    fn start(real: &Path) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mm.sock");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        script(&bin.join("mm"), &format!("#!/bin/sh\nexec '{}' --socket '{}' \"$@\"\n", real.display(), socket.display()));
+        // ssh <options> [--] <host> [command…]: run the command here.
+        script(
+            &bin.join("ssh"),
+            &format!(
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in --) shift; break;; -o|-p|-l|-i|-F|-J|-S) shift 2;; -*) shift;; *) break;; esac; done\n\
+                 echo \"$1\" >> '{}'\nshift\n[ \"$1\" = -- ] && shift\n[ $# -eq 0 ] && exit 0\nexec /bin/sh -c \"$*\"\n",
+                dir.path().join("ssh.log").display()
+            ),
+        );
+        let child = Command::new(bin.join("mm"))
+            .args(["daemon", "--no-notify"])
+            .env("MM_CONFIG_DIR", dir.path().join("config"))
+            // The node reaches watched machines with `ssh`: the stub.
+            .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+            .env_remove("TMUX")
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(socket.exists(), "test node did not start");
+        Self { dir, child }
+    }
+
+    fn ssh_log(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("ssh.log")).unwrap_or_default()
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+async fn call(conn: &Connection, request: Request) -> Response {
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    write_frame(&mut send, &request).await.unwrap();
+    send.finish().unwrap();
+    read_frame(&mut recv).await.unwrap().unwrap()
+}
+
+/// Opens `Agent`, sends manymux `List`, and returns the decoded answer.
+#[allow(clippy::result_large_err)] // test helper
+async fn agent_list(conn: &Connection, host: Option<&str>) -> Result<manymux::proto::Response, Response> {
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    write_frame(&mut send, &Request::Agent { host: host.map(String::from) }).await.unwrap();
+    match read_frame::<Response>(&mut recv).await.unwrap().unwrap() {
+        Response::AgentStarted => {}
+        other => return Err(other),
+    }
+    let mut request = Vec::new();
+    manymux::proto::write_msg(&mut request, manymux::proto::tag::REQUEST, &manymux::proto::Request::List).await.unwrap();
+    send.write_all(&request).await.unwrap();
+    // manymux frames: [tag: u8][len: u32 BE][body], inside our ControlFrames.
+    let mut bytes = Vec::new();
+    loop {
+        if bytes.len() >= 5 {
+            let len = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+            if bytes.len() >= 5 + len {
+                assert_eq!(bytes[0], manymux::proto::tag::RESPONSE);
+                let answer = manymux::proto::decode(&bytes[5..5 + len]).unwrap();
+                send.finish().unwrap();
+                return Ok(answer);
+            }
+        }
+        match tokio::time::timeout(Duration::from_secs(10), read_frame::<ControlFrame>(&mut recv)).await.unwrap().unwrap().unwrap() {
+            ControlFrame::Stdout(b) => bytes.extend(b),
+            ControlFrame::Stderr(line) => eprintln!("mm agent stderr: {line}"),
+            ControlFrame::Exit(code) => panic!("mm agent exited early: {code:?}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn manymux_through_etd() {
+    let Some(real) = real_mm() else {
+        eprintln!("skipped: no `mm` on PATH");
+        return;
+    };
+    let node = Node::start(&real);
+
+    // The node watches one machine, "fakehost", reached through the stub.
+    let add = Command::new(node.bin().join("mm"))
+        .args(["add", "fakehost"])
+        .env("MM_CONFIG_DIR", node.config())
+        .env("PATH", format!("{}:{}", node.bin().display(), std::env::var("PATH").unwrap()))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(add.status.success(), "mm add: {}", String::from_utf8_lossy(&add.stderr));
+
+    let home = tempfile::tempdir().unwrap();
+    let mut env: etd::tmux::Env = std::env::vars().filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE").collect();
+    env.insert("PATH".into(), format!("{}:{}", node.bin().display(), env["PATH"]));
+    env.insert("MM_CONFIG_DIR".into(), node.config().display().to_string());
+    env.insert("HOME".into(), home.path().display().to_string());
+
+    let files = tempfile::tempdir().unwrap();
+    let paths = Paths::at(files.path().into());
+    let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+    let state = server::State::new(paths.clone(), env);
+    let _router = server::serve(endpoint.clone(), state);
+    let phone = SecretKey::generate();
+    config::add_client(&paths, phone.public(), "phone").unwrap();
+    let port = endpoint.bound_sockets().iter().find(|a| a.is_ipv4()).unwrap().port();
+    let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+    let client = Endpoint::builder(presets::Minimal).secret_key(phone).bind().await.unwrap();
+    let conn = client.connect(addr, ALPN).await.unwrap();
+
+    assert_eq!(call(&conn, Request::Machines).await, Response::Machines(vec!["fakehost".into()]));
+
+    // This machine's node, and fakehost's (the same test node, through ssh).
+    for host in [None, Some("fakehost")] {
+        match agent_list(&conn, host).await {
+            Ok(manymux::proto::Response::Sessions(list)) => assert!(list.is_empty(), "{host:?}: {list:?}"),
+            other => panic!("{host:?}: {other:?}"),
+        }
+    }
+    assert!(node.ssh_log().lines().any(|h| h == "fakehost"), "ssh was not used: {:?}", node.ssh_log());
+
+    // A machine the node does not watch is refused before any ssh.
+    let before = node.ssh_log();
+    match agent_list(&conn, Some("evil.example")).await {
+        Err(Response::Error(e)) => assert!(e.contains("not a machine"), "{e}"),
+        other => panic!("{other:?}"),
+    }
+    match call(&conn, Request::ExecOn { host: "evil.example".into(), script: "true".into() }).await {
+        Response::Error(e) => assert!(e.contains("not a machine"), "{e}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(node.ssh_log(), before, "a refused host must not reach ssh");
+
+    // ExecOn: quoting survives, stderr is joined, the exit code comes back.
+    match call(&conn, Request::ExecOn { host: "fakehost".into(), script: "echo $((1+2)); echo 'it'\"'\"'s' >&2; exit 4".into() }).await {
+        Response::ExecResult { output, exit_code, .. } => {
+            assert_eq!(String::from_utf8_lossy(&output), "3\nit's\n");
+            assert_eq!(exit_code, Some(4));
+        }
+        other => panic!("{other:?}"),
+    }
+}

@@ -5,7 +5,9 @@
 //!   [`Response`] frame. `Control` then carries [`ControlFrame`]s down and raw
 //!   bytes up (tmux stdin). `Upload` sends its raw bytes after the request.
 //! - A frame is a big-endian `u32` length, then a postcard body.
-//! - postcard is positional: any change to these types is a new ALPN.
+//! - postcard is positional. New variants go at the end of an enum, so an
+//!   older peer still decodes what it knows. Any other change (reorder,
+//!   remove, a new field) is a new ALPN. No users yet: no compatibility code.
 //! - A device that is not paired may send only `Pair`.
 use anyhow::{bail, Context};
 use iroh::endpoint::{RecvStream, SendStream};
@@ -36,6 +38,14 @@ pub enum Request {
     /// `len` raw bytes follow. `path` is absolute or starts with `~/`, and must
     /// be inside the user's home directory. Parent directories are made.
     Upload { path: String, len: u64 },
+    /// A pipe to `mm agent` (manymux): on this machine (`None`), or through
+    /// `ssh <host> mm agent` for a machine in `Machines`. After `AgentStarted`
+    /// the stream carries `ControlFrame`s down and raw bytes up, as `Control`.
+    Agent { host: Option<String> },
+    /// `Exec` on a machine in `Machines`, through `ssh <host> /bin/sh -c`.
+    ExecOn { host: String, script: String },
+    /// The machines this machine's manymux node watches (`mm hosts`).
+    Machines,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,6 +71,9 @@ pub enum Response {
     ExecResult { output: Vec<u8>, exit_code: Option<i32>, truncated: bool },
     /// The absolute path written.
     Uploaded { path: String },
+    /// `mm agent` started; `ControlFrame`s follow.
+    AgentStarted,
+    Machines(Vec<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,12 +108,12 @@ pub struct SessionInfo {
     pub attached: u32,
 }
 
-/// Down the `Control` stream, after `ControlStarted`.
+/// Down a `Control` or `Agent` stream, after `ControlStarted` or `AgentStarted`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ControlFrame {
     Stdout(Vec<u8>),
     Stderr(String),
-    /// tmux exited. None: killed by a signal.
+    /// The process (tmux, or `mm agent`) exited. None: killed by a signal.
     Exit(Option<i32>),
 }
 

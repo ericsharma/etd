@@ -20,7 +20,11 @@
           pname = "etd";
           version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
           src = self;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # A dev-dependency (crates/etd tests), but Cargo.lock vendors it too.
+            outputHashes."manymux-0.2.2" = "sha256-gCK68CXHvz5MhRBomft6doBvRIwhAv4blezmknXZWZw=";
+          };
           cargoBuildFlags = [
             "-p"
             "etd"
