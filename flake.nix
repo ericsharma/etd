@@ -22,7 +22,7 @@
           src = self;
           cargoLock = {
             lockFile = ./Cargo.lock;
-            # A dev-dependency (crates/etd tests), but Cargo.lock vendors it too.
+            # manymux, a git dependency: etd (events) and et-link use its client core.
             outputHashes."manymux-0.2.2" = "sha256-gCK68CXHvz5MhRBomft6doBvRIwhAv4blezmknXZWZw=";
           };
           cargoBuildFlags = [

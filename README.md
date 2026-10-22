@@ -1,6 +1,11 @@
 # etd
 
-`etd` lets the E.T. iPhone app reach tmux on a machine, with no VPN and no open port. It runs an [iroh](https://iroh.computer) endpoint. The phone finds the machine by its key, not by an IP address. Connections are direct when possible, with an encrypted relay when not.
+`etd` lets the E.T. iPhone app reach your terminal sessions on a machine, with no VPN and no open port. It runs an [iroh](https://iroh.computer) endpoint. The phone finds the machine by its key, not by an IP address. Connections are direct when possible, with an encrypted relay when not.
+
+It serves two kinds of sessions:
+
+- **tmux** on the machine that runs etd (tmux control mode, one native page per window).
+- **[manymux](https://github.com/rayfish/manymux)** sessions on that machine *and* on every machine its manymux node watches (`mm add <host>`). etd reaches those with `ssh <host> mm agent`, so only one machine needs etd.
 
 **Status: experimental.** The protocol can change. The iOS app with iroh support is not released yet.
 
@@ -20,6 +25,14 @@ To try it without a service, run `etd` in a terminal. When no device is paired, 
 | `etd status` | Show the endpoint id, relay, addresses, tmux, and connected devices |
 | `etd clients` | List paired devices |
 | `etd revoke <name\|id>` | Remove a device and close its connections |
+
+### manymux
+
+Install manymux on every machine (`mm` must be on the `PATH` of a non-interactive ssh), and run its node as a service on each. On the machine with etd, add the others: `mm add <host>`. Its node must find `ssh` on its `PATH` to watch them, or bells from those machines never arrive.
+
+### Notifications
+
+Set `ETD_NOTIFY_COMMAND` in etd's environment. For a bell, a notification request, or a failed exit in a manymux session that nobody is attached to, etd runs the command through `/bin/sh -c` with `ETD_KIND`, `ETD_MACHINE`, `ETD_SESSION`, `ETD_TITLE` and `ETD_BODY` set. See [docs/PROTOCOL.md](docs/PROTOCOL.md#notifications).
 
 ## Install
 
@@ -45,20 +58,31 @@ On Linux without a desktop login, run `loginctl enable-linger $USER`. Otherwise 
 
 ## Security
 
-A paired device can do what you can do in a shell on this machine: it can run commands and write files in your home directory. Pair only your own devices. Use `etd revoke` for a lost device.
+A paired device can do what you can do in a shell on this machine: it can run commands and write files in your home directory. Through manymux, it can also run commands on every machine in `mm hosts`, with this machine's ssh keys. Pair only your own devices. Use `etd revoke` for a lost device.
 
 - Each device must scan a QR code from this machine. A pairing code works one time, for 10 minutes.
 - iroh checks the keys of both ends (QUIC, TLS 1.3). Relays see only encrypted traffic.
+- etd refuses any machine name that is not in `mm hosts`, before it runs ssh.
 - Keys and paired devices: `~/.config/etd` (Linux) or `~/Library/Application Support/etd` (macOS), or `$ETD_HOME`.
+
+## Parts
+
+| Crate | What |
+|---|---|
+| `crates/et-proto` | The wire types and framing: [docs/PROTOCOL.md](docs/PROTOCOL.md) |
+| `crates/etd` | The daemon, its CLI, and `etd-probe` (a test client) |
+| `crates/et-link` | The app's side, for Swift through UniFFI; `scripts/build-ios.sh` makes the xcframework, `apple/EtLink` is the Swift package |
 
 ## Development
 
 ```sh
 nix develop
-env -u TMUX cargo test   # the end-to-end test starts its own tmux server
+env -u TMUX cargo test
 ```
 
-`etd-probe` is a test client: `etd-probe pair <link>`, `etd-probe hello <id>`, `etd-probe bench <id> <session>`.
+The end-to-end tests start their own tmux server and their own manymux node (`mm --socket <temp>`), with private config and log directories. They never touch your running sessions. Remove `$TMUX` anyway: inside a tmux pane, a tmux command without `-S` goes to that pane's server.
+
+`etd-probe` is a test client: `etd-probe pair <link>`, `etd-probe hello <id>`, `etd-probe machines <id>`, `etd-probe exec-on <id> <host> <script>`, `etd-probe bench <id> <session>`. `cargo run --example agent_ls -- <id> [host]` lists a machine's manymux sessions through etd.
 
 ## License
 
