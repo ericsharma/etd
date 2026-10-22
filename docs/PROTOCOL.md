@@ -1,11 +1,11 @@
-# et/1: the protocol between E.T. and etd
+# et/1: the protocol between E.T. and etd, and between etds
 
-The source of truth is `crates/et-proto/src/lib.rs`. When this document and the code disagree, the code is right: correct this document.
+The source of truth is `crates/et-proto/src/lib.rs` (requests) and `crates/et-proto/src/network.rs` (the network document). When this document and the code disagree, the code is right: correct this document.
 
 ## Transport
 
 - iroh QUIC, ALPN `et/1`. Both ends are identified by their iroh keys (TLS 1.3).
-- One connection per app session. Each operation opens one bidirectional stream.
+- One connection per app session; machines also connect to each other. Each operation opens one bidirectional stream.
 - Framing: a big-endian `u32` length, then a [postcard](https://docs.rs/postcard) body. Frames over 16 MiB are refused.
 - The first frame on a stream is a `Request`. etd answers with one `Response` frame. Some requests then carry more data on the same stream (see below).
 
@@ -17,40 +17,68 @@ postcard is positional: an enum is a bare index, and a struct is its fields in o
 - Any other change (reorder, remove, a new field in a struct) is a new ALPN.
 - There are no users yet, so there is no compatibility code.
 
+## The network
+
+Each etd keeps one network: `network.json` (the signed document) in its config directory, and on machines `network.key` (the network key's secret half).
+
+```
+Network { key: PublicKey, name, records: { EndpointId → Record } }
+Record  { state: Member { name, kind: Machine | Device } | Removed, stamp: Stamp }
+Stamp   { counter: u64, author: EndpointId }        // compared counter first, then author
+Signed  { network: Network, signature }              // signed by the network key
+```
+
+- **Signature.** A document counts only when the network key signed its postcard bytes. A machine applies only signed documents; the app checks the signature too.
+- **Who changes it.** A machine gets the network key when it joins; a device does not. So only machines change the document: add a member (an invite redeemed there), or remove one (`etd revoke`).
+- **Merge without clocks.** A change gives the record a stamp one higher than any in the document. Merging two documents keeps, for each id, the record with the higher stamp. Two machines that change the document at the same time both keep their changes, and every machine ends with the same result. A removal is a record (`Removed`), so it travels like any other change; a removed member comes back only with a newer record (a new invite).
+- **Sync.** When a machine's document changes, it sends it to every other machine (`NetworkUpdate`). The receiver checks the signature, merges, signs the result with its copy of the key, and sends it on if it changed. A failed send is retried after 10 s, then with doubling waits; every machine also sends its document every 5 minutes.
+- **The first start** makes a network with this machine as the only member (and moves devices paired before networks existed, from `clients.json`, into it).
+- **Not done yet:** after a *machine* is revoked, the others keep the same network key; and a machine that was offline learns of changes only from another machine (a pkarr record signed by the network key is planned).
+
 ## Access
 
-etd reads the peer's `EndpointId` from the connection.
+etd reads the peer's `EndpointId` from the connection and looks it up in the network.
 
-- Not in `clients.json`: the first stream must be `Pair` with a valid secret. Anything else closes the connection with the reason `not paired`. 5 pairing tries per minute per device.
-- Removed with `etd revoke`: open connections close with the reason `revoked` within 2 seconds.
+- Not a member: the first stream must be `Join` or `Pair` with a valid invite secret. Anything else closes the connection with the reason `not paired`. 5 tries per minute per peer.
+- Removed (`etd revoke` on any machine): every machine closes its open connections, with the reason `revoked`, within seconds of getting the document.
 
-## Pairing ticket
+## Invite ticket
 
 `et://pair?t=<BASE32>`: upper-case base32 (no padding) of the postcard `Ticket`:
 
 | Field | Meaning |
 |---|---|
-| `addr` | etd's `EndpointAddr`: id and relay URL only (direct addresses make the QR code too large) |
-| `secret` | 32 random bytes; etd stores only its SHA-256, and it works one time |
-| `expires` | Unix seconds; 10 minutes after `etd pair` |
+| `addr` | The inviting etd's `EndpointAddr`: id and relay URL only (direct addresses make the QR code too large) |
+| `secret` | 32 random bytes; the inviting machine stores only its SHA-256 and the kind it admits (machine or device); it works one time |
+| `expires` | Unix seconds; 10 minutes after the invite |
 | `host_name` | For the app's confirm sheet |
 
 ## Requests
 
-| # | Request | Response | Then on the stream |
-|---|---|---|---|
-| 0 | `Hello { app }` | `HostInfo { host_name, os, etd_version, tmux }` | — |
-| 1 | `ListSessions` | `Sessions([SessionInfo])` (tmux) | — |
-| 2 | `Control { target }` | `ControlStarted` | `ControlFrame`s down, raw bytes up (tmux stdin) |
-| 3 | `Ping` | `Pong` | — |
-| 4 | `Pair { secret, device_name }` | `Paired { host_name }` or `Rejected(reason)` | — |
-| 5 | `Exec { script }` | `ExecResult { output, exit_code, truncated }` | — |
-| 6 | `Upload { path, len }` | `Uploaded { path }` | `len` raw bytes up, before the response |
-| 7 | `Agent { host }` | `AgentStarted` | `ControlFrame`s down, raw bytes up (`mm agent` stdin) |
-| 8 | `ExecOn { host, script }` | `ExecResult { … }` | — |
-| 9 | `Machines` | `Machines([String])` | — |
+| # | Request | Who may send it | Response | Then on the stream |
+|---|---|---|---|---|
+| 0 | `Hello { app }` | member | `HostInfo { host_name, os, etd_version, tmux }` | — |
+| 1 | `ListSessions` | member | `Sessions([SessionInfo])` (tmux) | — |
+| 2 | `Control { target }` | member | `ControlStarted` | `ControlFrame`s down, raw bytes up (tmux stdin) |
+| 3 | `Ping` | member | `Pong` | — |
+| 4 | `Pair { secret, device_name }` | anyone | `Paired { host_name }` or `Rejected(reason)` | — |
+| 5 | `Exec { script }` | member | `ExecResult { output, exit_code, truncated }` | — |
+| 6 | `Upload { path, len }` | member | `Uploaded { path }` | `len` raw bytes up, before the response |
+| 7 | `Agent { host }` | member | `AgentStarted` | `ControlFrame`s down, raw bytes up (`mm agent` stdin) |
+| 8 | `ExecOn { host, script }` | member | `ExecResult { … }` | — |
+| 9 | `Machines` | member | `Machines([String])` | — |
+| 10 | `Join { secret, name, kind }` | anyone | `Joined { network, network_key }` or `Rejected(reason)` | — |
+| 11 | `Network` | member | `NetworkDoc(signed)` | — |
+| 12 | `NetworkUpdate { network }` | machine | `Pong` | — |
+| 13 | `Invite { kind }` | member | `Invitation { url }` | — |
+| 14 | `Notify { note }` | machine | `Pong` | — |
+| 15 | `Foreground { until }` | member | `Pong` | — |
 
 Any request can get `Error(message)` instead.
+
+### Joining (`Join`, `Pair`)
+
+`Join` redeems an invite secret for a member of `kind`. The invite's kind must match: a device invite cannot make a machine. A machine name must be unique in the network (manymux and `etd-ssh` address machines by name); a device with a taken name gets " 2", " 3"… `Joined` carries the signed document and, for a machine only, the network key. `Pair` is the app's form of `Join` with `kind: Device`; it answers `Paired`. The connection continues as a member.
 
 ### tmux (`Control`)
 
@@ -60,7 +88,7 @@ Any request can get `Error(message)` instead.
 
 ### Shell (`Exec`, `ExecOn`)
 
-`/bin/sh -c <script>` in the home directory, with the user's login environment, stderr joined to stdout. Limits: 120 s and 8 MiB of output (`truncated`). `ExecOn` runs it on another machine through `ssh <host> /bin/sh -c '<script>'`.
+`/bin/sh -c <script>` in the home directory, with the user's login environment, stderr joined to stdout. Limits: 120 s and 8 MiB of output (`truncated`). `ExecOn` runs it on a machine reached by ssh (see `Agent`).
 
 ### Files (`Upload`)
 
@@ -68,10 +96,22 @@ Any request can get `Error(message)` instead.
 
 ### manymux (`Agent`, `Machines`)
 
-`Agent { host: None }` runs `mm agent` on etd's machine; `Agent { host: Some(name) }` runs `ssh <name> mm agent`. The app then speaks [manymux](https://github.com/rayfish/manymux)'s own protocol through the pipe; etd does not read it. A manymux node answers one request per stream, except `Attach` and `Events`, so the app opens many short `Agent` streams. etd keeps one ssh connection per machine (`ControlMaster`, 2 minutes), so each is a round trip, not a login.
+`Agent { host: None }` runs `mm agent` on etd's machine. The app then speaks [manymux](https://github.com/rayfish/manymux)'s own protocol through the pipe; etd does not read it. A manymux node answers one request per stream, except `Attach` and `Events`, so the app opens many short `Agent` streams.
 
-`host` (for `Agent` and `ExecOn`) must be in `Machines`: the output of `mm hosts` on etd's machine. Other names are refused before any ssh, so a paired device cannot make etd's machine connect to an address of its choice.
+In a network, the app connects to each machine's etd and uses `Agent { host: None }` there. `Agent { host: Some(name) }` and `ExecOn` are for a machine that is *not* in the network but that etd's machine reaches with `ssh <name> mm agent` (it must be in `Machines`, the output of `mm hosts`; other names are refused before any ssh). They go away when nothing needs them.
 
-## Notifications
+### Pushes (`Notify`, `Foreground`)
 
-Not part of the protocol. If `ETD_NOTIFY_COMMAND` is set, etd follows the local manymux node's event feed (which also carries the machines it watches). For a bell, a notification request (OSC 9/777), or a non-zero exit in a session with nobody attached, it runs the command through `/bin/sh -c` with `ETD_KIND` (`bell`, `notify`, `exit`), `ETD_MACHINE`, `ETD_SESSION`, `ETD_TITLE` and `ETD_BODY`. The command does the rest (for example, an APNs push).
+Each etd follows its own manymux node. For a session that nobody is attached to, a bell, a notification request (OSC 9/777) or a non-zero exit becomes a `Note { kind, machine, session, title, body }` (`machine`: the network's name for the machine). etd runs its push command (`ETD_NOTIFY_COMMAND`) if it has one, and sends `Notify` to every other machine; a machine with a push command runs it. A machine that etd's node reaches by ssh but that is not in the network is pushed for locally.
+
+The push command runs through `/bin/sh -c` with `ETD_KIND` (`bell`, `notify`, `exit`), `ETD_MACHINE`, `ETD_SESSION`, `ETD_TITLE` and `ETD_BODY`.
+
+`Foreground { until }` (Unix seconds, at most 2 minutes ahead): the app is open; this machine runs no push command until then. The app sends it every 20 s to every machine while it is in the foreground.
+
+## The local socket (`etd-ssh`)
+
+Not over iroh: a Unix socket in etd's state directory (`etd.sock`, mode 0600, or `$ETD_SOCKET`), with the same frames. `etd-ssh` is an `ssh` stand-in for manymux (`MM_SSH=etd-ssh`):
+
+- `etd-ssh [options] <machine> -- mm agent` sends `Agent { host: Some(machine) }`; the local etd connects to that machine's etd (it keeps the connection) and opens `Agent { host: None }` there. Then the stream is the pipe.
+- Any other command sends `ExecOn { host: machine, script }`; the local etd runs it there as `Exec`. Output goes to stdout; the exit code becomes etd-ssh's.
+- `<machine>` is a machine member's name. etd-ssh exits with 255 when it fails itself, as ssh does.

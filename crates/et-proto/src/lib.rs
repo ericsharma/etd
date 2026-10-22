@@ -62,7 +62,7 @@ pub enum Request {
     /// machine with a push command runs it; others ignore it.
     Notify { note: Note },
     /// The app is open until `until` (Unix seconds): no pushes until then
-    /// (devices only). The app sends it every 20 s while open.
+    /// (any member; the app sends it every 20 s while open).
     Foreground { until: u64 },
 }
 

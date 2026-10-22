@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("  {:<20} {}", m.name, kind_word(m.kind));
             }
             if config::running_status(&paths)?.is_none() {
-                println!("\nStart etd to use it: `etd install` (or `etd` in a terminal).");
+                println!("\netd is not running here. Start its service (it reads the new network when it starts),\nor install one with `etd install`, or run `etd` in a terminal.");
             }
             Ok(())
         }
