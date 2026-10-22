@@ -241,6 +241,23 @@ pub struct ExecResult {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NetworkMember {
+    /// Connect to a machine with `Link::connect(endpoint_id, nil)`.
+    pub endpoint_id: String,
+    pub name: String,
+    /// A machine runs etd (and has sessions); otherwise a phone or tablet.
+    pub is_machine: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NetworkInfo {
+    pub name: String,
+    /// The network key (the network's id).
+    pub key: String,
+    pub members: Vec<NetworkMember>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum ControlTarget {
     Attach { name: String },
@@ -346,6 +363,49 @@ impl RemoteHost {
                 rtt_ms: p.rtt().as_secs_f64() * 1000.0,
             },
             None => PathInfo { kind: PathKind::None, rtt_ms: 0.0 },
+        }
+    }
+
+    /// The network this machine belongs to: every machine and device. The
+    /// network key's signature is checked here, so a machine cannot show a
+    /// member list the network did not sign.
+    pub async fn network(&self) -> Result<NetworkInfo, LinkError> {
+        match self.call(Request::Network).await? {
+            Response::NetworkDoc(signed) => {
+                signed.verify().map_err(|e| LinkError::Protocol { message: format!("{e:#}") })?;
+                let members = signed
+                    .network
+                    .members()
+                    .map(|m| NetworkMember {
+                        endpoint_id: m.id.to_string(),
+                        name: m.name.to_string(),
+                        is_machine: m.kind == et_proto::network::Kind::Machine,
+                    })
+                    .collect();
+                Ok(NetworkInfo { name: signed.network.name.clone(), key: signed.network.key.to_string(), members })
+            }
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// An invite link (`et://pair?t=…`) for a new device, or with `machine`
+    /// for a new machine (`etd join <link>` there). Valid 10 minutes, once.
+    pub async fn invite(&self, machine: bool) -> Result<String, LinkError> {
+        let kind = if machine { et_proto::network::Kind::Machine } else { et_proto::network::Kind::Device };
+        match self.call(Request::Invite { kind }).await? {
+            Response::Invitation { url } => Ok(url),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// "The app is open" for the next `seconds` (at most 120): this machine
+    /// sends no pushes until then. Send it every 20 s while open, to every
+    /// machine.
+    pub async fn foreground(&self, seconds: u32) -> Result<(), LinkError> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        match self.call(Request::Foreground { until: now + u64::from(seconds) }).await? {
+            Response::Pong => Ok(()),
+            other => Err(unexpected(other)),
         }
     }
 

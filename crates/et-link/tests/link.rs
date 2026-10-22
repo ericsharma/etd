@@ -47,6 +47,15 @@ async fn link_end_to_end() {
     assert!(matches!(host.upload("/etc/x".into(), b"x".to_vec()).await, Err(LinkError::Remote { .. })));
     assert!(host.ping().await.unwrap() >= 0.0);
 
+    // The network: checked on the phone, with this phone in it.
+    let net = host.network().await.unwrap();
+    let mut names: Vec<(String, bool)> = net.members.iter().map(|m| (m.name.clone(), m.is_machine)).collect();
+    names.sort();
+    assert_eq!(names, [("hub".to_string(), true), ("test phone".to_string(), false)]);
+    assert!(host.invite(false).await.unwrap().starts_with("et://pair?t="));
+    assert!(host.invite(true).await.unwrap().starts_with("et://pair?t="));
+    host.foreground(60).await.unwrap();
+
     // The link works once only.
     let other = phone().await;
     assert!(matches!(other.pair(url, "other".into()).await, Err(LinkError::PairingRefused { .. })));
