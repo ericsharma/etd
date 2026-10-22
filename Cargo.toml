@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/et-proto", "crates/etd"]
+members = ["crates/et-proto", "crates/etd", "crates/et-link"]
 
 [workspace.package]
 version = "0.0.1"
@@ -15,3 +15,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# iroh 1.4 → netwatch → netdev 0.46 does not build for iOS; see vendor/README.md.
+# Also keep libc at 0.2.189 in Cargo.lock: 0.2.190+ hides the Apple routing
+# names from iOS.
+[patch.crates-io]
+netdev = { path = "vendor/netdev" }

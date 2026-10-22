@@ -1,2 +1,6 @@
 /target
 /result
+/apple/EtLink/EtLinkFFI.xcframework
+/apple/EtLink/Sources/EtLink/et_link.swift
+/apple/EtLink/.build
+/apple/EtLink/.swiftpm
