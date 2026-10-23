@@ -147,7 +147,18 @@ async fn send_files(
     let files = connections.files.get(paths).await?;
     let conn = connections.to(endpoint, id).await.with_context(|| to.to_string())?;
     let sent: Vec<PathBuf> = sent.iter().map(PathBuf::from).collect();
-    files.send(&conn, &sent, session, out).await
+    let outgoing = files.import(&sent).await?;
+    let (progress, mut updates) = tokio::sync::mpsc::unbounded_channel();
+    let sending = files.send(&conn, &outgoing, session, move |done, total| {
+        let _ = progress.send((done, total));
+    });
+    tokio::pin!(sending);
+    loop {
+        tokio::select! {
+            result = &mut sending => return result,
+            Some((done, total)) = updates.recv() => send(out, &Response::Progress { done, total }).await?,
+        }
+    }
 }
 
 /// Sends `request` (`Agent { host: Some }` or `ExecOn`) on to that machine,

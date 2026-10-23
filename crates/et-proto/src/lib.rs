@@ -15,6 +15,7 @@ use iroh::endpoint::{RecvStream, SendStream};
 use iroh::EndpointAddr;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+pub mod files;
 pub mod network;
 
 pub const ALPN: &[u8] = b"et/1";

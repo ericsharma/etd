@@ -6,9 +6,11 @@
 //!   `SSHConnection` calls: hello (findTmux), sessions, exec (run), upload,
 //!   open_control (openControlChannel).
 //! - [`ControlStream`]: `tmux -C` bytes; it backs the app's `ControlChannel`.
+//! - [`RemoteHost::send_files`]: files to a machine's `~/etd-downloads/`.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use et_proto::files::{Files, GC_EVERY};
 use et_proto::{read_frame, write_frame, ControlFrame, Request, Response, Ticket, ALPN};
 use iroh::endpoint::{presets, ConnectionError, QuicTransportConfig, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
@@ -273,6 +275,33 @@ pub struct PathInfo {
     pub rtt_ms: f64,
 }
 
+/// Progress of `send_files`: payload bytes the machine has, of `total`.
+#[uniffi::export(with_foreign)]
+pub trait SendProgress: Send + Sync {
+    fn on_progress(&self, done: u64, total: u64);
+}
+
+/// What `send_files` delivered.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Delivered {
+    /// The top-level paths on the machine, one per file or folder sent.
+    pub paths: Vec<String>,
+    /// etd typed them into the session.
+    pub typed: bool,
+}
+
+/// The app's blob store for sending, in its temporary directory: it holds
+/// only references to the files being sent.
+static FILES: tokio::sync::OnceCell<Arc<Files>> = tokio::sync::OnceCell::const_new();
+
+async fn files() -> Result<Arc<Files>, LinkError> {
+    FILES
+        .get_or_try_init(|| async { Files::open(&std::env::temp_dir().join("et-link-files"), GC_EVERY).await })
+        .await
+        .cloned()
+        .map_err(|e| LinkError::Invalid { message: format!("file store: {e:#}") })
+}
+
 /// One connection to one machine's etd.
 #[derive(uniffi::Object)]
 pub struct RemoteHost {
@@ -400,6 +429,28 @@ impl RemoteHost {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         match self.call(Request::Foreground { until: now + u64::from(seconds) }).await? {
             Response::Pong => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Sends files and folders (local paths) to `~/etd-downloads/` on this
+    /// machine (PLAN-files). `session`: also type the paths into that
+    /// manymux session. Keep access to the files (security-scoped URLs)
+    /// until it returns. Cancel the task to stop; sending again resumes.
+    pub async fn send_files(
+        &self,
+        paths: Vec<String>,
+        session: Option<String>,
+        progress: Arc<dyn SendProgress>,
+    ) -> Result<Delivered, LinkError> {
+        let files = files().await?;
+        let paths: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
+        let outgoing = files.import(&paths).await.map_err(|e| invalid(format!("{e:#}")))?;
+        progress.on_progress(0, outgoing.total);
+        let answer =
+            files.send(&self.conn, &outgoing, session, |done, total| progress.on_progress(done, total)).await.map_err(stream_error)?;
+        match answer {
+            Response::Delivered { paths, typed } => Ok(Delivered { paths, typed }),
             other => Err(unexpected(other)),
         }
     }

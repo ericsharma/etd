@@ -11,3 +11,5 @@ postcard.workspace = true
 serde.workspace = true
 anyhow.workspace = true
 data-encoding = "2"
+iroh-blobs.workspace = true
+tokio.workspace = true

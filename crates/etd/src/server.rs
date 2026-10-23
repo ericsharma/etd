@@ -538,7 +538,7 @@ async fn deliver(
     let delivered = async {
         let files = state.connections.files.get(&state.paths).await?;
         let downloads = files::downloads(&state.env)?;
-        files.deliver(conn, hash, &downloads, &mut send).await
+        files::deliver(&files, conn, hash, &downloads, &mut send).await
     }
     .await;
     let reply = match delivered {
