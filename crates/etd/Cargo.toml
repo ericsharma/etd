@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 et-proto = { path = "../et-proto" }
 iroh.workspace = true
+iroh-blobs.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

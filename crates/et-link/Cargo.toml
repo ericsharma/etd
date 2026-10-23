@@ -24,7 +24,9 @@ serde.workspace = true
 # The manymux client core (no PTYs). Same commit as nixos-config's manymux
 # input (v0.2.2); a bump changes both.
 manymux = { git = "https://github.com/rayfish/manymux", rev = "ee00f0786ea67ad65e780a9b47e554461f009c50", default-features = false }
+iroh-blobs.workspace = true
 
 [dev-dependencies]
 etd = { path = "../etd" }
 tempfile = "3"
+n0-future = "0.3"
