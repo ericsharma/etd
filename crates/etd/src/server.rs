@@ -545,11 +545,14 @@ async fn deliver(
         Ok(paths) => {
             let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
             info!("files from {}: {}", peer.fmt_short(), paths.join(", "));
+            let mut typed = false;
             if let Some(session) = session {
-                // Typing into a manymux session: PLAN-files F4.
-                debug!("not typed into {session}: not built yet");
+                match mm::type_into(&state.env, &session, &mm::typed_paths(&paths)).await {
+                    Ok(()) => typed = true,
+                    Err(e) => warn!("paths not typed into {session}: {e:#}"),
+                }
             }
-            Response::Delivered { paths, typed: false }
+            Response::Delivered { paths, typed }
         }
         Err(e) => {
             warn!("files from {}: {e:#}", peer.fmt_short());

@@ -105,7 +105,7 @@ The bytes move with [iroh-blobs](https://github.com/n0-computer/iroh-blobs) 0.10
 1. The sender imports its files and folders into its blob store as one iroh-blobs `Collection` (names relative to each path's parent: `notes.md`, `out/logs/run.txt`).
 2. On a connection **it opened** to the target, the sender runs the iroh-blobs provider (`provider::handle_connection`), which serves that collection's root hash only (other gets and observes are refused). A phone can send although it accepts no connections.
 3. The sender sends `Deliver { hash }`. The target etd asks for the sizes, checks that its disk keeps 2 GB free, then fetches over the same connection only the chunks its store does not have: a `Deliver` sent again after a cut resumes.
-4. The target writes each top-level item to `~/etd-downloads/` (`$ETD_DOWNLOADS`); a taken name gets ` (2)`, ` (3)`… It answers `Delivered` with the top-level paths. `session` (type the paths into that manymux session) is not built yet: `typed` is `false`.
+4. The target writes each top-level item to `~/etd-downloads/` (`$ETD_DOWNLOADS`); a taken name gets ` (2)`, ` (3)`… It answers `Delivered` with the top-level paths. With `session`, etd then types the paths (shell-quoted when needed, a space after each, no Enter) into that manymux session on its machine, through `mm agent`: it attaches at the session's current size (a session takes the smallest size of its clients, so nothing resizes), types, and detaches. `typed` says whether that worked.
 
 Blobs live only while a send or delivery runs; the store's garbage collection (every 10 minutes) removes the rest. The sender imports by reference, and the store never deletes a file it references, so the user's files are never removed.
 

@@ -115,7 +115,7 @@ async fn send(paths: &Paths, args: &[&str]) -> anyhow::Result<()> {
                     println!("{path}");
                 }
                 if let (Some(session), false) = (session, typed) {
-                    eprintln!("(not typed into {to}:{session}: typing into a session is not built yet)");
+                    eprintln!("(not typed into {to}:{session}: no such manymux session there, or see etd's log on {to})");
                 }
                 return Ok(());
             }

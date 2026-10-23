@@ -1,8 +1,13 @@
-//! manymux on this machine: `mm hosts`, `mm agent`, and manymux's machine
-//! list. etd never reads the manymux protocol; it starts `mm agent` and moves
-//! the bytes. Other machines are reached through the network (local.rs).
+//! manymux on this machine: `mm hosts`, `mm agent`, manymux's machine list,
+//! and typing into a session (`type_into`). For the app, etd only starts
+//! `mm agent` and moves the bytes. Other machines are reached through the
+//! network (local.rs).
+use std::process::Stdio;
+use std::time::Duration;
+
 use anyhow::{bail, Context};
-use tokio::process::Command;
+use manymux::proto::{self as mp, tag, FrameReader};
+use tokio::process::{ChildStdin, Command};
 
 use crate::tmux::Env;
 
@@ -35,6 +40,76 @@ pub fn agent_local(env: &Env) -> Command {
     let mut cmd = command(env, "mm");
     cmd.arg("agent");
     cmd
+}
+
+/// Types `text` into the session `name` on this machine's node, as a
+/// keyboard would. A session's size is the smallest of its attached
+/// clients' sizes, so attaching at the size it has already changes nothing:
+/// list it for its size, attach at that size, type, detach.
+pub async fn type_into(env: &Env, name: &str, text: &str) -> anyhow::Result<()> {
+    let (_list, mut stdin, mut reader) = agent(env)?;
+    mp::write_msg(&mut stdin, tag::REQUEST, &mp::Request::List).await?;
+    let size = match answer(&mut reader).await? {
+        mp::Response::Sessions(list) => {
+            list.into_iter().find(|s| s.name == name).map(|s| s.size).with_context(|| format!("no session named {name} here"))?
+        }
+        other => bail!("mm list: {other:?}"),
+    };
+    let (mut child, mut stdin, mut reader) = agent(env)?;
+    let attach = mp::Request::Attach { name: name.to_string(), size, history: 0, read_only: false };
+    mp::write_msg(&mut stdin, tag::REQUEST, &attach).await?;
+    match answer(&mut reader).await? {
+        mp::Response::Attached { .. } => {}
+        other => bail!("attach {name}: {other:?}"),
+    }
+    mp::write_frame(&mut stdin, tag::DATA, text.as_bytes()).await?;
+    mp::write_frame(&mut stdin, tag::DETACH, &[]).await?;
+    drop(stdin);
+    // The screen comes back while attached; nothing here needs it.
+    let drain = async { while let Ok(Some(_)) = reader.next().await {} };
+    let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+    let _ = child.kill().await;
+    Ok(())
+}
+
+/// A local `mm agent` with its pipes. The child dies when dropped.
+fn agent(env: &Env) -> anyhow::Result<(tokio::process::Child, ChildStdin, FrameReader<tokio::process::ChildStdout>)> {
+    let mut child = agent_local(env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("start `mm agent`")?;
+    let stdin = child.stdin.take().context("stdin")?;
+    let reader = FrameReader::new(child.stdout.take().context("stdout")?);
+    Ok((child, stdin, reader))
+}
+
+/// The node's answer to a request, skipping other frames.
+async fn answer(reader: &mut FrameReader<tokio::process::ChildStdout>) -> anyhow::Result<mp::Response> {
+    let read = async {
+        loop {
+            let frame = reader.next().await?.context("mm agent ended")?;
+            if frame.tag == tag::RESPONSE {
+                return match mp::decode::<mp::Response>(&frame.body)? {
+                    mp::Response::Error(e) => Err(anyhow::anyhow!("{e}")),
+                    response => Ok(response),
+                };
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), read).await.context("mm agent did not answer")?
+}
+
+/// Paths as one line for a prompt: each shell-quoted when it needs it, a
+/// space after each, no Enter.
+pub fn typed_paths(paths: &[String]) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+~@%:,=".contains(c);
+    paths
+        .iter()
+        .map(|p| if !p.is_empty() && p.chars().all(safe) { format!("{p} ") } else { format!("'{}' ", p.replace('\'', "'\\''")) })
+        .collect()
 }
 
 /// manymux's machine list: `$MM_CONFIG_DIR/hosts.toml`, else
@@ -76,6 +151,12 @@ pub fn write_hosts(path: &std::path::Path, names: &[String]) -> anyhow::Result<b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_paths_quote_only_when_needed() {
+        let paths = ["/h/etd-downloads/a.png".to_string(), "/h/etd-downloads/notes (2).md".to_string(), "/h/it's".to_string()];
+        assert_eq!(typed_paths(&paths), "/h/etd-downloads/a.png '/h/etd-downloads/notes (2).md' '/h/it'\\''s' ");
+    }
 
     #[test]
     fn hosts_file_round_trip() {
