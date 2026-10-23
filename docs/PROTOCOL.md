@@ -33,7 +33,8 @@ Signed  { network: Network, signature }              // signed by the network ke
 - **Merge without clocks.** A change gives the record a stamp one higher than any in the document. Merging two documents keeps, for each id, the record with the higher stamp. Two machines that change the document at the same time both keep their changes, and every machine ends with the same result. A removal is a record (`Removed`), so it travels like any other change; a removed member comes back only with a newer record (a new invite).
 - **Sync.** When a machine's document changes, it sends it to every other machine (`NetworkUpdate`). The receiver checks the signature, merges, signs the result with its copy of the key, and sends it on if it changed. A failed send is retried after 10 s, then with doubling waits; every machine also sends its document every 5 minutes.
 - **The first start** makes a network with this machine as the only member (and moves devices paired before networks existed, from `clients.json`, into it).
-- **Not done yet:** after a *machine* is revoked, the others keep the same network key; and a machine that was offline learns of changes only from another machine (a pkarr record signed by the network key is planned).
+- **New key after a machine is revoked.** A revoked machine still has the network key, so the machine that revokes it makes a new one. It keeps the change in `rotation.json`: `old` (the document with the machine removed, signed by the old key) and `new` (the same document with the new key, signed by it). Before each `NetworkUpdate`, a machine sends `NetworkRotate { old, new, key }`. The receiver takes it only if `old` is signed by the key it has now, `new` differs from `old` only in the key, and it is still a member. A machine with another key refuses it (a fork: two machines revoked at once with different results; fix by hand). A document signed by the old key is then refused as "another network".
+- **Catching up.** At its start, a machine asks every other machine for the document (`Network`). A machine that is asked by a machine answers and also sends it its document and the last key change, so a machine that was off during a key change gets it. There is no pkarr record: a pkarr record is last-writer-wins, and a revoked machine has the old key, so it could replace the record.
 
 ## Access
 
@@ -73,6 +74,7 @@ etd reads the peer's `EndpointId` from the connection and looks it up in the net
 | 13 | `Invite { kind }` | member | `Invitation { url }` | — |
 | 14 | `Notify { note }` | machine | `Pong` | — |
 | 15 | `Foreground { until }` | member | `Pong` | — |
+| 16 | `NetworkRotate { old, new, key }` | machine | `Pong` | — |
 
 Any request can get `Error(message)` instead.
 

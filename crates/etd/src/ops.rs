@@ -15,7 +15,10 @@ pub const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The user's home directory, from the login environment.
 pub fn home(env: &Env) -> anyhow::Result<PathBuf> {
-    env.get("HOME").map(PathBuf::from).or_else(dirs::home_dir).context("no home directory")
+    env.get("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .context("no home directory")
 }
 
 /// `/bin/sh -c` in the home directory, stderr joined to stdout, with a time limit.
@@ -56,12 +59,20 @@ pub async fn exec(env: &Env, script: &str) -> Response {
         child.wait().await
     };
     match tokio::time::timeout(EXEC_TIMEOUT, run).await {
-        Ok(Ok(status)) => Response::ExecResult { output, exit_code: status.code(), truncated },
+        Ok(Ok(status)) => Response::ExecResult {
+            output,
+            exit_code: status.code(),
+            truncated,
+        },
         Ok(Err(e)) => Response::Error(format!("wait: {e}")),
         // Dropping the child kills it.
         Err(_) => {
             output.extend_from_slice(format!("\netd: killed after {EXEC_TIMEOUT:?}\n").as_bytes());
-            Response::ExecResult { output, exit_code: None, truncated }
+            Response::ExecResult {
+                output,
+                exit_code: None,
+                truncated,
+            }
         }
     }
 }
@@ -87,27 +98,44 @@ pub fn resolve(home: &Path, path: &str) -> anyhow::Result<PathBuf> {
 /// Reads `len` bytes from `recv` into `path`, through a temporary file.
 pub async fn upload(env: &Env, path: &str, len: u64, recv: &mut RecvStream) -> Response {
     match try_upload(env, path, len, recv).await {
-        Ok(path) => Response::Uploaded { path: path.display().to_string() },
+        Ok(path) => Response::Uploaded {
+            path: path.display().to_string(),
+        },
         Err(e) => Response::Error(format!("{e:#}")),
     }
 }
 
-async fn try_upload(env: &Env, path: &str, len: u64, recv: &mut RecvStream) -> anyhow::Result<PathBuf> {
+async fn try_upload(
+    env: &Env,
+    path: &str,
+    len: u64,
+    recv: &mut RecvStream,
+) -> anyhow::Result<PathBuf> {
     if len > MAX_UPLOAD {
         bail!("upload too large: {len} bytes (max {MAX_UPLOAD})");
     }
     let home = home(env)?;
     let target = resolve(&home, path)?;
     let parent = target.parent().context("no parent directory")?;
-    tokio::fs::create_dir_all(parent).await.with_context(|| format!("create {}", parent.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("create {}", parent.display()))?;
     // A symlink in the path could point out of home.
     let real_home = tokio::fs::canonicalize(&home).await?;
-    if !tokio::fs::canonicalize(parent).await?.starts_with(&real_home) {
+    if !tokio::fs::canonicalize(parent)
+        .await?
+        .starts_with(&real_home)
+    {
         bail!("{} is outside {}", parent.display(), home.display());
     }
-    let name = target.file_name().context("no file name")?.to_string_lossy();
+    let name = target
+        .file_name()
+        .context("no file name")?
+        .to_string_lossy();
     let tmp = parent.join(format!(".{name}.etd-upload"));
-    let mut file = tokio::fs::File::create(&tmp).await.with_context(|| format!("create {}", tmp.display()))?;
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .with_context(|| format!("create {}", tmp.display()))?;
     let mut left = len;
     let mut buf = vec![0u8; 64 * 1024];
     while left > 0 {
@@ -137,7 +165,10 @@ mod tests {
     #[test]
     fn resolve_keeps_paths_inside_home() {
         let home = Path::new("/home/u");
-        assert_eq!(resolve(home, "~/a/b.png").unwrap(), Path::new("/home/u/a/b.png"));
+        assert_eq!(
+            resolve(home, "~/a/b.png").unwrap(),
+            Path::new("/home/u/a/b.png")
+        );
         assert_eq!(resolve(home, "/home/u/x").unwrap(), Path::new("/home/u/x"));
         assert!(resolve(home, "/etc/passwd").is_err());
         assert!(resolve(home, "~/../v/x").is_err());

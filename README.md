@@ -83,7 +83,8 @@ A member of the network can do what you can do in a shell on **every machine** o
 - A member list counts only when the network key signed it. The phone checks the signature too.
 - Only machines may change the member list (add, revoke). A phone or tablet may invite, but not revoke.
 - `etd-ssh` talks to the local etd over a socket that only your user can open.
-- Not done yet: when a *machine* is revoked, the others do not get a new network key, so the revoked machine could still sign changes. Revoking a phone or tablet is complete.
+- Revoking a *machine* also moves the network to a new network key, because the revoked machine knows the old one. The other machines take the new key only together with the change signed by the old key, so the revoked machine cannot follow or make its own. A machine that was off gets the change when it starts again, from any machine that is on.
+- A machine that is lost while every other machine is off can still sign changes until one of them revokes it: revoke a lost machine soon.
 - Keys and the network: `~/.config/etd` (Linux) or `~/Library/Application Support/etd` (macOS), or `$ETD_HOME`.
 
 ## Parts

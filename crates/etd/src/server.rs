@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use et_proto::network::{Kind, Network, Signed};
-use et_proto::{read_frame, write_frame, ControlFrame, HostInfo, Request, Response, Target, TmuxStatus, ALPN};
+use et_proto::{
+    read_frame, write_frame, ControlFrame, HostInfo, Request, Response, Target, TmuxStatus, ALPN,
+};
 use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointId, SecretKey};
@@ -82,7 +84,11 @@ impl State {
     /// A device said the app is open, and that time has not passed.
     pub(crate) fn app_open(&self) -> bool {
         let now = config::now_secs();
-        self.foreground.lock().unwrap().values().any(|until| *until > now)
+        self.foreground
+            .lock()
+            .unwrap()
+            .values()
+            .any(|until| *until > now)
     }
 
     pub(crate) fn paths(&self) -> &Paths {
@@ -99,7 +105,9 @@ impl State {
 
     fn add_live(&self, id: EndpointId, name: &str, conn: &Connection) {
         let mut live = self.live.lock().unwrap();
-        let entry = live.entry(id).or_insert_with(|| (name.to_string(), Vec::new()));
+        let entry = live
+            .entry(id)
+            .or_insert_with(|| (name.to_string(), Vec::new()));
         entry.1.push(conn.clone());
     }
 
@@ -131,7 +139,11 @@ impl State {
         live.retain(|id, (name, conns)| {
             let keep = network.member(id).is_some();
             if !keep {
-                info!("{name} ({}) revoked: closing {} connection(s)", id.fmt_short(), conns.len());
+                info!(
+                    "{name} ({}) revoked: closing {} connection(s)",
+                    id.fmt_short(),
+                    conns.len()
+                );
                 for conn in conns.iter() {
                     conn.close(2u32.into(), b"revoked");
                 }
@@ -141,7 +153,12 @@ impl State {
     }
 
     fn connected_names(&self) -> Vec<String> {
-        self.live.lock().unwrap().values().map(|(name, _)| name.clone()).collect()
+        self.live
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 }
 
@@ -150,7 +167,12 @@ impl State {
 pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Result<()> {
     let env = tmux::login_env().await;
     let tmux_text = match tmux::find(&env).await {
-        TmuxStatus::Found(t) => format!("{} ({}), TMUX_TMPDIR={}", t.path, t.version, t.tmpdir.as_deref().unwrap_or("default")),
+        TmuxStatus::Found(t) => format!(
+            "{} ({}), TMUX_TMPDIR={}",
+            t.path,
+            t.version,
+            t.tmpdir.as_deref().unwrap_or("default")
+        ),
         TmuxStatus::NotFound(why) => format!("not found yet: {why}"),
     };
     info!("tmux: {tmux_text}");
@@ -167,11 +189,18 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
     info!("endpoint id: {}", endpoint.id());
     // The first start makes the network (and moves paired devices into it).
     let signed = network::ensure(&paths, endpoint.id(), &tmux::host_name())?;
-    info!("network {}: {} member(s)", signed.network.name, signed.network.members().count());
+    info!(
+        "network {}: {} member(s)",
+        signed.network.name,
+        signed.network.members().count()
+    );
     let state_paths = paths.clone();
     let has_mm = mm::available(&env);
     let state = State::new(paths, env);
-    if let Some(command) = std::env::var("ETD_NOTIFY_COMMAND").ok().filter(|c| !c.trim().is_empty()) {
+    if let Some(command) = std::env::var("ETD_NOTIFY_COMMAND")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+    {
         state.set_notify_command(command);
     }
     let router = serve(endpoint.clone(), state.clone());
@@ -185,12 +214,21 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
     let watcher = tokio::spawn(watch(endpoint.clone(), state, tmux_text));
     // etd-ssh (manymux's MM_SSH) reaches the other machines through this.
     let local = local::spawn(endpoint.clone(), state_paths.clone());
-    if tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await.is_err() {
+    if tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online())
+        .await
+        .is_err()
+    {
         warn!("no relay after {ONLINE_TIMEOUT:?}; direct connections only until it comes up");
     }
     info!("online; run `etd invite` to add a device, `etd invite --machine` to add a machine");
     if show_pairing {
-        if let Err(e) = pair::print(&state_paths, &endpoint.addr(), &tmux::host_name(), Kind::Device, false) {
+        if let Err(e) = pair::print(
+            &state_paths,
+            &endpoint.addr(),
+            &tmux::host_name(),
+            Kind::Device,
+            false,
+        ) {
             warn!("pairing code: {e:#}");
         }
     }
@@ -212,7 +250,9 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
 /// Accepts et/1 on `endpoint`. Revokes, status and network sync run in [`watch`].
 pub fn serve(endpoint: Endpoint, state: Arc<State>) -> Router {
     let _ = state.endpoint.set(endpoint.clone());
-    Router::builder(endpoint).accept(ALPN, Handler(state)).spawn()
+    Router::builder(endpoint)
+        .accept(ALPN, Handler(state))
+        .spawn()
 }
 
 /// Every `WATCH_EVERY`: applies revokes, sends a changed network document to
@@ -228,6 +268,11 @@ pub async fn watch(endpoint: Endpoint, state: Arc<State>, tmux: String) {
     let failed = Arc::new(AtomicBool::new(false));
     let mut retry_at: Option<u32> = None;
     let mut backoff = RETRY_FIRST;
+    // A machine that was offline catches up at once: ask the others.
+    {
+        let (endpoint, paths) = (endpoint.clone(), state.paths.clone());
+        tokio::spawn(async move { network::pull(&endpoint, &paths).await });
+    }
     loop {
         if failed.swap(false, Ordering::Relaxed) {
             retry_at = Some(ticks.wrapping_add(backoff));
@@ -238,8 +283,12 @@ pub async fn watch(endpoint: Endpoint, state: Arc<State>, tmux: String) {
                 state.apply_revokes(&signed.network);
                 if sent.as_ref() != Some(&signed) && manage_mm_hosts {
                     let me = endpoint.id();
-                    let names: Vec<String> =
-                        signed.network.machines().filter(|m| m.id != me).map(|m| m.name.to_string()).collect();
+                    let names: Vec<String> = signed
+                        .network
+                        .machines()
+                        .filter(|m| m.id != me)
+                        .map(|m| m.name.to_string())
+                        .collect();
                     match mm::hosts_file(&state.env).map(|path| mm::write_hosts(&path, &names)) {
                         Some(Ok(true)) => info!("manymux machines: {}", names.join(", ")),
                         Some(Err(e)) => warn!("manymux hosts.toml: {e:#}"),
@@ -253,9 +302,14 @@ pub async fn watch(endpoint: Endpoint, state: Arc<State>, tmux: String) {
                         backoff = RETRY_FIRST;
                     }
                     retry_at = None;
-                    let (endpoint, doc, failed) = (endpoint.clone(), signed.clone(), failed.clone());
+                    let (endpoint, doc, failed, paths) = (
+                        endpoint.clone(),
+                        signed.clone(),
+                        failed.clone(),
+                        state.paths.clone(),
+                    );
                     tokio::spawn(async move {
-                        if !network::push(&endpoint, &doc).await {
+                        if !network::push(&endpoint, &paths, &doc).await {
                             failed.store(true, Ordering::Relaxed);
                         }
                     });
@@ -294,7 +348,10 @@ impl ProtocolHandler for Handler {
             warn!("{e:#}");
             None
         });
-        let member = network.as_ref().and_then(|s| s.network.member(&id)).map(|m| (m.name.to_string(), m.kind));
+        let member = network
+            .as_ref()
+            .and_then(|s| s.network.member(&id))
+            .map(|m| (m.name.to_string(), m.kind));
         let (name, kind) = match member {
             Some(member) => member,
             None => match admission(state, &conn).await {
@@ -348,7 +405,10 @@ async fn admission(state: &State, conn: &Connection) -> Option<(String, Kind)> {
     };
     // `Pair` (the app's) answers `Paired`; `Join` answers `Joined`.
     let (secret, name, wanted, is_pair) = match request {
-        Request::Pair { secret, device_name } => (secret, device_name, Kind::Device, true),
+        Request::Pair {
+            secret,
+            device_name,
+        } => (secret, device_name, Kind::Device, true),
         Request::Join { secret, name, kind } => (secret, name, kind, false),
         _ => {
             info!("refused {}: not paired", id.fmt_short());
@@ -361,15 +421,27 @@ async fn admission(state: &State, conn: &Connection) -> Option<(String, Kind)> {
         Err("too many tries; wait a minute".to_string())
     } else {
         match pair::redeem(&state.paths, &secret) {
-            None => Err("this invite is wrong, used, or expired; run `etd invite` again".to_string()),
-            Some(kind) if kind != wanted => {
-                Err(format!("this invite is for a {}, not a {}", kind_word(kind), kind_word(wanted)))
+            None => {
+                Err("this invite is wrong, used, or expired; run `etd invite` again".to_string())
             }
+            Some(kind) if kind != wanted => Err(format!(
+                "this invite is for a {}, not a {}",
+                kind_word(kind),
+                kind_word(wanted)
+            )),
             Some(kind) => {
-                let name = if name.trim().is_empty() { id.fmt_short().to_string() } else { name };
+                let name = if name.trim().is_empty() {
+                    id.fmt_short().to_string()
+                } else {
+                    name
+                };
                 match network::admit(&state.paths, me, id, &name, kind) {
                     Ok(signed) => {
-                        let name = signed.network.member(&id).map(|m| m.name.to_string()).unwrap_or(name);
+                        let name = signed
+                            .network
+                            .member(&id)
+                            .map(|m| m.name.to_string())
+                            .unwrap_or(name);
                         Ok((name, kind, signed))
                     }
                     Err(e) => Err(format!("{e:#}")),
@@ -379,16 +451,28 @@ async fn admission(state: &State, conn: &Connection) -> Option<(String, Kind)> {
     };
     match reply {
         Ok((name, kind, signed)) => {
-            info!("{name} ({}) joined as a {}", id.fmt_short(), kind_word(kind));
+            info!(
+                "{name} ({}) joined as a {}",
+                id.fmt_short(),
+                kind_word(kind)
+            );
             let response = if is_pair {
-                Response::Paired { host_name: tmux::host_name() }
+                Response::Paired {
+                    host_name: tmux::host_name(),
+                }
             } else {
                 // A machine gets the network key: it may change the network.
                 let network_key = match kind {
-                    Kind::Machine => network::load_key(&state.paths).ok().flatten().map(|k| k.to_bytes()),
+                    Kind::Machine => network::load_key(&state.paths)
+                        .ok()
+                        .flatten()
+                        .map(|k| k.to_bytes()),
                     Kind::Device => None,
                 };
-                Response::Joined { network: signed, network_key }
+                Response::Joined {
+                    network: signed,
+                    network_key,
+                }
             };
             let _ = write_frame(&mut send, &response).await;
             let _ = send.finish();
@@ -406,8 +490,16 @@ async fn admission(state: &State, conn: &Connection) -> Option<(String, Kind)> {
     }
 }
 
-async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: SendStream, mut recv: RecvStream) -> anyhow::Result<()> {
-    let Some(request) = read_frame::<Request>(&mut recv).await? else { return Ok(()) };
+async fn serve_stream(
+    state: &State,
+    peer: EndpointId,
+    kind: Kind,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> anyhow::Result<()> {
+    let Some(request) = read_frame::<Request>(&mut recv).await? else {
+        return Ok(());
+    };
     match &request {
         Request::Upload { path, len } => debug!("request: Upload {path} ({len} bytes)"),
         Request::Pair { device_name, .. } => debug!("request: Pair from {device_name}"),
@@ -431,7 +523,9 @@ async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: Sen
         Request::Control { target } => return control(state, target, send, recv).await,
         Request::Ping => Response::Pong,
         // Already paired.
-        Request::Pair { .. } => Response::Paired { host_name: tmux::host_name() },
+        Request::Pair { .. } => Response::Paired {
+            host_name: tmux::host_name(),
+        },
         Request::Exec { script } => ops::exec(&state.env, &script).await,
         Request::Upload { path, len } => ops::upload(&state.env, &path, len, &mut recv).await,
         Request::Agent { host } => return agent(state, host, send, recv).await,
@@ -441,7 +535,19 @@ async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: Sen
         },
         Request::Join { .. } => Response::Error("already a member of this network".into()),
         Request::Network => match network::load(&state.paths) {
-            Ok(Some(signed)) => Response::NetworkDoc(signed),
+            Ok(Some(signed)) => {
+                // A machine asks at its start. If it missed a key change, the
+                // document alone is no use to it: send it the change as well.
+                if kind == Kind::Machine {
+                    let (endpoint, paths) = (state.endpoint().clone(), state.paths.clone());
+                    tokio::spawn(async move {
+                        if let Err(e) = network::push_to(&endpoint, &paths, peer).await {
+                            debug!("network not sent to {}: {e:#}", peer.fmt_short());
+                        }
+                    });
+                }
+                Response::NetworkDoc(signed)
+            }
             Ok(None) => Response::Error("no network yet".into()),
             Err(e) => Response::Error(format!("{e:#}")),
         },
@@ -458,9 +564,37 @@ async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: Sen
             }
             Err(e) => Response::Error(format!("{e:#}")),
         },
-        Request::Notify { .. } if kind != Kind::Machine => Response::Error("only machines send notes".into()),
+        Request::NetworkRotate { .. } if kind != Kind::Machine => {
+            Response::Error("only machines change the network key".into())
+        }
+        Request::NetworkRotate { old, new, key } => {
+            match network::apply_rotation(&state.paths, state.endpoint().id(), &old, &new, &key) {
+                Ok(changed) => {
+                    if changed {
+                        info!("network key changed by {}", peer.fmt_short());
+                    }
+                    Response::Pong
+                }
+                Err(e) => {
+                    warn!(
+                        "network key change from {} refused: {e:#}",
+                        peer.fmt_short()
+                    );
+                    Response::Error(format!("{e:#}"))
+                }
+            }
+        }
+        Request::Notify { .. } if kind != Kind::Machine => {
+            Response::Error("only machines send notes".into())
+        }
         Request::Notify { note } => {
-            debug!("note from {}: {} {}/{}", peer.fmt_short(), note.kind, note.machine, note.session);
+            debug!(
+                "note from {}: {} {}/{}",
+                peer.fmt_short(),
+                note.kind,
+                note.machine,
+                note.session
+            );
             events::deliver(state, &note).await;
             Response::Pong
         }
@@ -470,7 +604,12 @@ async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: Sen
             Response::Pong
         }
         Request::Invite { kind } => {
-            match pair::invite_url(&state.paths, &state.endpoint().addr(), &tmux::host_name(), kind) {
+            match pair::invite_url(
+                &state.paths,
+                &state.endpoint().addr(),
+                &tmux::host_name(),
+                kind,
+            ) {
                 Ok(url) => Response::Invitation { url },
                 Err(e) => Response::Error(format!("{e:#}")),
             }
@@ -487,11 +626,20 @@ async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: Sen
 
 /// `tmux -C` without a PTY (et-ios SPEC.md §2.1 step 4). When the phone closes
 /// its side, tmux's stdin closes and tmux detaches; the session keeps running.
-async fn control(state: &State, target: Target, mut send: SendStream, recv: RecvStream) -> anyhow::Result<()> {
+async fn control(
+    state: &State,
+    target: Target,
+    mut send: SendStream,
+    recv: RecvStream,
+) -> anyhow::Result<()> {
     let tmux = match tmux::find(&state.env).await {
         TmuxStatus::Found(t) => t,
         TmuxStatus::NotFound(why) => {
-            write_frame(&mut send, &Response::Error(format!("tmux not found: {why}"))).await?;
+            write_frame(
+                &mut send,
+                &Response::Error(format!("tmux not found: {why}")),
+            )
+            .await?;
             send.finish()?;
             return Ok(());
         }
@@ -503,12 +651,25 @@ async fn control(state: &State, target: Target, mut send: SendStream, recv: Recv
     };
     // TERM=et-ios marks E.T.'s control clients (#{client_termname}).
     cmd.env("TERM", "et-ios");
-    pipe(state, cmd, Response::ControlStarted, &format!("tmux -C {target:?}"), send, recv).await
+    pipe(
+        state,
+        cmd,
+        Response::ControlStarted,
+        &format!("tmux -C {target:?}"),
+        send,
+        recv,
+    )
+    .await
 }
 
 /// `mm agent` here, or `ssh <host> mm agent` for a machine the node watches.
 /// etd does not read the manymux protocol; it only moves the bytes.
-async fn agent(state: &State, host: Option<String>, mut send: SendStream, recv: RecvStream) -> anyhow::Result<()> {
+async fn agent(
+    state: &State,
+    host: Option<String>,
+    mut send: SendStream,
+    recv: RecvStream,
+) -> anyhow::Result<()> {
     let label = format!("mm agent on {}", host.as_deref().unwrap_or("this machine"));
     let cmd = match host {
         None => mm::agent_local(&state.env),
@@ -527,8 +688,18 @@ async fn agent(state: &State, host: Option<String>, mut send: SendStream, recv: 
 /// Runs `cmd` with its stdin fed from the phone, and its stdout and stderr
 /// sent down as `ControlFrame`s, then `Exit`. When the phone closes its side,
 /// stdin closes: tmux detaches, `mm agent` ends; the sessions keep running.
-async fn pipe(state: &State, mut cmd: Command, started: Response, label: &str, mut send: SendStream, mut recv: RecvStream) -> anyhow::Result<()> {
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+async fn pipe(
+    state: &State,
+    mut cmd: Command,
+    started: Response,
+    label: &str,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> anyhow::Result<()> {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     if let Ok(home) = ops::home(&state.env) {
         cmd.current_dir(home);
     }
@@ -562,7 +733,12 @@ async fn pipe(state: &State, mut cmd: Command, started: Response, label: &str, m
     let out = tokio::spawn(async move {
         let mut buf = vec![0u8; READ_CHUNK];
         while let Ok(n) = stdout.read(&mut buf).await {
-            if n == 0 || out_frames.send(ControlFrame::Stdout(buf[..n].to_vec())).await.is_err() {
+            if n == 0
+                || out_frames
+                    .send(ControlFrame::Stdout(buf[..n].to_vec()))
+                    .await
+                    .is_err()
+            {
                 break;
             }
         }

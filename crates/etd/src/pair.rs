@@ -17,7 +17,10 @@ use crate::config::{now_secs, Paths};
 pub const TTL: Duration = Duration::from_secs(10 * 60);
 
 fn hash_hex(secret: &[u8; 32]) -> String {
-    Sha256::digest(secret).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(secret)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn kind_name(kind: Kind) -> &'static str {
@@ -29,14 +32,28 @@ fn kind_name(kind: Kind) -> &'static str {
 
 /// Makes a secret for one `kind` member, valid for `TTL`, and the ticket
 /// that carries it. The kind stays here, not in the ticket.
-pub fn create(paths: &Paths, addr: EndpointAddr, host_name: String, kind: Kind) -> anyhow::Result<Ticket> {
+pub fn create(
+    paths: &Paths,
+    addr: EndpointAddr,
+    host_name: String,
+    kind: Kind,
+) -> anyhow::Result<Ticket> {
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).map_err(|e| anyhow::anyhow!("random: {e}"))?;
     let expires = now_secs() + TTL.as_secs();
     let dir = paths.pending();
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join(hash_hex(&secret)), format!("{expires} {}", kind_name(kind))).context("write pending secret")?;
-    Ok(Ticket { addr, secret, expires, host_name })
+    fs::write(
+        dir.join(hash_hex(&secret)),
+        format!("{expires} {}", kind_name(kind)),
+    )
+    .context("write pending secret")?;
+    Ok(Ticket {
+        addr,
+        secret,
+        expires,
+        host_name,
+    })
 }
 
 /// The kind of member `secret` admits, if it is pending and not expired. It
@@ -60,12 +77,16 @@ pub fn redeem(paths: &Paths, secret: &[u8; 32]) -> Option<Kind> {
 }
 
 fn remove_expired(paths: &Paths) {
-    let Ok(entries) = fs::read_dir(paths.pending()) else { return };
+    let Ok(entries) = fs::read_dir(paths.pending()) else {
+        return;
+    };
     let now = now_secs();
     for entry in entries.flatten() {
-        let expires = fs::read_to_string(entry.path())
-            .ok()
-            .and_then(|t| t.split_whitespace().next().and_then(|e| e.parse::<u64>().ok()));
+        let expires = fs::read_to_string(entry.path()).ok().and_then(|t| {
+            t.split_whitespace()
+                .next()
+                .and_then(|e| e.parse::<u64>().ok())
+        });
         if expires.is_none_or(|e| e <= now) {
             let _ = fs::remove_file(entry.path());
         }
@@ -75,13 +96,25 @@ fn remove_expired(paths: &Paths) {
 /// The invite link for `addr`. Only the relay goes in: direct addresses
 /// (bridges, VPNs) make the QR code too big, and hole punching finds the
 /// direct path after the first connect.
-pub fn invite_url(paths: &Paths, addr: &EndpointAddr, host_name: &str, kind: Kind) -> anyhow::Result<String> {
-    let addr = EndpointAddr::new(addr.id).with_addrs(addr.relay_urls().cloned().map(TransportAddr::Relay));
+pub fn invite_url(
+    paths: &Paths,
+    addr: &EndpointAddr,
+    host_name: &str,
+    kind: Kind,
+) -> anyhow::Result<String> {
+    let addr =
+        EndpointAddr::new(addr.id).with_addrs(addr.relay_urls().cloned().map(TransportAddr::Relay));
     create(paths, addr, host_name.to_string(), kind)?.to_url()
 }
 
 /// Makes an invite and prints it: a QR code with instructions, or only the link.
-pub fn print(paths: &Paths, addr: &EndpointAddr, host_name: &str, kind: Kind, url_only: bool) -> anyhow::Result<()> {
+pub fn print(
+    paths: &Paths,
+    addr: &EndpointAddr,
+    host_name: &str,
+    kind: Kind,
+    url_only: bool,
+) -> anyhow::Result<()> {
     let url = invite_url(paths, addr, host_name, kind)?;
     if url_only {
         println!("{url}");
@@ -106,7 +139,12 @@ pub fn print(paths: &Paths, addr: &EndpointAddr, host_name: &str, kind: Kind, ur
 /// The QR code as terminal text (two rows of modules per line).
 pub fn qr(url: &str) -> anyhow::Result<String> {
     let code = QrCode::new(url.as_bytes())?;
-    Ok(code.render::<Dense1x2>().dark_color(Dense1x2::Light).light_color(Dense1x2::Dark).quiet_zone(true).build())
+    Ok(code
+        .render::<Dense1x2>()
+        .dark_color(Dense1x2::Light)
+        .light_color(Dense1x2::Dark)
+        .quiet_zone(true)
+        .build())
 }
 
 #[cfg(test)]
@@ -134,7 +172,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::at(dir.path().into());
         let ticket = create(&paths, addr(), "box".into(), Kind::Device).unwrap();
-        fs::write(paths.pending().join(hash_hex(&ticket.secret)), format!("{} device", now_secs() - 1)).unwrap();
+        fs::write(
+            paths.pending().join(hash_hex(&ticket.secret)),
+            format!("{} device", now_secs() - 1),
+        )
+        .unwrap();
         assert_eq!(redeem(&paths, &ticket.secret), None);
     }
 
@@ -143,7 +185,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::at(dir.path().into());
         let ticket = create(&paths, addr(), "box".into(), Kind::Machine).unwrap();
-        fs::write(paths.pending().join(hash_hex(&ticket.secret)), (now_secs() + 60).to_string()).unwrap();
+        fs::write(
+            paths.pending().join(hash_hex(&ticket.secret)),
+            (now_secs() + 60).to_string(),
+        )
+        .unwrap();
         assert_eq!(redeem(&paths, &ticket.secret), Some(Kind::Device));
     }
 }

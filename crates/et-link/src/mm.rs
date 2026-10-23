@@ -23,7 +23,9 @@ use crate::{closed, stream_error, unexpected, ExecResult, LinkError, RemoteHost}
 const PIPE: usize = 256 * 1024;
 
 fn protocol(e: anyhow::Error) -> LinkError {
-    LinkError::Protocol { message: format!("{e:#}") }
+    LinkError::Protocol {
+        message: format!("{e:#}"),
+    }
 }
 
 fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, LinkError> {
@@ -41,11 +43,20 @@ struct Agent {
 impl Agent {
     async fn open(host: &RemoteHost, machine: Option<String>) -> Result<Self, LinkError> {
         let (mut send, mut recv) = host.conn.open_bi().await.map_err(|e| closed(&e))?;
-        write_frame(&mut send, &Request::Agent { host: machine }).await.map_err(stream_error)?;
-        match read_frame::<Response>(&mut recv).await.map_err(stream_error)? {
+        write_frame(&mut send, &Request::Agent { host: machine })
+            .await
+            .map_err(stream_error)?;
+        match read_frame::<Response>(&mut recv)
+            .await
+            .map_err(stream_error)?
+        {
             Some(Response::AgentStarted) => {}
             Some(other) => return Err(unexpected(other)),
-            None => return Err(LinkError::Protocol { message: "no answer to Agent".into() }),
+            None => {
+                return Err(LinkError::Protocol {
+                    message: "no answer to Agent".into(),
+                })
+            }
         }
         let (mut pipe, reader) = tokio::io::duplex(PIPE);
         let stderr = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -70,12 +81,18 @@ impl Agent {
                 }
             }
         });
-        Ok(Self { send: Mutex::new(Some(send)), reader: Mutex::new(FrameReader::new(reader)), stderr })
+        Ok(Self {
+            send: Mutex::new(Some(send)),
+            reader: Mutex::new(FrameReader::new(reader)),
+            stderr,
+        })
     }
 
     async fn frame(&self, tag: u8, body: &[u8]) -> Result<(), LinkError> {
         let mut send = self.send.lock().await;
-        let send = send.as_mut().ok_or_else(|| LinkError::Closed { message: "already detached".into() })?;
+        let send = send.as_mut().ok_or_else(|| LinkError::Closed {
+            message: "already detached".into(),
+        })?;
         mp::write_frame(send, tag, body).await.map_err(stream_error)
     }
 
@@ -118,14 +135,22 @@ impl Agent {
                     };
                 }
                 Some(_) => continue,
-                None => return Err(LinkError::Closed { message: "mm agent ended without an answer".into() }),
+                None => {
+                    return Err(LinkError::Closed {
+                        message: "mm agent ended without an answer".into(),
+                    })
+                }
             }
         }
     }
 }
 
 /// One request on its own stream, as the node expects.
-async fn one(host: &RemoteHost, machine: Option<String>, request: mp::Request) -> Result<mp::Response, LinkError> {
+async fn one(
+    host: &RemoteHost,
+    machine: Option<String>,
+    request: mp::Request,
+) -> Result<mp::Response, LinkError> {
     let agent = Agent::open(host, machine).await?;
     let response = agent.request(&request).await;
     agent.finish().await;
@@ -133,7 +158,9 @@ async fn one(host: &RemoteHost, machine: Option<String>, request: mp::Request) -
 }
 
 fn wrong(response: mp::Response) -> LinkError {
-    LinkError::Protocol { message: format!("unexpected manymux answer: {response:?}") }
+    LinkError::Protocol {
+        message: format!("unexpected manymux answer: {response:?}"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -167,7 +194,11 @@ impl From<mp::SessionInfo> for MmSession {
             attached: s.attached as u32,
             idle_secs: s.idle,
             bells: s.bells,
-            started: s.started.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            started: s
+                .started
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         }
     }
 }
@@ -223,7 +254,13 @@ impl From<mp::HostedEvent> for MmEvent {
             mp::EventKind::Exited(code) => MmEventKind::Exited { code },
             mp::EventKind::Started => MmEventKind::Started,
         };
-        Self { machine: e.host, session: e.event.session, title: e.event.title, kind, attached: e.event.attached as u32 }
+        Self {
+            machine: e.host,
+            session: e.event.session,
+            title: e.event.title,
+            kind,
+            attached: e.event.attached as u32,
+        }
     }
 }
 
@@ -241,8 +278,22 @@ impl RemoteHost {
 
     /// `exec` on another machine, over ssh from the hub.
     pub async fn exec_on(&self, machine: String, script: String) -> Result<ExecResult, LinkError> {
-        match self.call(Request::ExecOn { host: machine, script }).await? {
-            Response::ExecResult { output, exit_code, truncated } => Ok(ExecResult { output, exit_code, truncated }),
+        match self
+            .call(Request::ExecOn {
+                host: machine,
+                script,
+            })
+            .await?
+        {
+            Response::ExecResult {
+                output,
+                exit_code,
+                truncated,
+            } => Ok(ExecResult {
+                output,
+                exit_code,
+                truncated,
+            }),
             other => Err(unexpected(other)),
         }
     }
@@ -255,7 +306,11 @@ impl RemoteHost {
     }
 
     /// Starts a session. Returns the name it got.
-    pub async fn mm_spawn(&self, machine: Option<String>, spec: MmSpawn) -> Result<String, LinkError> {
+    pub async fn mm_spawn(
+        &self,
+        machine: Option<String>,
+        spec: MmSpawn,
+    ) -> Result<String, LinkError> {
         let spec = mp::SpawnSpec {
             name: spec.name,
             command: spec.command,
@@ -279,7 +334,12 @@ impl RemoteHost {
 
     /// Renames a session. The node cleans the name (letters, digits, `-_.`);
     /// list again to see what it became.
-    pub async fn mm_rename(&self, machine: Option<String>, name: String, to: String) -> Result<(), LinkError> {
+    pub async fn mm_rename(
+        &self,
+        machine: Option<String>,
+        name: String,
+        to: String,
+    ) -> Result<(), LinkError> {
         match one(self, machine, mp::Request::Rename { name, to }).await? {
             mp::Response::Ok => Ok(()),
             other => Err(wrong(other)),
@@ -287,11 +347,20 @@ impl RemoteHost {
     }
 
     /// Screens without attaching (thumbnails). Empty `names`: every session.
-    pub async fn mm_peek(&self, machine: Option<String>, names: Vec<String>) -> Result<Vec<MmPeek>, LinkError> {
+    pub async fn mm_peek(
+        &self,
+        machine: Option<String>,
+        names: Vec<String>,
+    ) -> Result<Vec<MmPeek>, LinkError> {
         match one(self, machine, mp::Request::Peek { names }).await? {
             mp::Response::Peeked(list) => Ok(list
                 .into_iter()
-                .map(|p| MmPeek { name: p.name, cols: p.size.cols, rows: p.size.rows, screen: p.screen })
+                .map(|p| MmPeek {
+                    name: p.name,
+                    cols: p.size.cols,
+                    rows: p.size.rows,
+                    screen: p.screen,
+                })
                 .collect()),
             other => Err(wrong(other)),
         }
@@ -309,14 +378,30 @@ impl RemoteHost {
         read_only: bool,
     ) -> Result<Arc<MmAttachment>, LinkError> {
         let agent = Agent::open(self, machine).await?;
-        let request = mp::Request::Attach { name, size: mp::Size::new(cols, rows).sane(), history, read_only };
+        let request = mp::Request::Attach {
+            name,
+            size: mp::Size::new(cols, rows).sane(),
+            history,
+            read_only,
+        };
         match agent.request(&request).await? {
-            mp::Response::Attached { size, read_only: honoured, .. } => {
+            mp::Response::Attached {
+                size,
+                read_only: honoured,
+                ..
+            } => {
                 if read_only && !honoured {
                     agent.finish().await;
-                    return Err(LinkError::Remote { message: "this machine's manymux cannot attach read-only".into() });
+                    return Err(LinkError::Remote {
+                        message: "this machine's manymux cannot attach read-only".into(),
+                    });
                 }
-                Ok(Arc::new(MmAttachment { agent, cols: size.cols, rows: size.rows, read_only }))
+                Ok(Arc::new(MmAttachment {
+                    agent,
+                    cols: size.cols,
+                    rows: size.rows,
+                    read_only,
+                }))
             }
             other => {
                 agent.finish().await;
@@ -352,7 +437,10 @@ pub enum MmOutput {
     /// Something in another session on the same machine.
     Event { event: MmEvent },
     /// The answer to `rename()`: the new name, or why not.
-    Renamed { name: Option<String>, refused: Option<String> },
+    Renamed {
+        name: Option<String>,
+        refused: Option<String>,
+    },
     /// The session's process ended. Nothing follows.
     Exit { code: i32 },
 }
@@ -386,7 +474,9 @@ impl MmAttachment {
     pub async fn next(&self) -> Result<MmOutput, LinkError> {
         loop {
             let Some(frame) = self.agent.next().await? else {
-                return Err(LinkError::Closed { message: "session stream ended".into() });
+                return Err(LinkError::Closed {
+                    message: "session stream ended".into(),
+                });
             };
             return Ok(match frame.tag {
                 tag::DATA => MmOutput::Data { bytes: frame.body },
@@ -394,14 +484,27 @@ impl MmAttachment {
                 tag::RESYNC => MmOutput::Resync { bytes: frame.body },
                 tag::SIZE => {
                     let size: mp::Size = decode(&frame.body)?;
-                    MmOutput::Size { cols: size.cols, rows: size.rows }
+                    MmOutput::Size {
+                        cols: size.cols,
+                        rows: size.rows,
+                    }
                 }
-                tag::EVENT => MmOutput::Event { event: decode::<mp::HostedEvent>(&frame.body)?.into() },
-                tag::RENAME => match decode::<mp::Renamed>(&frame.body)? {
-                    mp::Renamed::Name(name) => MmOutput::Renamed { name: Some(name), refused: None },
-                    mp::Renamed::Refused(why) => MmOutput::Renamed { name: None, refused: Some(why) },
+                tag::EVENT => MmOutput::Event {
+                    event: decode::<mp::HostedEvent>(&frame.body)?.into(),
                 },
-                tag::EXIT => MmOutput::Exit { code: decode(&frame.body)? },
+                tag::RENAME => match decode::<mp::Renamed>(&frame.body)? {
+                    mp::Renamed::Name(name) => MmOutput::Renamed {
+                        name: Some(name),
+                        refused: None,
+                    },
+                    mp::Renamed::Refused(why) => MmOutput::Renamed {
+                        name: None,
+                        refused: Some(why),
+                    },
+                },
+                tag::EXIT => MmOutput::Exit {
+                    code: decode(&frame.body)?,
+                },
                 tag::PING => {
                     // Answering once means answering always: the node then
                     // detaches a client silent for 45 s (a suspended app).
@@ -421,7 +524,9 @@ impl MmAttachment {
 
     /// Asks for a size; `Size` in `next` says what the session took.
     pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), LinkError> {
-        self.agent.msg(tag::RESIZE, &mp::Size::new(cols, rows).sane()).await
+        self.agent
+            .msg(tag::RESIZE, &mp::Size::new(cols, rows).sane())
+            .await
     }
 
     /// Asks for a new name; the answer is `Renamed` in `next`.
@@ -438,12 +543,16 @@ impl MmAttachment {
     /// session. `kind`: the file extension (`png`, `jpg`, `gif`, `webp`).
     pub async fn paste(&self, kind: String, bytes: Vec<u8>) -> Result<(), LinkError> {
         if bytes.len() > mp::MAX_PASTE {
-            return Err(LinkError::Invalid { message: format!("{} bytes; the limit is {}", bytes.len(), mp::MAX_PASTE) });
+            return Err(LinkError::Invalid {
+                message: format!("{} bytes; the limit is {}", bytes.len(), mp::MAX_PASTE),
+            });
         }
         for chunk in bytes.chunks(mp::PASTE_CHUNK) {
             self.agent.frame(tag::PASTE, chunk).await?;
         }
-        self.agent.msg(tag::PASTE_END, &mp::PasteInfo { kind }).await
+        self.agent
+            .msg(tag::PASTE_END, &mp::PasteInfo { kind })
+            .await
     }
 
     /// Leaves the session running and closes this stream.
@@ -464,10 +573,14 @@ impl MmEvents {
     pub async fn next(&self) -> Result<MmEvent, LinkError> {
         loop {
             let Some(frame) = self.agent.next().await? else {
-                return Err(LinkError::Closed { message: "event feed ended".into() });
+                return Err(LinkError::Closed {
+                    message: "event feed ended".into(),
+                });
             };
             if frame.tag == tag::EVENT {
-                return Ok(mp::decode::<mp::HostedEvent>(&frame.body).map_err(protocol)?.into());
+                return Ok(mp::decode::<mp::HostedEvent>(&frame.body)
+                    .map_err(protocol)?
+                    .into());
             }
         }
     }

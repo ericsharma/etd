@@ -64,25 +64,47 @@ pub struct Member<'a> {
 impl Network {
     /// A new network with one member: the machine that makes it.
     pub fn new(key: &SecretKey, name: &str, founder: EndpointId, founder_name: &str) -> Self {
-        let mut network = Self { key: key.public(), name: name.into(), records: BTreeMap::new() };
-        network.set(founder, State::Member { name: founder_name.into(), kind: Kind::Machine }, founder);
+        let mut network = Self {
+            key: key.public(),
+            name: name.into(),
+            records: BTreeMap::new(),
+        };
+        network.set(
+            founder,
+            State::Member {
+                name: founder_name.into(),
+                kind: Kind::Machine,
+            },
+            founder,
+        );
         network
     }
 
     /// The highest counter in the document.
     pub fn counter(&self) -> u64 {
-        self.records.values().map(|r| r.stamp.counter).max().unwrap_or(0)
+        self.records
+            .values()
+            .map(|r| r.stamp.counter)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Changes `id`'s record, with a stamp above every other.
     pub fn set(&mut self, id: EndpointId, state: State, author: EndpointId) {
-        let stamp = Stamp { counter: self.counter() + 1, author };
+        let stamp = Stamp {
+            counter: self.counter() + 1,
+            author,
+        };
         self.records.insert(id, Record { state, stamp });
     }
 
     pub fn member(&self, id: &EndpointId) -> Option<Member<'_>> {
         match &self.records.get(id)?.state {
-            State::Member { name, kind } => Some(Member { id: *id, name, kind: *kind }),
+            State::Member { name, kind } => Some(Member {
+                id: *id,
+                name,
+                kind: *kind,
+            }),
             State::Removed => None,
         }
     }
@@ -97,7 +119,9 @@ impl Network {
 
     /// Members whose name is `who`, or whose id starts with `who` (8+ chars).
     pub fn find(&self, who: &str) -> Vec<Member<'_>> {
-        self.members().filter(|m| m.name == who || (who.len() >= 8 && m.id.to_string().starts_with(who))).collect()
+        self.members()
+            .filter(|m| m.name == who || (who.len() >= 8 && m.id.to_string().starts_with(who)))
+            .collect()
     }
 
     /// Takes every record of `other` that has a higher stamp. True if
@@ -108,7 +132,10 @@ impl Network {
         }
         let mut changed = false;
         for (id, theirs) in &other.records {
-            let newer = self.records.get(id).is_none_or(|ours| theirs.stamp > ours.stamp);
+            let newer = self
+                .records
+                .get(id)
+                .is_none_or(|ours| theirs.stamp > ours.stamp);
             if newer {
                 self.records.insert(*id, theirs.clone());
                 changed = true;
@@ -127,7 +154,10 @@ impl Network {
             bail!("not this network's key");
         }
         let signature = key.sign(&self.signing_bytes()?);
-        Ok(Signed { network: self, signature })
+        Ok(Signed {
+            network: self,
+            signature,
+        })
     }
 }
 
@@ -135,7 +165,11 @@ impl Signed {
     /// Checks that the network key signed this document.
     pub fn verify(&self) -> anyhow::Result<()> {
         let bytes = self.network.signing_bytes()?;
-        self.network.key.verify(&bytes, &self.signature).ok().context("the network document's signature is not valid")
+        self.network
+            .key
+            .verify(&bytes, &self.signature)
+            .ok()
+            .context("the network document's signature is not valid")
     }
 }
 
@@ -156,9 +190,22 @@ mod tests {
         let signed = Network::new(&net, "home", a, "trigkey").sign(&net).unwrap();
         signed.verify().unwrap();
         let mut forged = signed.clone();
-        forged.network.set(id(3).1, State::Member { name: "evil".into(), kind: Kind::Machine }, a);
-        assert!(forged.verify().is_err(), "a changed document must not verify");
-        assert!(Network::new(&net, "home", a, "t").sign(&id(9).0).is_err(), "only the network key signs");
+        forged.network.set(
+            id(3).1,
+            State::Member {
+                name: "evil".into(),
+                kind: Kind::Machine,
+            },
+            a,
+        );
+        assert!(
+            forged.verify().is_err(),
+            "a changed document must not verify"
+        );
+        assert!(
+            Network::new(&net, "home", a, "t").sign(&id(9).0).is_err(),
+            "only the network key signs"
+        );
     }
 
     #[test]
@@ -167,11 +214,32 @@ mod tests {
         let (_, a) = id(2);
         let (_, b) = id(3);
         let mut on_a = Network::new(&net, "home", a, "trigkey");
-        on_a.set(b, State::Member { name: "gmktec".into(), kind: Kind::Machine }, a);
+        on_a.set(
+            b,
+            State::Member {
+                name: "gmktec".into(),
+                kind: Kind::Machine,
+            },
+            a,
+        );
         let mut on_b = on_a.clone();
         // At the same time: a adds a phone, b adds a laptop.
-        on_a.set(id(4).1, State::Member { name: "phone".into(), kind: Kind::Device }, a);
-        on_b.set(id(5).1, State::Member { name: "laptop".into(), kind: Kind::Machine }, b);
+        on_a.set(
+            id(4).1,
+            State::Member {
+                name: "phone".into(),
+                kind: Kind::Device,
+            },
+            a,
+        );
+        on_b.set(
+            id(5).1,
+            State::Member {
+                name: "laptop".into(),
+                kind: Kind::Machine,
+            },
+            b,
+        );
         let mut merged_a = on_a.clone();
         assert!(merged_a.merge(&on_b).unwrap());
         let mut merged_b = on_b.clone();
@@ -187,7 +255,14 @@ mod tests {
         let (_, a) = id(2);
         let (_, phone) = id(4);
         let mut doc = Network::new(&net, "home", a, "trigkey");
-        doc.set(phone, State::Member { name: "phone".into(), kind: Kind::Device }, a);
+        doc.set(
+            phone,
+            State::Member {
+                name: "phone".into(),
+                kind: Kind::Device,
+            },
+            a,
+        );
         let before = doc.clone();
         doc.set(phone, State::Removed, a);
         assert!(doc.member(&phone).is_none());
@@ -195,7 +270,14 @@ mod tests {
         assert!(!doc.merge(&before).unwrap());
         assert!(doc.member(&phone).is_none());
         // A newer add (a new invite) does.
-        doc.set(phone, State::Member { name: "phone".into(), kind: Kind::Device }, a);
+        doc.set(
+            phone,
+            State::Member {
+                name: "phone".into(),
+                kind: Kind::Device,
+            },
+            a,
+        );
         assert!(doc.member(&phone).is_some());
         assert_eq!(doc.find("phone").len(), 1);
         assert_eq!(doc.machines().count(), 1);

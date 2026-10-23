@@ -21,14 +21,25 @@ const ENV_MARKER: &str = "__ETD_ENV__";
 /// The login shell's environment, else this process's own.
 pub async fn login_env() -> Env {
     let own: Env = std::env::vars().collect();
-    let shell = own.get("SHELL").cloned().or_else(passwd_shell).unwrap_or_else(|| "/bin/sh".into());
+    let shell = own
+        .get("SHELL")
+        .cloned()
+        .or_else(passwd_shell)
+        .unwrap_or_else(|| "/bin/sh".into());
     // The marker skips anything a profile prints before `env` runs.
     let script = format!("printf '\\n{ENV_MARKER}\\n'; env -0");
-    let run = Command::new(&shell).args(["-l", "-c", &script]).stdin(Stdio::null()).stderr(Stdio::null()).output();
+    let run = Command::new(&shell)
+        .args(["-l", "-c", &script])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
     let output = match tokio::time::timeout(LOGIN_ENV_TIMEOUT, run).await {
         Ok(Ok(output)) if output.status.success() => output.stdout,
         Ok(Ok(output)) => {
-            warn!("{shell} -l exited with {}; using etd's own environment", output.status);
+            warn!(
+                "{shell} -l exited with {}; using etd's own environment",
+                output.status
+            );
             return own;
         }
         Ok(Err(e)) => {
@@ -41,9 +52,19 @@ pub async fn login_env() -> Env {
         }
     };
     let text = String::from_utf8_lossy(&output);
-    let Some((_, vars)) = text.split_once(&format!("\n{ENV_MARKER}\n")) else { return own };
-    let env: Env = vars.split('\0').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.into(), v.into())).collect();
-    if env.contains_key("PATH") { env } else { own }
+    let Some((_, vars)) = text.split_once(&format!("\n{ENV_MARKER}\n")) else {
+        return own;
+    };
+    let env: Env = vars
+        .split('\0')
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+    if env.contains_key("PATH") {
+        env
+    } else {
+        own
+    }
 }
 
 /// The login shell from the user database. Service managers (launchd) may
@@ -55,7 +76,9 @@ fn passwd_shell() -> Option<String> {
         if pw.is_null() || (*pw).pw_shell.is_null() {
             return None;
         }
-        let shell = std::ffi::CStr::from_ptr((*pw).pw_shell).to_string_lossy().into_owned();
+        let shell = std::ffi::CStr::from_ptr((*pw).pw_shell)
+            .to_string_lossy()
+            .into_owned();
         (!shell.is_empty()).then_some(shell)
     }
 }
@@ -80,7 +103,12 @@ fn candidates(env: &Env) -> Vec<String> {
     let user = env.get("USER").cloned().unwrap_or_default();
     let mut list: Vec<String> = env
         .get("PATH")
-        .map(|p| p.split(':').filter(|d| !d.is_empty()).map(|d| format!("{d}/tmux")).collect())
+        .map(|p| {
+            p.split(':')
+                .filter(|d| !d.is_empty())
+                .map(|d| format!("{d}/tmux"))
+                .collect()
+        })
         .unwrap_or_default();
     list.extend([
         "/opt/homebrew/bin/tmux".into(),
@@ -96,7 +124,9 @@ fn candidates(env: &Env) -> Vec<String> {
 
 fn is_executable(path: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// A tmux command with the login environment and the found socket directory.
@@ -104,7 +134,11 @@ pub fn command(env: &Env, tmux: &TmuxInstall) -> Command {
     let mut cmd = Command::new(&tmux.path);
     // $TMUX wins over TMUX_TMPDIR. If etd starts inside a tmux pane, an
     // inherited $TMUX would send every command to that pane's server.
-    cmd.env_clear().envs(env).env_remove("TMUX").env_remove("TMUX_PANE").stdin(Stdio::null());
+    cmd.env_clear()
+        .envs(env)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .stdin(Stdio::null());
     match &tmux.tmpdir {
         Some(dir) => cmd.env("TMUX_TMPDIR", dir),
         None => cmd.env_remove("TMUX_TMPDIR"),
@@ -122,7 +156,13 @@ pub async fn find(env: &Env) -> TmuxStatus {
     }) else {
         return TmuxStatus::NotFound(format!("no executable tmux in:\n{}", tried.join("\n")));
     };
-    let version = match Command::new(&path).arg("-V").env_clear().envs(env).output().await {
+    let version = match Command::new(&path)
+        .arg("-V")
+        .env_clear()
+        .envs(env)
+        .output()
+        .await
+    {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Ok(o) => return TmuxStatus::NotFound(format!("{path} -V: {}", o.status)),
         Err(e) => return TmuxStatus::NotFound(format!("{path} -V: {e}")),
@@ -134,29 +174,54 @@ pub async fn find(env: &Env) -> TmuxStatus {
         std::env::var("TMUX_TMPDIR").ok(),
         env.get("XDG_RUNTIME_DIR").cloned(),
         Some(format!("/run/user/{uid}")),
-        env.get("TMPDIR").map(|d| d.trim_end_matches('/').to_string()),
+        env.get("TMPDIR")
+            .map(|d| d.trim_end_matches('/').to_string()),
         Some("/tmp".into()),
     ];
     for dir in dirs.into_iter().flatten().filter(|d| !d.is_empty()) {
         if !Path::new(&format!("{dir}/tmux-{uid}/default")).exists() {
             continue;
         }
-        let install = TmuxInstall { path: path.clone(), version: version.clone(), tmpdir: Some(dir) };
-        let ok = command(env, &install).arg("list-sessions").stdout(Stdio::null()).stderr(Stdio::null()).status().await;
+        let install = TmuxInstall {
+            path: path.clone(),
+            version: version.clone(),
+            tmpdir: Some(dir),
+        };
+        let ok = command(env, &install)
+            .arg("list-sessions")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
         if ok.map(|s| s.success()).unwrap_or(false) {
             return TmuxStatus::Found(install);
         }
     }
-    TmuxStatus::Found(TmuxInstall { path, version, tmpdir: login_tmpdir.filter(|d| !d.is_empty()) })
+    TmuxStatus::Found(TmuxInstall {
+        path,
+        version,
+        tmpdir: login_tmpdir.filter(|d| !d.is_empty()),
+    })
 }
 
 /// Sessions on the server. Empty when no server is running.
 pub async fn list_sessions(env: &Env, tmux: &TmuxInstall) -> anyhow::Result<Vec<SessionInfo>> {
     let format = "#{session_id} #{session_windows} #{session_attached} #{session_name}";
-    let output = command(env, tmux).args(["list-sessions", "-F", format]).output().await.context("run tmux")?;
+    let output = command(env, tmux)
+        .args(["list-sessions", "-F", format])
+        .output()
+        .await
+        .context("run tmux")?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        if ["no server running", "error connecting to", "No such file or directory"].iter().any(|s| err.contains(s)) {
+        if [
+            "no server running",
+            "error connecting to",
+            "No such file or directory",
+        ]
+        .iter()
+        .any(|s| err.contains(s))
+        {
             return Ok(Vec::new());
         }
         bail!("tmux list-sessions: {}: {}", output.status, err.trim());
@@ -172,7 +237,12 @@ fn parse_sessions(text: &str) -> Vec<SessionInfo> {
             let windows = f.next()?.parse().ok()?;
             let attached = f.next()?.parse().ok()?;
             let name = f.next()?;
-            id.starts_with('$').then(|| SessionInfo { id: id.into(), name: name.into(), windows, attached })
+            id.starts_with('$').then(|| SessionInfo {
+                id: id.into(),
+                name: name.into(),
+                windows,
+                attached,
+            })
         })
         .collect()
 }

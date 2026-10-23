@@ -22,17 +22,28 @@ async fn main() -> anyhow::Result<()> {
     };
     let id: EndpointId = id.parse().context("not an endpoint id")?;
     let key = config::load_or_create_key(&Paths::from_env()?.config.join("probe.key"))?;
-    let endpoint = Endpoint::builder(presets::N0).secret_key(key).bind().await?;
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(key)
+        .bind()
+        .await?;
     let conn = endpoint.connect(EndpointAddr::new(id), ALPN).await?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(&mut send, &Request::Agent { host: host.clone() }).await?;
-    match read_frame::<Response>(&mut recv).await?.context("no answer")? {
+    match read_frame::<Response>(&mut recv)
+        .await?
+        .context("no answer")?
+    {
         Response::AgentStarted => {}
         other => bail!("{other:?}"),
     }
     let mut request = Vec::new();
-    manymux::proto::write_msg(&mut request, manymux::proto::tag::REQUEST, &manymux::proto::Request::List).await?;
+    manymux::proto::write_msg(
+        &mut request,
+        manymux::proto::tag::REQUEST,
+        &manymux::proto::Request::List,
+    )
+    .await?;
     send.write_all(&request).await?;
     let mut bytes = Vec::new();
     let answer: manymux::proto::Response = loop {
@@ -42,7 +53,13 @@ async fn main() -> anyhow::Result<()> {
                 break manymux::proto::decode(&bytes[5..5 + len])?;
             }
         }
-        match tokio::time::timeout(Duration::from_secs(20), read_frame::<ControlFrame>(&mut recv)).await??.context("stream ended")? {
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            read_frame::<ControlFrame>(&mut recv),
+        )
+        .await??
+        .context("stream ended")?
+        {
             ControlFrame::Stdout(b) => bytes.extend(b),
             ControlFrame::Stderr(line) => eprintln!("stderr: {line}"),
             ControlFrame::Exit(code) => bail!("mm agent exited: {code:?}"),
@@ -51,9 +68,16 @@ async fn main() -> anyhow::Result<()> {
     send.finish()?;
     match answer {
         manymux::proto::Response::Sessions(list) => {
-            println!("{}: {} session(s)", host.as_deref().unwrap_or("this machine"), list.len());
+            println!(
+                "{}: {} session(s)",
+                host.as_deref().unwrap_or("this machine"),
+                list.len()
+            );
             for s in list {
-                println!("  {}  {}  idle {}s  attached {}", s.name, s.title, s.idle, s.attached);
+                println!(
+                    "  {}  {}  idle {}s  attached {}",
+                    s.name, s.title, s.idle, s.attached
+                );
             }
         }
         other => println!("{other:?}"),

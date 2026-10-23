@@ -20,7 +20,9 @@ use iroh::{Endpoint, EndpointAddr, SecretKey};
 
 fn real_mm() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join("mm")).find(|p| p.is_file())
+    std::env::split_paths(&path)
+        .map(|d| d.join("mm"))
+        .find(|p| p.is_file())
 }
 
 fn script(path: &Path, body: &str) {
@@ -40,7 +42,14 @@ impl Node {
         let socket = dir.path().join("mm.sock");
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        script(&bin.join("mm"), &format!("#!/bin/sh\nexec '{}' --socket '{}' \"$@\"\n", real.display(), socket.display()));
+        script(
+            &bin.join("mm"),
+            &format!(
+                "#!/bin/sh\nexec '{}' --socket '{}' \"$@\"\n",
+                real.display(),
+                socket.display()
+            ),
+        );
         script(
             &bin.join("ssh"),
             "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in --) shift; break;; -o|-p|-l|-i|-F|-J|-S) shift 2;; -*) shift;; *) break;; esac; done\n\
@@ -64,9 +73,22 @@ impl Node {
 
     fn env_of(dir: &Path) -> Vec<(String, String)> {
         vec![
-            ("PATH".into(), format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap())),
-            ("MM_CONFIG_DIR".into(), dir.join("config").display().to_string()),
-            ("XDG_STATE_HOME".into(), dir.join("state").display().to_string()),
+            (
+                "PATH".into(),
+                format!(
+                    "{}:{}",
+                    dir.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            ),
+            (
+                "MM_CONFIG_DIR".into(),
+                dir.join("config").display().to_string(),
+            ),
+            (
+                "XDG_STATE_HOME".into(),
+                dir.join("state").display().to_string(),
+            ),
         ]
     }
 
@@ -86,7 +108,11 @@ impl Drop for Node {
 async fn until(attachment: &MmAttachment, text: &str) -> String {
     let mut seen = String::new();
     while !seen.contains(text) {
-        match tokio::time::timeout(Duration::from_secs(10), attachment.next()).await.expect("output in time").unwrap() {
+        match tokio::time::timeout(Duration::from_secs(10), attachment.next())
+            .await
+            .expect("output in time")
+            .unwrap()
+        {
             MmOutput::Data { bytes } | MmOutput::History { bytes } | MmOutput::Resync { bytes } => {
                 seen.push_str(&String::from_utf8_lossy(&bytes))
             }
@@ -98,11 +124,22 @@ async fn until(attachment: &MmAttachment, text: &str) -> String {
 }
 
 fn spawn(command: &str, name: &str) -> MmSpawn {
-    MmSpawn { name: Some(name.into()), command: vec!["sh".into(), "-c".into(), command.into()], cwd: None, cols: 80, rows: 24 }
+    MmSpawn {
+        name: Some(name.into()),
+        command: vec!["sh".into(), "-c".into(), command.into()],
+        cwd: None,
+        cols: 80,
+        rows: 24,
+    }
 }
 
 async fn names(host: &RemoteHost, machine: Option<String>) -> Vec<String> {
-    host.mm_list(machine).await.unwrap().into_iter().map(|s| s.name).collect()
+    host.mm_list(machine)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.name)
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -118,46 +155,91 @@ async fn manymux_through_et_link() {
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
-    assert!(add.status.success(), "mm add: {}", String::from_utf8_lossy(&add.stderr));
+    assert!(
+        add.status.success(),
+        "mm add: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
 
     let home = tempfile::tempdir().unwrap();
-    let mut env: etd::tmux::Env = std::env::vars().filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE").collect();
+    let mut env: etd::tmux::Env = std::env::vars()
+        .filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE")
+        .collect();
     env.extend(node.env());
     env.insert("HOME".into(), home.path().display().to_string());
     env.remove("XDG_RUNTIME_DIR"); // no ssh ControlMaster with the stub
 
     let files = tempfile::tempdir().unwrap();
     let paths = Paths::at(files.path().into());
-    let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .alpns(vec![ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
     etd::network::ensure(&paths, endpoint.id(), "hub").unwrap();
     let _router = server::serve(endpoint.clone(), server::State::new(paths.clone(), env));
     let phone = SecretKey::generate();
-    etd::network::admit(&paths, endpoint.id(), phone.public(), "phone", et_proto::network::Kind::Device).unwrap();
-    let port = endpoint.bound_sockets().iter().find(|a| a.is_ipv4()).unwrap().port();
-    let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
-    let url = etd::pair::create(&paths, addr, "hub".into(), et_proto::network::Kind::Device).unwrap().to_url().unwrap();
-    let link = Link::from_endpoint(Endpoint::builder(presets::Minimal).secret_key(phone).bind().await.unwrap());
+    etd::network::admit(
+        &paths,
+        endpoint.id(),
+        phone.public(),
+        "phone",
+        et_proto::network::Kind::Device,
+    )
+    .unwrap();
+    let port = endpoint
+        .bound_sockets()
+        .iter()
+        .find(|a| a.is_ipv4())
+        .unwrap()
+        .port();
+    let addr = EndpointAddr::new(endpoint.id())
+        .with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+    let url = etd::pair::create(&paths, addr, "hub".into(), et_proto::network::Kind::Device)
+        .unwrap()
+        .to_url()
+        .unwrap();
+    let link = Link::from_endpoint(
+        Endpoint::builder(presets::Minimal)
+            .secret_key(phone)
+            .bind()
+            .await
+            .unwrap(),
+    );
     let paired = link.pair(url, "phone".into()).await.unwrap();
     let host: Arc<RemoteHost> = link.connect(paired.endpoint_id, None).await.unwrap();
 
     assert_eq!(host.machines().await.unwrap(), ["fakehost"]);
-    let r = host.exec_on("fakehost".into(), "echo on-$((40+2))".into()).await.unwrap();
+    let r = host
+        .exec_on("fakehost".into(), "echo on-$((40+2))".into())
+        .await
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&r.output), "on-42\n");
 
     // The event feed sees a start and a bell.
     let events = host.mm_events().await.unwrap();
 
     // Start, attach, type, see the answer, and the exit code.
-    let name = host.mm_spawn(None, spawn("echo ready; read x; echo got:$x; exit 7", "t1")).await.unwrap();
+    let name = host
+        .mm_spawn(None, spawn("echo ready; read x; echo got:$x; exit 7", "t1"))
+        .await
+        .unwrap();
     assert_eq!(name, "t1");
     assert!(names(&host, None).await.contains(&"t1".to_string()));
-    let t1 = host.mm_attach(None, "t1".into(), 80, 24, 0, false).await.unwrap();
+    let t1 = host
+        .mm_attach(None, "t1".into(), 80, 24, 0, false)
+        .await
+        .unwrap();
     assert!(!t1.read_only());
     until(&t1, "ready").await;
     t1.write(b"hi\r".to_vec()).await.unwrap();
     until(&t1, "got:hi").await;
     loop {
-        match tokio::time::timeout(Duration::from_secs(10), t1.next()).await.unwrap().unwrap() {
+        match tokio::time::timeout(Duration::from_secs(10), t1.next())
+            .await
+            .unwrap()
+            .unwrap()
+        {
             MmOutput::Exit { code } => {
                 assert_eq!(code, 7);
                 break;
@@ -167,16 +249,28 @@ async fn manymux_through_et_link() {
     }
 
     // The same node through the ssh path, as "fakehost".
-    host.mm_spawn(Some("fakehost".into()), spawn("printf '\\a'; echo peekme; sleep 30", "t2")).await.unwrap();
-    assert!(names(&host, Some("fakehost".into())).await.contains(&"t2".to_string()));
+    host.mm_spawn(
+        Some("fakehost".into()),
+        spawn("printf '\\a'; echo peekme; sleep 30", "t2"),
+    )
+    .await
+    .unwrap();
+    assert!(names(&host, Some("fakehost".into()))
+        .await
+        .contains(&"t2".to_string()));
     tokio::time::sleep(Duration::from_millis(500)).await;
     let peeks = host.mm_peek(None, vec!["t2".into()]).await.unwrap();
     assert_eq!(peeks.len(), 1);
     assert!(peeks[0].screen.contains("peekme"), "{:?}", peeks[0].screen);
 
     let mut kinds = Vec::new();
-    while !(kinds.iter().any(|k| matches!(k, MmEventKind::Started)) && kinds.iter().any(|k| matches!(k, MmEventKind::Bell))) {
-        let event = tokio::time::timeout(Duration::from_secs(10), events.next()).await.expect("events in time").unwrap();
+    while !(kinds.iter().any(|k| matches!(k, MmEventKind::Started))
+        && kinds.iter().any(|k| matches!(k, MmEventKind::Bell)))
+    {
+        let event = tokio::time::timeout(Duration::from_secs(10), events.next())
+            .await
+            .expect("events in time")
+            .unwrap();
         if event.session == "t2" {
             kinds.push(event.kind);
         }
@@ -184,13 +278,18 @@ async fn manymux_through_et_link() {
     events.close().await;
 
     // Watch without typing; the node honours it.
-    let viewer = host.mm_attach(None, "t2".into(), 40, 10, 0, true).await.unwrap();
+    let viewer = host
+        .mm_attach(None, "t2".into(), 40, 10, 0, true)
+        .await
+        .unwrap();
     assert!(viewer.read_only());
     until(&viewer, "peekme").await;
     viewer.detach().await;
 
     // Rename and end.
-    host.mm_rename(None, "t2".into(), "renamed".into()).await.unwrap();
+    host.mm_rename(None, "t2".into(), "renamed".into())
+        .await
+        .unwrap();
     assert!(names(&host, None).await.contains(&"renamed".to_string()));
     host.mm_kill(None, "renamed".into()).await.unwrap();
     for _ in 0..50 {
@@ -202,5 +301,8 @@ async fn manymux_through_et_link() {
     assert!(!names(&host, None).await.contains(&"renamed".to_string()));
 
     // Errors from the node arrive as Remote.
-    assert!(matches!(host.mm_attach(None, "nope".into(), 80, 24, 0, false).await, Err(et_link::LinkError::Remote { .. })));
+    assert!(matches!(
+        host.mm_attach(None, "nope".into(), 80, 24, 0, false).await,
+        Err(et_link::LinkError::Remote { .. })
+    ));
 }

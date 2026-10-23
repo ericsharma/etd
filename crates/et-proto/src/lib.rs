@@ -29,41 +29,79 @@ pub const MAX_EXEC_OUTPUT: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Request {
-    Hello { app: String },
+    Hello {
+        app: String,
+    },
     ListSessions,
-    Control { target: Target },
+    Control {
+        target: Target,
+    },
     Ping,
     /// The secret from a pairing [`Ticket`].
-    Pair { secret: [u8; 32], device_name: String },
+    Pair {
+        secret: [u8; 32],
+        device_name: String,
+    },
     /// `/bin/sh -c` with the user's login environment; stderr joined to stdout.
-    Exec { script: String },
+    Exec {
+        script: String,
+    },
     /// `len` raw bytes follow. `path` is absolute or starts with `~/`, and must
     /// be inside the user's home directory. Parent directories are made.
-    Upload { path: String, len: u64 },
+    Upload {
+        path: String,
+        len: u64,
+    },
     /// A pipe to `mm agent` (manymux): on this machine (`None`), or through
     /// `ssh <host> mm agent` for a machine in `Machines`. After `AgentStarted`
     /// the stream carries `ControlFrame`s down and raw bytes up, as `Control`.
-    Agent { host: Option<String> },
+    Agent {
+        host: Option<String>,
+    },
     /// `Exec` on a machine in `Machines`, through `ssh <host> /bin/sh -c`.
-    ExecOn { host: String, script: String },
+    ExecOn {
+        host: String,
+        script: String,
+    },
     /// The machines this machine's manymux node watches (`mm hosts`).
     Machines,
     /// Join this machine's network with an invite's secret. A device that is
     /// not a member may send this (as `Pair`). `Pair` is `Join` with
     /// `kind: Device`.
-    Join { secret: [u8; 32], name: String, kind: network::Kind },
+    Join {
+        secret: [u8; 32],
+        name: String,
+        kind: network::Kind,
+    },
     /// The network document (any member).
     Network,
     /// A newer document from another machine of the network (machines only).
-    NetworkUpdate { network: network::Signed },
+    NetworkUpdate {
+        network: network::Signed,
+    },
     /// An invite link for a new member of `kind` (any member).
-    Invite { kind: network::Kind },
+    Invite {
+        kind: network::Kind,
+    },
     /// A session on the sending machine wants someone (machines only). A
     /// machine with a push command runs it; others ignore it.
-    Notify { note: Note },
+    Notify {
+        note: Note,
+    },
     /// The app is open until `until` (Unix seconds): no pushes until then
     /// (any member; the app sends it every 20 s while open).
-    Foreground { until: u64 },
+    Foreground {
+        until: u64,
+    },
+    /// The network key changed because a machine was revoked (machines
+    /// only). `old` is signed by the old key and removes that machine; `new`
+    /// is the same document under the new key, signed by it; `key` is the
+    /// new key's secret half.
+    NetworkRotate {
+        old: network::Signed,
+        new: network::Signed,
+        key: [u8; 32],
+    },
 }
 
 /// What a push says. `machine` is the network's name for the machine.
@@ -93,21 +131,34 @@ pub enum Response {
     ControlStarted,
     Pong,
     Error(String),
-    Paired { host_name: String },
+    Paired {
+        host_name: String,
+    },
     /// Wrong or used secret, or too many tries. The connection closes after it.
     Rejected(String),
     /// `exit_code` None: killed by a signal or by the time limit.
-    ExecResult { output: Vec<u8>, exit_code: Option<i32>, truncated: bool },
+    ExecResult {
+        output: Vec<u8>,
+        exit_code: Option<i32>,
+        truncated: bool,
+    },
     /// The absolute path written.
-    Uploaded { path: String },
+    Uploaded {
+        path: String,
+    },
     /// `mm agent` started; `ControlFrame`s follow.
     AgentStarted,
     Machines(Vec<String>),
     /// The network after the join. `network_key`: the network key's secret
     /// half, for a machine only.
-    Joined { network: network::Signed, network_key: Option<[u8; 32]> },
+    Joined {
+        network: network::Signed,
+        network_key: Option<[u8; 32]>,
+    },
     NetworkDoc(network::Signed),
-    Invitation { url: String },
+    Invitation {
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,12 +218,20 @@ const TICKET_PREFIX: &str = "et://pair?t=";
 impl Ticket {
     pub fn to_url(&self) -> anyhow::Result<String> {
         let bytes = postcard::to_stdvec(self)?;
-        Ok(format!("{TICKET_PREFIX}{}", data_encoding::BASE32_NOPAD.encode(&bytes)))
+        Ok(format!(
+            "{TICKET_PREFIX}{}",
+            data_encoding::BASE32_NOPAD.encode(&bytes)
+        ))
     }
 
     pub fn from_url(url: &str) -> anyhow::Result<Self> {
-        let body = url.trim().strip_prefix(TICKET_PREFIX).context("not an et://pair link")?;
-        let bytes = data_encoding::BASE32_NOPAD.decode(body.to_ascii_uppercase().as_bytes()).context("bad ticket")?;
+        let body = url
+            .trim()
+            .strip_prefix(TICKET_PREFIX)
+            .context("not an et://pair link")?;
+        let bytes = data_encoding::BASE32_NOPAD
+            .decode(body.to_ascii_uppercase().as_bytes())
+            .context("bad ticket")?;
         postcard::from_bytes(&bytes).context("bad ticket")
     }
 }
@@ -189,7 +248,9 @@ pub fn encode<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
 }
 
 pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> anyhow::Result<()> {
-    send.write_all(&encode(value)?).await.context("write frame")?;
+    send.write_all(&encode(value)?)
+        .await
+        .context("write frame")?;
     Ok(())
 }
 
@@ -206,7 +267,9 @@ pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> anyhow::R
         bail!("frame too large: {len} bytes");
     }
     let mut body = vec![0u8; len];
-    recv.read_exact(&mut body).await.context("read frame body")?;
+    recv.read_exact(&mut body)
+        .await
+        .context("read frame body")?;
     Ok(Some(postcard::from_bytes(&body).context("decode frame")?))
 }
 
@@ -218,7 +281,10 @@ mod tests {
     fn frame_round_trip() {
         let frame = ControlFrame::Stdout(b"%begin 1 2 1\n".to_vec());
         let bytes = encode(&frame).unwrap();
-        assert_eq!(u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize, bytes.len() - 4);
+        assert_eq!(
+            u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize,
+            bytes.len() - 4
+        );
         let back: ControlFrame = postcard::from_bytes(&bytes[4..]).unwrap();
         assert_eq!(back, frame);
     }
