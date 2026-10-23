@@ -63,6 +63,16 @@ services.etd.enable = true;
 
 The module runs etd and the manymux node (`services.etd.manymux.enable`, on by default), sets `MM_SSH` for your shells, and keeps manymux's machine list equal to the network. A deploy never restarts the manymux node: a restart ends every session on that machine.
 
+Prebuilt (macOS and Linux, aarch64 and x86_64): download `etd-<version>-<target>.tar.gz` from [Releases](https://github.com/ericsharma/etd/releases), then:
+
+```sh
+mkdir -p ~/.local/bin
+tar xzf etd-*.tar.gz -C ~/.local/bin
+~/.local/bin/etd install
+```
+
+Keep `etd` and `etd-ssh` in the same directory. The binaries are not signed. On macOS, download with `curl`: a browser download gets a quarantine flag, and Gatekeeper blocks the binaries until you run `xattr -d com.apple.quarantine` on them.
+
 From source:
 
 ```sh

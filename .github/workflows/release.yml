@@ -1,0 +1,50 @@
+# A tag `v*` builds etd and etd-ssh for macOS and Linux and publishes them as
+# a GitHub release. `etd install` needs etd-ssh next to etd: keep both in one
+# directory (for example ~/.local/bin).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    env:
+      # Runs on macOS 11 and later, not only on the runner's version.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked -p etd --bin etd --bin etd-ssh --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="etd-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          tar czf "$name.tar.gz" -C target/${{ matrix.target }}/release etd etd-ssh
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: etd-*.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --prerelease --generate-notes etd-*.tar.gz*
