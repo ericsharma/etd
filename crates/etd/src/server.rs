@@ -465,7 +465,7 @@ async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: Sen
             Err(e) => Response::Error(format!("{e:#}")),
         },
         Request::NetworkRotate { .. } if kind != Kind::Machine => Response::Error("only machines change the network key".into()),
-        Request::NetworkRotate { old, new, key } => match network::apply_rotation(&state.paths, state.endpoint().id(), &old, &new, &key) {
+        Request::NetworkRotate { chain, key } => match network::apply_rotation(&state.paths, state.endpoint().id(), &chain, &key) {
             Ok(changed) => {
                 if changed {
                     info!("network key changed by {}", peer.fmt_short());

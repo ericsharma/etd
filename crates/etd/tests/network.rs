@@ -4,7 +4,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use et_proto::network::{Kind, Network};
+use et_proto::network::{Kind, Network, Record, Rotation, Stamp, State};
 use et_proto::{read_frame, write_frame, Request, Response, ALPN};
 use etd::config::Paths;
 use etd::{network, pair, server};
@@ -206,33 +206,57 @@ async fn revoking_a_machine_changes_the_network_key() {
         endpoint.close().await;
         (name, _dir, endpoint.secret_key().clone())
     };
+    // Just before, c (about to be revoked) sent e a helper machine, and
+    // itself again with a high counter. Only e got it.
+    let helper = SecretKey::generate().public();
+    let mut forged = c_doc.network.clone();
+    forged.set(helper, State::Member { name: "helper".into(), kind: Kind::Machine }, c_id);
+    let me_again =
+        Record { state: State::Member { name: "mac-mini".into(), kind: Kind::Machine }, stamp: Stamp { counter: 1000, author: c_id } };
+    forged.records.insert(c_id, me_again);
+    let forged = forged.sign(&c_key).unwrap();
+    assert!(network::apply(&e_dir, &forged).unwrap());
+
     network::revoke(&a.paths, a.endpoint.id(), "mac-mini").unwrap();
-    let new_key = a.network().key;
-    assert_ne!(new_key, old_key);
-    eventually("b has the new key", &[&b], |m| m.network().key == new_key).await;
-    assert_eq!(network::load_key(&b.paths).unwrap().unwrap().public(), new_key);
+    let first_key = a.network().key;
+    assert_ne!(first_key, old_key);
+    eventually("b has the new key", &[&b], |m| m.network().key == first_key).await;
     assert!(b.network().member(&c_id).is_none());
+    // A second key change while e is still off.
+    let spare = SecretKey::generate().public();
+    network::admit(&a.paths, a.endpoint.id(), spare, "spare", Kind::Machine).unwrap();
+    network::revoke(&a.paths, a.endpoint.id(), "spare").unwrap();
+    let new_key = a.network().key;
+    assert_ne!(new_key, first_key);
+    eventually("b has the second key", &[&b], |m| m.network().key == new_key).await;
+    assert_eq!(network::load_key(&b.paths).unwrap().unwrap().public(), new_key);
     eventually("the same document", &[&a, &b], |m| m.network() == a.network()).await;
 
     // What c can still sign with the old key is worth nothing now.
-    let mut forged = c_doc.network.clone();
-    forged.set(SecretKey::generate().public(), et_proto::network::State::Member { name: "evil".into(), kind: Kind::Machine }, c_id);
-    let forged = forged.sign(&c_key).unwrap();
     assert!(network::apply(&b.paths, &forged).is_err(), "a document under the old key");
     // Nor can c make its own key change from the old key.
     let mut moved = forged.network.clone();
     let k2 = SecretKey::generate();
     moved.key = k2.public();
     let moved = moved.sign(&k2).unwrap();
-    let err = network::apply_rotation(&b.paths, b.endpoint.id(), &forged, &moved, &k2.to_bytes()).unwrap_err();
+    let chain = [Rotation { old: forged, new: moved }];
+    let err = network::apply_rotation(&b.paths, b.endpoint.id(), &chain, &k2.to_bytes()).unwrap_err();
     assert!(format!("{err:#}").contains("fork"), "{err:#}");
     // And c cannot reach the others any more.
     let conn = c.endpoint.connect(b.endpoint.id(), ALPN).await.unwrap();
     assert!(call(&conn, Request::Network).await.is_err(), "not a member any more");
 
-    // e comes back: it asks the others at its start and gets the change.
+    // e comes back: it asks the others at its start and gets both changes,
+    // without c's helper and without c.
     let e = Machine::start_at(e_off.0, &book, e_off.1, e_off.2).await;
     assert_eq!(network::load(&e_dir).unwrap().unwrap().network.key, old_key);
     eventually("e has the new key", &[&e], |m| m.network().key == new_key).await;
     eventually("the same document", &[&a, &b, &e], |m| m.network() == a.network()).await;
+    assert!(e.network().member(&helper).is_none() && e.network().member(&c_id).is_none(), "{:?}", e.names());
+
+    // Machine names are one word: manymux and etd-ssh use them as such.
+    let id = SecretKey::generate().public();
+    assert!(network::admit(&a.paths, a.endpoint.id(), id, "mac/mini", Kind::Machine).is_err());
+    assert!(network::admit(&a.paths, a.endpoint.id(), id, "two words", Kind::Machine).is_err());
+    assert!(network::admit(&a.paths, a.endpoint.id(), id, "Eric's iPad", Kind::Device).is_ok());
 }

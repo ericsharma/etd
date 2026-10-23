@@ -140,7 +140,7 @@ async fn forward(state: &State, note: &Note) {
 }
 
 /// Follows this machine's node until the feed ends. Errors say why.
-async fn follow_once(state: &State) -> anyhow::Result<()> {
+async fn follow_once(state: &Arc<State>) -> anyhow::Result<()> {
     let mut child = mm::agent_local(state.env())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -171,8 +171,13 @@ async fn follow_once(state: &State) -> anyhow::Result<()> {
         let signed = network::load(state.paths()).ok().flatten();
         match route(&event, &host_name, signed.as_ref().map(|s| &s.network), me) {
             Route::Own(note) => {
-                deliver(state, &note).await;
-                forward(state, &note).await;
+                // In the background: a machine that is off must not hold up
+                // the next events.
+                let state = state.clone();
+                tokio::spawn(async move {
+                    deliver(&state, &note).await;
+                    forward(&state, &note).await;
+                });
             }
             Route::Legacy(note) => deliver(state, &note).await,
             Route::Skip => {}

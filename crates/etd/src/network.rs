@@ -9,7 +9,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 
 use anyhow::{bail, Context};
-use et_proto::network::{Kind, Network, Signed, State};
+use et_proto::network::{Kind, Network, Rotation, Signed, State};
 use et_proto::{read_frame, write_frame, Request, Response, Ticket, ALPN};
 use iroh::{Endpoint, EndpointId, SecretKey};
 use tracing::{debug, info, warn};
@@ -98,6 +98,11 @@ fn short(key: &iroh::PublicKey) -> String {
 /// it, and saves it. Returns the new document.
 pub fn change(paths: &Paths, f: impl FnOnce(&mut Network) -> anyhow::Result<()>) -> anyhow::Result<Signed> {
     let _lock = Lock::take(paths)?;
+    change_locked(paths, f)
+}
+
+/// `change`, for a caller that holds the lock.
+fn change_locked(paths: &Paths, f: impl FnOnce(&mut Network) -> anyhow::Result<()>) -> anyhow::Result<Signed> {
     let signed = load(paths)?.context("no network yet; start etd once")?;
     let key = load_key(paths)?.context("this machine has no network key, so it cannot change the network")?;
     let mut network = signed.network;
@@ -114,6 +119,14 @@ pub fn unique_name(network: &Network, wanted: &str, kind: Kind) -> anyhow::Resul
     let taken = |name: &str| network.members().any(|m| m.name == name);
     if wanted.is_empty() {
         bail!("a member needs a name");
+    }
+    if wanted.chars().any(char::is_control) {
+        bail!("a name must not contain control characters");
+    }
+    // manymux writes a session on another machine as `<machine>/<session>`,
+    // and manymux's hosts.toml and etd-ssh take the name as one word.
+    if kind == Kind::Machine && !wanted.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
+        bail!("a machine name may have only letters, digits, '.', '_' and '-': {wanted:?}");
     }
     if !taken(wanted) {
         return Ok(wanted.into());
@@ -137,10 +150,13 @@ pub fn admit(paths: &Paths, me: EndpointId, id: EndpointId, name: &str, kind: Ki
 }
 
 /// Removes members by name or id prefix (machines only: D1). Returns them.
+/// Revoking a machine also moves the network to a new network key, because
+/// the revoked machine holds the old one.
 pub fn revoke(paths: &Paths, me: EndpointId, who: &str) -> anyhow::Result<Vec<(EndpointId, String)>> {
+    let _lock = Lock::take(paths)?;
     let mut removed = Vec::new();
     let mut a_machine = false;
-    change(paths, |network| {
+    let signed = change_locked(paths, |network| {
         let found: Vec<(EndpointId, String, Kind)> = network.find(who).iter().map(|m| (m.id, m.name.to_string(), m.kind)).collect();
         if found.is_empty() {
             bail!("no member matches {who:?}; see `etd members`");
@@ -155,94 +171,98 @@ pub fn revoke(paths: &Paths, me: EndpointId, who: &str) -> anyhow::Result<Vec<(E
         removed = found.into_iter().map(|(id, name, _)| (id, name)).collect();
         Ok(())
     })?;
-    // A revoked machine holds the network key: move the network to a new one.
     if a_machine {
-        rotate(paths)?;
+        let key = SecretKey::generate();
+        let mut network = signed.network.clone();
+        network.key = key.public();
+        let rotation = Rotation { old: signed, new: network.sign(&key)? };
+        let mut chain = load_rotations(paths)?;
+        chain.push(rotation.clone());
+        config::write_json(&paths.rotations(), &chain)?;
+        save_key(paths, &key)?;
+        save(paths, &rotation.new)?;
+        info!("network key changed: {} → {}", short(&rotation.old.network.key), short(&rotation.new.network.key));
     }
     Ok(removed)
 }
 
-/// The last key change: the old document (signed by the old key, with the
-/// revoked machine removed) and the same document under the new key. Kept
-/// to send to machines that have not changed keys yet.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Rotation {
-    pub old: Signed,
-    pub new: Signed,
+/// The network's key changes, oldest first (empty if it never changed).
+pub fn load_rotations(paths: &Paths) -> anyhow::Result<Vec<Rotation>> {
+    Ok(config::read_json(&paths.rotations())?.unwrap_or_default())
 }
 
-pub fn load_rotation(paths: &Paths) -> anyhow::Result<Option<Rotation>> {
-    config::read_json(&paths.rotation())
-}
-
-/// Moves the network to a new network key, after a machine was revoked.
-/// The other machines accept the new key only together with the old
-/// document, signed by the old key, so a revoked machine cannot follow.
-fn rotate(paths: &Paths) -> anyhow::Result<Signed> {
-    let _lock = Lock::take(paths)?;
-    let old = load(paths)?.context("no network")?;
-    let key = SecretKey::generate();
-    let mut network = old.network.clone();
-    network.key = key.public();
-    let new = network.sign(&key)?;
-    config::write_json(&paths.rotation(), &Rotation { old: old.clone(), new: new.clone() })?;
-    save_key(paths, &key)?;
-    save(paths, &new)?;
-    info!("network key changed: {} → {}", short(&old.network.key), short(&new.network.key));
-    Ok(new)
-}
-
-/// A key change from another machine (`NetworkRotate`). True if this
-/// machine's copy changed. Refuses a change that does not start from this
-/// machine's key (two machines that changed keys at once: a fork, fixed by
-/// hand) and a change that removes this machine.
-pub fn apply_rotation(paths: &Paths, me: EndpointId, old: &Signed, new: &Signed, key: &[u8; 32]) -> anyhow::Result<bool> {
-    old.verify()?;
-    new.verify()?;
+/// Key changes from another machine (`NetworkRotate`): `chain` is every key
+/// change of the network, `key` the secret half of the last new key. This
+/// machine moves from its key to the last one. True if its copy changed.
+///
+/// Refused: a chain that does not pass through this machine's key (two
+/// machines changed keys at once: a fork, fixed by hand), and a chain that
+/// removes this machine. A chain that ends at a key this machine already left
+/// changes nothing (the sender is behind; it gets this machine's chain).
+pub fn apply_rotation(paths: &Paths, me: EndpointId, chain: &[Rotation], key: &[u8; 32]) -> anyhow::Result<bool> {
+    let last = chain.last().context("an empty key change")?;
+    for (i, step) in chain.iter().enumerate() {
+        step.verify()?;
+        if i > 0 && chain[i - 1].new.network.key != step.old.network.key {
+            bail!("the key changes do not follow each other");
+        }
+    }
     let key = SecretKey::from_bytes(key);
-    if key.public() != new.network.key {
+    if key.public() != last.new.network.key {
         bail!("the new network key does not match the new document");
     }
-    let mut same = new.network.clone();
-    same.key = old.network.key;
-    if same != old.network {
-        bail!("the new document is not the old one under a new key");
-    }
+    let _lock = Lock::take(paths)?;
     let local = load(paths)?.context("no network")?;
-    if local.network.key == new.network.key {
+    let current = local.network.key;
+    if current == last.new.network.key {
         // Already moved: only the records can be new.
-        return apply(paths, new);
+        return apply_locked(paths, &last.new);
     }
-    if local.network.key != old.network.key {
+    if load_rotations(paths)?.iter().any(|r| r.old.network.key == last.new.network.key) {
+        return Ok(false);
+    }
+    // Where this machine's key is in the chain.
+    if !chain.iter().any(|r| r.old.network.key == current || r.new.network.key == current) {
         bail!(
-            "network key fork: this machine has {}, the change goes from {} to {}",
-            short(&local.network.key),
-            short(&old.network.key),
-            short(&new.network.key)
+            "network key fork: this machine has {}, the key changes go {}",
+            short(&current),
+            chain.iter().map(|r| short(&r.old.network.key)).chain([short(&last.new.network.key)]).collect::<Vec<_>>().join(" → ")
         );
     }
-    if new.network.member(&me).is_none() {
+    let mut network = last.new.network.clone();
+    if network.member(&me).is_none() {
         bail!("this machine is removed from the network");
     }
-    let _lock = Lock::take(paths)?;
-    // Keep changes made here under the old key meanwhile.
-    let mut network = new.network.clone();
-    let mut ours = local.network.clone();
-    ours.key = network.key;
-    network.merge(&ours)?;
+    // Keep changes made here under the old key meanwhile, except those by
+    // or about a removed member: a machine about to be revoked may have
+    // added a helper, or itself again with a high counter.
+    let removed = |id: &EndpointId| network.records.get(id).is_some_and(|r| r.state == State::Removed);
+    let mine: Vec<_> = local
+        .network
+        .records
+        .iter()
+        .filter(|(id, r)| !removed(id) && !removed(&r.stamp.author))
+        .filter(|(id, r)| network.records.get(*id).is_none_or(|theirs| r.stamp > theirs.stamp))
+        .map(|(id, r)| (*id, r.clone()))
+        .collect();
+    network.records.extend(mine);
     let signed = network.sign(&key)?;
-    config::write_json(&paths.rotation(), &Rotation { old: old.clone(), new: new.clone() })?;
+    config::write_json(&paths.rotations(), &chain)?;
     save_key(paths, &key)?;
     save(paths, &signed)?;
-    info!("network key changed: {} → {}", short(&old.network.key), short(&new.network.key));
+    info!("network key changed: {} → {}", short(&current), short(&last.new.network.key));
     Ok(true)
 }
 
 /// A document from another machine: checks it, merges it, and saves the
 /// result signed again. True if this machine's copy changed.
 pub fn apply(paths: &Paths, incoming: &Signed) -> anyhow::Result<bool> {
-    incoming.verify()?;
     let _lock = Lock::take(paths)?;
+    apply_locked(paths, incoming)
+}
+
+fn apply_locked(paths: &Paths, incoming: &Signed) -> anyhow::Result<bool> {
+    incoming.verify()?;
     let signed = load(paths)?.context("no network yet")?;
     let mut network = signed.network.clone();
     if !network.merge(&incoming.network)? {
@@ -333,11 +353,12 @@ pub async fn push_to(endpoint: &Endpoint, paths: &Paths, id: EndpointId) -> anyh
 
 async fn push_one(endpoint: &Endpoint, paths: &Paths, id: EndpointId, signed: Signed) -> anyhow::Result<()> {
     let conn = tokio::time::timeout(std::time::Duration::from_secs(15), endpoint.connect(id, ALPN)).await.context("timed out")??;
-    // A machine that has not moved to the current key gets the key change
-    // first; for one that has, it changes nothing.
-    if let Some(rotation) = load_rotation(paths)?.filter(|r| r.new.network.key == signed.network.key) {
+    // A machine that has not moved to the current key gets the key changes
+    // first; for one that has, they change nothing.
+    let chain = load_rotations(paths)?;
+    if chain.last().is_some_and(|r| r.new.network.key == signed.network.key) {
         let key = load_key(paths)?.context("no network key")?.to_bytes();
-        call(&conn, Request::NetworkRotate { old: rotation.old, new: rotation.new, key }).await?;
+        call(&conn, Request::NetworkRotate { chain, key }).await?;
     }
     call(&conn, Request::NetworkUpdate { network: signed }).await?;
     conn.close(0u32.into(), b"sent");

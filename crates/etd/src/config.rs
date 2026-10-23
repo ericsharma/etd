@@ -54,9 +54,10 @@ impl Paths {
         self.config.join("network.key")
     }
 
-    /// The last network key change, to send to machines that missed it.
-    pub fn rotation(&self) -> PathBuf {
-        self.config.join("rotation.json")
+    /// The network's key changes, oldest first, to send to machines that
+    /// missed one.
+    pub fn rotations(&self) -> PathBuf {
+        self.config.join("rotations.json")
     }
 
     /// Held while the network document is read, changed and written.

@@ -54,6 +54,32 @@ pub struct Signed {
     pub signature: Signature,
 }
 
+/// One key change, after a machine was revoked: `old` (the document with
+/// that machine removed, signed by the old key) and `new` (the same document
+/// with the new key, signed by it).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Rotation {
+    pub old: Signed,
+    pub new: Signed,
+}
+
+impl Rotation {
+    /// Both signed, and `new` is `old` under another key.
+    pub fn verify(&self) -> anyhow::Result<()> {
+        self.old.verify()?;
+        self.new.verify()?;
+        let mut same = self.new.network.clone();
+        same.key = self.old.network.key;
+        if same != self.old.network || self.new.network.key == self.old.network.key {
+            bail!("a key change must keep the document and change the key");
+        }
+        Ok(())
+    }
+}
+
+/// Counters above this are refused: `set` must always find a higher one.
+const MAX_COUNTER: u64 = u64::MAX / 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member<'a> {
     pub id: EndpointId,
@@ -105,6 +131,9 @@ impl Network {
     pub fn merge(&mut self, other: &Network) -> anyhow::Result<bool> {
         if other.key != self.key {
             bail!("a document of another network");
+        }
+        if other.counter() > MAX_COUNTER {
+            bail!("a document with a counter out of range");
         }
         let mut changed = false;
         for (id, theirs) in &other.records {

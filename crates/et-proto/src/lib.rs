@@ -94,12 +94,10 @@ pub enum Request {
         until: u64,
     },
     /// The network key changed because a machine was revoked (machines
-    /// only). `old` is signed by the old key and removes that machine; `new`
-    /// is the same document under the new key, signed by it; `key` is the
-    /// new key's secret half.
+    /// only). `chain`: every key change of the network, oldest first; `key`:
+    /// the secret half of the last one's new key.
     NetworkRotate {
-        old: network::Signed,
-        new: network::Signed,
+        chain: Vec<network::Rotation>,
         key: [u8; 32],
     },
 }

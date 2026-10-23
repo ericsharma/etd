@@ -58,16 +58,20 @@ pub async fn receive<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> an
 #[derive(Debug, Default)]
 struct Connections(Mutex<HashMap<EndpointId, Connection>>);
 
+/// A machine that is off must not hold `etd-ssh` up for long.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl Connections {
     async fn to(&self, endpoint: &Endpoint, id: EndpointId) -> anyhow::Result<Connection> {
-        let mut map = self.0.lock().await;
-        if let Some(conn) = map.get(&id) {
-            if conn.close_reason().is_none() {
-                return Ok(conn.clone());
-            }
+        if let Some(conn) = self.0.lock().await.get(&id).filter(|c| c.close_reason().is_none()) {
+            return Ok(conn.clone());
         }
-        let conn = endpoint.connect(id, ALPN).await.context("reach the machine")?;
-        map.insert(id, conn.clone());
+        // Not under the lock: a machine that is off would hold up the others.
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(id, ALPN))
+            .await
+            .context("reach the machine: timed out")?
+            .context("reach the machine")?;
+        self.0.lock().await.insert(id, conn.clone());
         Ok(conn)
     }
 }
