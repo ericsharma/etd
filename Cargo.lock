@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "et-link"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "et-proto",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "et-proto"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "data-encoding",
@@ -873,7 +873,7 @@ dependencies = [
 
 [[package]]
 name = "etd"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "dirs",
