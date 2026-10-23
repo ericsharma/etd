@@ -883,6 +883,7 @@ dependencies = [
  "iroh-blobs",
  "libc",
  "manymux",
+ "n0-future",
  "postcard",
  "qrcode",
  "serde",

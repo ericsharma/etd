@@ -3,6 +3,8 @@
 //! - `Agent { host: Some(name) }`: a pipe to `mm agent` on the machine
 //!   `name`. After `AgentStarted`, `ControlFrame`s come back and raw bytes go.
 //! - `ExecOn { host: name, script }`: `Exec` on that machine.
+//! - `Send { paths, to, session }` (`etd send`, socket only): files to that
+//!   machine (files.rs).
 //!
 //! They come from the local socket (`etd-ssh`, manymux's `MM_SSH`), with the
 //! same et/1 frames as over iroh, or from a member over iroh. The socket is
@@ -24,7 +26,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::config::Paths;
-use crate::network;
+use crate::{files, network};
 
 /// `$ETD_SOCKET`, else `etd.sock` in etd's state directory.
 pub fn socket_path(paths: &Paths) -> PathBuf {
@@ -54,16 +56,20 @@ pub async fn receive<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> an
     Ok(Some(postcard::from_bytes(&body)?))
 }
 
-/// Open iroh connections to other machines, reused across requests.
+/// Open iroh connections to other machines, reused across requests, and
+/// the file store that sends over them.
 #[derive(Debug, Default)]
-pub struct Connections(Mutex<HashMap<EndpointId, Connection>>);
+pub struct Connections {
+    open: Mutex<HashMap<EndpointId, Connection>>,
+    pub files: files::Lazy,
+}
 
 /// A machine that is off must not hold `etd-ssh` up for long.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl Connections {
     async fn to(&self, endpoint: &Endpoint, id: EndpointId) -> anyhow::Result<Connection> {
-        if let Some(conn) = self.0.lock().await.get(&id).filter(|c| c.close_reason().is_none()) {
+        if let Some(conn) = self.open.lock().await.get(&id).filter(|c| c.close_reason().is_none()) {
             return Ok(conn.clone());
         }
         // Not under the lock: a machine that is off would hold up the others.
@@ -71,7 +77,7 @@ impl Connections {
             .await
             .context("reach the machine: timed out")?
             .context("reach the machine")?;
-        self.0.lock().await.insert(id, conn.clone());
+        self.open.lock().await.insert(id, conn.clone());
         Ok(conn)
     }
 }
@@ -115,8 +121,33 @@ async fn handle(mut stream: UnixStream, endpoint: &Endpoint, paths: &Paths, conn
     let Some(request) = receive::<_, Request>(&mut stream).await? else {
         return Ok(());
     };
+    if let Request::Send { paths: sent, to, session } = request {
+        let reply = match send_files(endpoint, paths, connections, &sent, &to, session, &mut stream).await {
+            Ok(reply) => reply,
+            Err(e) => Response::Error(format!("{e:#}")),
+        };
+        send(&mut stream, &reply).await?;
+        return Ok(stream.shutdown().await?);
+    }
     let (rx, tx) = stream.into_split();
     forward(request, rx, tx, endpoint, paths, connections).await
+}
+
+/// `etd send`: `Progress` frames to `out`; returns the machine's answer.
+async fn send_files(
+    endpoint: &Endpoint,
+    paths: &Paths,
+    connections: &Connections,
+    sent: &[String],
+    to: &str,
+    session: Option<String>,
+    out: &mut UnixStream,
+) -> anyhow::Result<Response> {
+    let id = machine(paths, endpoint.id(), to)?;
+    let files = connections.files.get(paths).await?;
+    let conn = connections.to(endpoint, id).await.with_context(|| to.to_string())?;
+    let sent: Vec<PathBuf> = sent.iter().map(PathBuf::from).collect();
+    files.send(&conn, &sent, session, out).await
 }
 
 /// Sends `request` (`Agent { host: Some }` or `ExecOn`) on to that machine,

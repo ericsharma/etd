@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{self, Paths, Status};
 use crate::tmux::{self, Env};
-use crate::{events, local, mm, network, ops, pair};
+use crate::{events, files, local, mm, network, ops, pair};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -316,9 +316,9 @@ impl ProtocolHandler for Handler {
                     break;
                 }
             };
-            let state = state.clone();
+            let (state, conn) = (state.clone(), conn.clone());
             tokio::spawn(async move {
-                if let Err(e) = serve_stream(&state, id, kind, send, recv).await {
+                if let Err(e) = serve_stream(&state, &conn, id, kind, send, recv).await {
                     debug!("stream ended: {e:#}");
                 }
             });
@@ -411,7 +411,14 @@ async fn admission(state: &State, conn: &Connection) -> Option<(String, Kind)> {
     }
 }
 
-async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: SendStream, mut recv: RecvStream) -> anyhow::Result<()> {
+async fn serve_stream(
+    state: &State,
+    conn: &Connection,
+    peer: EndpointId,
+    kind: Kind,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> anyhow::Result<()> {
     let Some(request) = read_frame::<Request>(&mut recv).await? else {
         return Ok(());
     };
@@ -509,6 +516,45 @@ async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: Sen
             Ok(list) => Response::Machines(list),
             Err(e) => Response::Error(format!("{e:#}")),
         },
+        Request::Deliver { hash, session } => return deliver(state, conn, peer, hash, session, send).await,
+        Request::Send { .. } => Response::Error("Send is for the local socket (`etd send`)".into()),
+    };
+    write_frame(&mut send, &reply).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// Fetches a collection from the member at the other end of `conn` into
+/// `~/etd-downloads/` (files.rs): `Progress` frames, then `Delivered`.
+async fn deliver(
+    state: &State,
+    conn: &Connection,
+    peer: EndpointId,
+    hash: [u8; 32],
+    session: Option<String>,
+    mut send: SendStream,
+) -> anyhow::Result<()> {
+    let hash = iroh_blobs::Hash::from_bytes(hash);
+    let delivered = async {
+        let files = state.connections.files.get(&state.paths).await?;
+        let downloads = files::downloads(&state.env)?;
+        files.deliver(conn, hash, &downloads, &mut send).await
+    }
+    .await;
+    let reply = match delivered {
+        Ok(paths) => {
+            let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+            info!("files from {}: {}", peer.fmt_short(), paths.join(", "));
+            if let Some(session) = session {
+                // Typing into a manymux session: PLAN-files F4.
+                debug!("not typed into {session}: not built yet");
+            }
+            Response::Delivered { paths, typed: false }
+        }
+        Err(e) => {
+            warn!("files from {}: {e:#}", peer.fmt_short());
+            Response::Error(format!("{e:#}"))
+        }
     };
     write_frame(&mut send, &reply).await?;
     send.finish()?;

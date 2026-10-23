@@ -20,6 +20,9 @@ usage:
   etd join <link> [--name N]   join the network of the machine that made the link
   etd members                  list the network's machines and devices
   etd revoke <name|id>         remove a member everywhere and close its connections
+  etd send <path>… <machine>[:<session>]
+                               send files or folders to ~/etd-downloads/ on another machine
+                               of the network; prints the paths there
   etd status [--json]          show the daemon's id, addresses, and connected members
   etd id                       print this machine's endpoint id
   etd pair [--url]             the same as `etd invite` (a device)
@@ -77,6 +80,53 @@ fn kind_word(kind: Kind) -> &'static str {
     match kind {
         Kind::Machine => "machine",
         Kind::Device => "device",
+    }
+}
+
+/// `etd send <path>… <machine>[:<session>]`, through the running etd.
+async fn send(paths: &Paths, args: &[&str]) -> anyhow::Result<()> {
+    let (target, files) = args.split_last().context(USAGE)?;
+    let (to, session) = match target.split_once(':') {
+        Some((machine, session)) => (machine.to_string(), Some(session.to_string())),
+        None => (target.to_string(), None),
+    };
+    let files = files
+        .iter()
+        .map(|f| std::path::Path::new(f).canonicalize().map(|p| p.display().to_string()).with_context(|| f.to_string()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let socket = etd::local::socket_path(paths);
+    let mut stream =
+        tokio::net::UnixStream::connect(&socket).await.with_context(|| format!("etd is not running here ({})", socket.display()))?;
+    etd::local::send(&mut stream, &et_proto::Request::Send { paths: files, to: to.clone(), session: session.clone() }).await?;
+    let show = std::io::stderr().is_terminal();
+    loop {
+        match etd::local::receive::<_, et_proto::Response>(&mut stream).await?.context("etd closed the connection")? {
+            et_proto::Response::Progress { done, total } => {
+                if show {
+                    let pct = (done * 100).checked_div(total).unwrap_or(100);
+                    eprint!("\r{to}: {pct:>3}%  {:.1} / {:.1} MB ", done as f64 / 1e6, total as f64 / 1e6);
+                }
+            }
+            et_proto::Response::Delivered { paths, typed } => {
+                if show {
+                    eprintln!();
+                }
+                for path in paths {
+                    println!("{path}");
+                }
+                if let (Some(session), false) = (session, typed) {
+                    eprintln!("(not typed into {to}:{session}: typing into a session is not built yet)");
+                }
+                return Ok(());
+            }
+            et_proto::Response::Error(e) => {
+                if show {
+                    eprintln!();
+                }
+                bail!("{e}")
+            }
+            other => bail!("unexpected answer: {other:?}"),
+        }
     }
 }
 
@@ -193,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
             println!("allowed {name} ({id})");
             Ok(())
         }
+        ["send", rest @ ..] if rest.len() >= 2 => send(&paths, rest).await,
         ["-h" | "--help" | "help"] => {
             println!("{USAGE}");
             Ok(())

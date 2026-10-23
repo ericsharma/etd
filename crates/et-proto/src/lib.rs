@@ -4,6 +4,7 @@
 //! - The first frame on a stream is a [`Request`]; `etd` answers with one
 //!   [`Response`] frame. `Control` then carries [`ControlFrame`]s down and raw
 //!   bytes up (tmux stdin). `Upload` sends its raw bytes after the request.
+//!   `Deliver` answers `Progress` frames, then `Delivered`.
 //! - A frame is a big-endian `u32` length, then a postcard body.
 //! - postcard is positional. New variants go at the end of an enum, so an
 //!   older peer still decodes what it knows. Any other change (reorder,
@@ -101,6 +102,22 @@ pub enum Request {
         chain: Vec<network::Rotation>,
         key: [u8; 32],
     },
+    /// Take the files of iroh-blobs collection `hash` from the sender: this
+    /// etd fetches it over this same connection (the sender serves it there),
+    /// then writes it to `~/etd-downloads/`. `Progress` frames, then
+    /// `Delivered`. `session`: also type the paths into that manymux session.
+    Deliver {
+        hash: [u8; 32],
+        session: Option<String>,
+    },
+    /// Local socket only (`etd send`): send `paths` (files or folders) to the
+    /// machine of the network called `to`, with `Deliver`. `Progress` frames,
+    /// then the machine's `Delivered`.
+    Send {
+        paths: Vec<String>,
+        to: String,
+        session: Option<String>,
+    },
 }
 
 /// What a push says. `machine` is the network's name for the machine.
@@ -157,6 +174,17 @@ pub enum Response {
     NetworkDoc(network::Signed),
     Invitation {
         url: String,
+    },
+    /// Payload bytes of a `Deliver` so far.
+    Progress {
+        done: u64,
+        total: u64,
+    },
+    /// The top-level paths written (one per file or folder sent).
+    /// `typed`: they were typed into the session.
+    Delivered {
+        paths: Vec<String>,
+        typed: bool,
     },
 }
 

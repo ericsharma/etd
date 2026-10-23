@@ -1,0 +1,460 @@
+//! Files between members of the network (et-ios docs/PLAN-files.md).
+//!
+//! The sender imports its files into an iroh-blobs store as one collection
+//! and serves that collection on a connection IT opened to the receiver, so
+//! a phone never has to accept connections. It then sends `Deliver { hash }`
+//! on that connection; the receiving etd fetches the collection over the same
+//! connection (only the chunks it does not have yet: a resend resumes) and
+//! writes it to `~/etd-downloads/`.
+//!
+//! Blobs are kept only while a send or a delivery runs (tags); the store's
+//! garbage collection removes the rest. The sender imports by reference, so
+//! its files are not copied; the store never deletes a file it references.
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context};
+use et_proto::{read_frame, write_frame, Request, Response};
+use iroh::endpoint::Connection;
+use iroh_blobs::api::blobs::{AddPathOptions, ExportMode, ExportOptions, ImportMode};
+use iroh_blobs::api::remote::GetProgressItem;
+use iroh_blobs::api::TempTag;
+use iroh_blobs::format::collection::Collection;
+use iroh_blobs::provider::events::{AbortReason, ConnectMode, EventMask, EventSender, ObserveMode, ProviderMessage, RequestMode};
+use iroh_blobs::store::fs::options::Options;
+use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::store::GcConfig;
+use iroh_blobs::{BlobFormat, Hash, HashAndFormat};
+use n0_future::StreamExt;
+use tokio::io::AsyncWrite;
+use tokio::sync::OnceCell;
+use tracing::{debug, info};
+
+use crate::config::Paths;
+use crate::local;
+use crate::ops;
+use crate::tmux::Env;
+
+/// How often blobs that no send or delivery holds are removed.
+pub const GC_EVERY: Duration = Duration::from_secs(10 * 60);
+/// A delivery must leave this much free on the disk.
+const FREE_MARGIN: u64 = 2 * 1024 * 1024 * 1024;
+/// Most files in one send.
+const MAX_ITEMS: u64 = 100_000;
+/// `Progress` frames at most this often.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+/// Tags that keep a delivery's blobs while it runs.
+const RECV_TAG: &str = "recv/";
+
+/// The store, opened at first use (most etds never send a file).
+#[derive(Debug, Default)]
+pub struct Lazy(OnceCell<Arc<Files>>);
+
+impl Lazy {
+    pub async fn get(&self, paths: &Paths) -> anyhow::Result<Arc<Files>> {
+        let dir = paths.state.join("blobs");
+        self.0.get_or_try_init(|| async move { Files::open(&dir, GC_EVERY).await }).await.cloned()
+    }
+}
+
+pub struct Files {
+    store: FsStore,
+    /// The store's directory (for the free-space check).
+    dir: PathBuf,
+    /// Root hashes being sent: the only ones served.
+    offered: Arc<Mutex<HashSet<Hash>>>,
+    /// Connections served on (stable ids).
+    serving: Arc<Mutex<HashSet<usize>>>,
+}
+
+impl std::fmt::Debug for Files {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Files").field("offered", &self.offered.lock().unwrap().len()).finish()
+    }
+}
+
+/// A collection being sent; while it lives, its blobs are kept and served.
+pub struct Outgoing {
+    files: Arc<Files>,
+    root: TempTag,
+    pub total: u64,
+}
+
+impl Outgoing {
+    pub fn hash(&self) -> Hash {
+        self.root.hash()
+    }
+}
+
+impl Drop for Outgoing {
+    fn drop(&mut self) {
+        self.files.offered.lock().unwrap().remove(&self.root.hash());
+    }
+}
+
+impl Files {
+    pub async fn open(dir: &Path, gc: Duration) -> anyhow::Result<Arc<Self>> {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let mut options = Options::new(dir);
+        options.gc = Some(GcConfig { interval: gc, add_protected: None });
+        let store = FsStore::load_with_opts(dir.join("blobs.db"), options).await.context("open the file store")?;
+        // Deliveries cut by a restart: the sender sends again.
+        store.tags().delete_prefix(RECV_TAG).await?;
+        Ok(Arc::new(Self { store, dir: dir.to_path_buf(), offered: Arc::default(), serving: Arc::default() }))
+    }
+
+    /// Serves the offered collections on `conn`, a connection this side
+    /// opened; the other side fetches over it after `Deliver`.
+    pub fn serve_on(&self, conn: &Connection) {
+        let id = conn.stable_id();
+        if !self.serving.lock().unwrap().insert(id) {
+            return;
+        }
+        let (store, conn, events, serving) =
+            ((*self.store).clone(), conn.clone(), only_offered(self.offered.clone()), self.serving.clone());
+        tokio::spawn(async move {
+            iroh_blobs::provider::handle_connection(conn, store, events).await;
+            serving.lock().unwrap().remove(&id);
+        });
+    }
+
+    /// Imports `paths` (files or folders) as one collection, by reference.
+    /// Names are relative to each path's parent: `a.txt`, `out/x/y.bin`.
+    pub async fn import(self: &Arc<Self>, paths: &[PathBuf]) -> anyhow::Result<Outgoing> {
+        let mut sources = BTreeMap::new();
+        for path in paths {
+            let path = path.canonicalize().with_context(|| format!("{}", path.display()))?;
+            let parent = path.parent().context("cannot send /")?.to_path_buf();
+            for file in walk(&path)? {
+                let name = name_of(file.strip_prefix(&parent)?)?;
+                if sources.insert(name.clone(), file).is_some() {
+                    bail!("two files would be called {name}");
+                }
+            }
+        }
+        if sources.is_empty() {
+            bail!("nothing to send (empty folders only)");
+        }
+        let mut items = Vec::new();
+        let mut total = 0;
+        for (name, path) in sources {
+            total += std::fs::metadata(&path)?.len();
+            let tag = self
+                .store
+                .add_path_with_opts(AddPathOptions { path: path.clone(), mode: ImportMode::TryReference, format: BlobFormat::Raw })
+                .temp_tag()
+                .await
+                .with_context(|| format!("read {}", path.display()))?;
+            items.push((name, tag));
+        }
+        let collection: Collection = items.iter().map(|(name, tag)| (name.clone(), tag.hash())).collect();
+        // The collection's tag keeps the items.
+        let root = collection.store(&self.store).await?;
+        self.offered.lock().unwrap().insert(root.hash());
+        Ok(Outgoing { files: self.clone(), root, total })
+    }
+
+    /// `etd send`: `paths` to the machine at the other end of `conn`.
+    /// `Progress` frames go to `out`; returns the machine's last answer.
+    pub async fn send<W: AsyncWrite + Unpin>(
+        self: &Arc<Self>,
+        conn: &Connection,
+        paths: &[PathBuf],
+        session: Option<String>,
+        out: &mut W,
+    ) -> anyhow::Result<Response> {
+        let outgoing = self.import(paths).await?;
+        self.serve_on(conn);
+        let (mut up, mut down) = conn.open_bi().await?;
+        write_frame(&mut up, &Request::Deliver { hash: *outgoing.hash().as_bytes(), session }).await?;
+        up.finish()?;
+        loop {
+            match read_frame::<Response>(&mut down).await?.context("the machine closed the stream")? {
+                progress @ Response::Progress { .. } => local::send(out, &progress).await?,
+                last => return Ok(last),
+            }
+        }
+    }
+
+    /// `Deliver`: fetches collection `hash` over `conn` (from the member at
+    /// its other end), writes it under `downloads`, and returns the top-level
+    /// paths. `Progress` frames go to `out`.
+    pub async fn deliver<W: AsyncWrite + Unpin>(
+        &self,
+        conn: &Connection,
+        hash: Hash,
+        downloads: &Path,
+        out: &mut W,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let content = HashAndFormat::hash_seq(hash);
+        let (_, sizes) = iroh_blobs::get::request::get_hash_seq_and_sizes(conn, &hash, 32 * MAX_ITEMS, None)
+            .await
+            .context("ask the sender for the sizes")?;
+        let total: u64 = sizes.iter().sum();
+        for dir in [&self.dir, downloads] {
+            if let Some(free) = available(dir) {
+                if free < total.saturating_add(FREE_MARGIN) {
+                    bail!("not enough space on {}: {} free, {} needed + 2 GB", dir.display(), mb(free), mb(total));
+                }
+            }
+        }
+        let tag = format!("{RECV_TAG}{hash}");
+        self.store.tags().set(&tag, content).await?;
+        let result = self.fetch_and_export(conn, content, total, downloads, out).await;
+        self.store.tags().delete(&tag).await?;
+        result
+    }
+
+    async fn fetch_and_export<W: AsyncWrite + Unpin>(
+        &self,
+        conn: &Connection,
+        content: HashAndFormat,
+        total: u64,
+        downloads: &Path,
+        out: &mut W,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let started = Instant::now();
+        let mut last = Instant::now() - PROGRESS_EVERY;
+        let mut fetch = self.store.remote().fetch(conn.clone(), content).stream();
+        let stats = loop {
+            match fetch.next().await.context("the fetch ended")? {
+                GetProgressItem::Progress(done) => {
+                    if last.elapsed() >= PROGRESS_EVERY {
+                        last = Instant::now();
+                        local::send(out, &Response::Progress { done, total }).await?;
+                    }
+                }
+                GetProgressItem::Done(stats) => break stats,
+                GetProgressItem::Error(e) => bail!("fetch: {e}"),
+            }
+        };
+        local::send(out, &Response::Progress { done: total, total }).await?;
+        info!("fetched {} of {} in {:?}", mb(stats.payload_bytes_read), mb(total), started.elapsed());
+
+        let collection = Collection::load(content.hash, self.store.as_ref()).await?;
+        let names: Vec<String> = collection.iter().map(|(name, _)| name.clone()).collect();
+        let (targets, tops) = plan(&names, downloads)?;
+        for ((_, hash), target) in collection.iter().zip(targets) {
+            std::fs::create_dir_all(target.parent().context("no parent")?)?;
+            // Copy, never reference: the user may change or delete the file.
+            self.store
+                .export_with_opts(ExportOptions { hash: *hash, target: target.clone(), mode: ExportMode::Copy })
+                .await
+                .with_context(|| format!("write {}", target.display()))?;
+            debug!("wrote {}", target.display());
+        }
+        Ok(tops)
+    }
+}
+
+/// `$ETD_DOWNLOADS` (a leading `~/` is the home directory), else
+/// `~/etd-downloads`.
+pub fn downloads(env: &Env) -> anyhow::Result<PathBuf> {
+    let home = ops::home(env)?;
+    let set = std::env::var("ETD_DOWNLOADS").ok().or_else(|| env.get("ETD_DOWNLOADS").cloned()).filter(|s| !s.is_empty());
+    Ok(match set {
+        Some(dir) => match dir.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(dir),
+        },
+        None => home.join("etd-downloads"),
+    })
+}
+
+/// Serves only offered roots (whole collections, with their children).
+fn only_offered(offered: Arc<Mutex<HashSet<Hash>>>) -> EventSender {
+    let mask = EventMask {
+        connected: ConnectMode::None,
+        get: RequestMode::Intercept,
+        get_many: RequestMode::Disabled,
+        observe: ObserveMode::Intercept,
+        ..EventMask::DEFAULT
+    };
+    let (tx, mut rx) = EventSender::channel(16, mask);
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let ProviderMessage::GetRequestReceived(msg) = msg {
+                let ok = offered.lock().unwrap().contains(&msg.request.hash);
+                if !ok {
+                    debug!("refused a request for {}: not offered", msg.request.hash);
+                }
+                msg.tx.send(if ok { Ok(()) } else { Err(AbortReason::Permission) }).await.ok();
+            } else if let ProviderMessage::ObserveRequestReceived(msg) = msg {
+                msg.tx.send(Err(AbortReason::Permission)).await.ok();
+            }
+        }
+    });
+    tx
+}
+
+/// Every file under `path` (or `path` itself), skipping symlinks, sorted.
+fn walk(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_file() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut out = Vec::new();
+    if meta.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(path)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            out.extend(walk(&entry.path())?);
+        }
+    }
+    Ok(out)
+}
+
+/// A relative path as a collection name: `a/b.txt`.
+fn name_of(rel: &Path) -> anyhow::Result<String> {
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| match c {
+            Component::Normal(s) => s.to_str().map(str::to_string).with_context(|| format!("not UTF-8: {}", rel.display())),
+            _ => bail!("bad path {}", rel.display()),
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(parts.join("/"))
+}
+
+/// A name part from the sender: no `..`, no separators, not empty.
+fn checked(part: &str) -> anyhow::Result<&str> {
+    if part.is_empty() || part == "." || part == ".." || part.contains(['/', '\\', '\0']) {
+        bail!("bad file name from the sender: {part:?}");
+    }
+    Ok(part)
+}
+
+/// Where each item goes under `dir`, and the top-level paths. A top-level
+/// name that is taken gets ` (2)`, ` (3)`… (`a (2).txt`, `out (2)`).
+fn plan(names: &[String], dir: &Path) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut tops: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut order = Vec::new();
+    let mut targets = Vec::new();
+    for name in names {
+        let parts: Vec<&str> = name.split('/').map(checked).collect::<anyhow::Result<_>>()?;
+        let is_file = parts.len() == 1;
+        let top = tops.entry(parts[0].to_string()).or_insert_with(|| {
+            let free = free_name(dir, parts[0], is_file);
+            order.push(free.clone());
+            free
+        });
+        targets.push(parts[1..].iter().fold(top.clone(), |p, part| p.join(part)));
+    }
+    Ok((targets, order))
+}
+
+fn free_name(dir: &Path, name: &str, is_file: bool) -> PathBuf {
+    let taken = |p: &Path| std::fs::symlink_metadata(p).is_ok();
+    let first = dir.join(name);
+    if !taken(&first) {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if is_file && !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    (2..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| !taken(p)).expect("some name is free")
+}
+
+/// Free bytes for this user on the disk of `path` (or its nearest parent).
+fn available(path: &Path) -> Option<u64> {
+    let mut p = path;
+    while !p.exists() {
+        p = p.parent()?;
+    }
+    let c = CString::new(p.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid C string and a statvfs to write into.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    Some(s.f_bavail as u64 * s.f_frsize as u64)
+}
+
+fn mb(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_keeps_trees_and_renames_taken_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+        std::fs::create_dir(dir.path().join("out")).unwrap();
+        let names = ["a.txt", "out/x/y.bin", "out/z", "Makefile"].map(String::from);
+        let (targets, tops) = plan(&names, dir.path()).unwrap();
+        let d = dir.path();
+        assert_eq!(targets, [d.join("a (2).txt"), d.join("out (2)/x/y.bin"), d.join("out (2)/z"), d.join("Makefile")]);
+        assert_eq!(tops, [d.join("a (2).txt"), d.join("out (2)"), d.join("Makefile")]);
+        for bad in ["../x", "a//b", "/abs", "a/./b", "a\\b"] {
+            assert!(plan(&[bad.to_string()], d).is_err(), "{bad} was allowed");
+        }
+    }
+
+    /// Deliver between two stores, then let both collect garbage: the
+    /// sender's original (imported by reference) and the delivered copy stay.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn garbage_collection_keeps_user_files() {
+        use iroh::endpoint::presets;
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("src/report.bin");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        std::fs::write(&original, &data).unwrap();
+
+        let gc = Duration::from_millis(300);
+        let sender = Files::open(&dir.path().join("a"), gc).await.unwrap();
+        let receiver = Files::open(&dir.path().join("b"), gc).await.unwrap();
+        let a = iroh::Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let b = iroh::Endpoint::builder(presets::Minimal).alpns(vec![b"t".to_vec()]).bind().await.unwrap();
+        let port = b.bound_sockets().iter().find(|s| s.is_ipv4()).unwrap().port();
+        let addr = iroh::EndpointAddr::new(b.id()).with_ip_addr(([127, 0, 0, 1], port).into());
+        let accepting = tokio::spawn({
+            let b = b.clone();
+            async move { b.accept().await.unwrap().await.unwrap() }
+        });
+        let conn = a.connect(addr, b"t").await.unwrap();
+        let incoming = accepting.await.unwrap();
+
+        let outgoing = sender.import(std::slice::from_ref(&original)).await.unwrap();
+        sender.serve_on(&conn);
+        let downloads = dir.path().join("etd-downloads");
+        let paths = receiver.deliver(&incoming, outgoing.hash(), &downloads, &mut tokio::io::sink()).await.unwrap();
+        assert_eq!(paths, [downloads.join("report.bin")]);
+
+        // Not offered any more: a second fetch is refused.
+        let hash = outgoing.hash();
+        drop(outgoing);
+        let other = tempfile::tempdir().unwrap();
+        assert!(receiver.deliver(&incoming, hash, other.path(), &mut tokio::io::sink()).await.is_err());
+
+        let big_in_store = |store: &str| {
+            walk(&dir.path().join(store)).unwrap().iter().filter(|p| std::fs::metadata(p).unwrap().len() >= 3_000_000).count()
+        };
+        assert_eq!(big_in_store("b"), 1, "the receiver's store holds its copy");
+        tokio::time::sleep(gc * 5).await;
+        assert_eq!(big_in_store("b"), 0, "garbage collection did not run");
+        assert_eq!(std::fs::read(&original).unwrap(), data, "the sender's original changed");
+        assert_eq!(std::fs::read(downloads.join("report.bin")).unwrap(), data, "the delivered copy changed");
+    }
+
+    #[test]
+    fn downloads_default_and_override() {
+        let env: Env = [("HOME".to_string(), "/home/u".to_string())].into_iter().collect();
+        if std::env::var_os("ETD_DOWNLOADS").is_none() {
+            assert_eq!(downloads(&env).unwrap(), Path::new("/home/u/etd-downloads"));
+        }
+        let mut env2 = env.clone();
+        env2.insert("ETD_DOWNLOADS".into(), "~/in".into());
+        if std::env::var_os("ETD_DOWNLOADS").is_none() {
+            assert_eq!(downloads(&env2).unwrap(), Path::new("/home/u/in"));
+        }
+    }
+}
