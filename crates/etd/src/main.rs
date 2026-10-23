@@ -156,8 +156,11 @@ async fn files(paths: &Paths) -> anyhow::Result<()> {
             3600..86400 => format!("{}h", ago / 3600),
             _ => format!("{}d", ago / 86400),
         };
-        let size =
-            if item.size >= 1_000_000 { format!("{:.1} MB", item.size as f64 / 1e6) } else { format!("{:.1} kB", item.size as f64 / 1e3) };
+        let size = match item.size {
+            0..1_000 => format!("{} B", item.size),
+            1_000..1_000_000 => format!("{:.1} kB", item.size as f64 / 1e3),
+            _ => format!("{:.1} MB", item.size as f64 / 1e6),
+        };
         let path = if item.is_dir { format!("{}/", item.path) } else { item.path };
         println!("{when:<8} {:<12} {:<14} {size:>9}  {path}", item.machine, item.from);
     }
