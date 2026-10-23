@@ -98,6 +98,14 @@ async fn etd_send_files_and_folders() {
     assert!(again.status.success(), "etd send: {}", String::from_utf8_lossy(&again.stderr));
     assert_eq!(String::from_utf8_lossy(&again.stdout).trim(), d.join("notes (2).md").display().to_string());
 
+    // `etd files` on trigkey lists what gmktec received, newest first.
+    let files = Command::new(ETD).arg("files").env("ETD_HOME", hub.dir.path()).env("ETD_SOCKET", &socket).output().unwrap();
+    let text = String::from_utf8_lossy(&files.stdout);
+    let rows: Vec<&str> = text.lines().skip(1).collect();
+    assert_eq!(rows.len(), 3, "{text}");
+    assert!(rows[0].contains("gmktec") && rows[0].contains("trigkey") && rows[0].ends_with("notes (2).md"), "{text}");
+    assert!(text.contains(&format!("{}/", d.join("out").display())), "{text}");
+
     // A name that is not a machine of the network.
     let wrong = etd_send(hub.dir.path(), &socket, &[&notes_s, "laptop"]);
     assert!(!wrong.status.success());

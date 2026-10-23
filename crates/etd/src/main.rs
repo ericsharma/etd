@@ -23,6 +23,7 @@ usage:
   etd send <path>… <machine>[:<session>]
                                send files or folders to ~/etd-downloads/ on another machine
                                of the network; prints the paths there
+  etd files                    list the files sent to every machine of the network
   etd status [--json]          show the daemon's id, addresses, and connected members
   etd id                       print this machine's endpoint id
   etd pair [--url]             the same as `etd invite` (a device)
@@ -128,6 +129,39 @@ async fn send(paths: &Paths, args: &[&str]) -> anyhow::Result<()> {
             other => bail!("unexpected answer: {other:?}"),
         }
     }
+}
+
+/// `etd files`: what every machine of the network has received.
+async fn files(paths: &Paths) -> anyhow::Result<()> {
+    let socket = etd::local::socket_path(paths);
+    let mut stream =
+        tokio::net::UnixStream::connect(&socket).await.with_context(|| format!("etd is not running here ({})", socket.display()))?;
+    etd::local::send(&mut stream, &et_proto::Request::Shared).await?;
+    let list = match etd::local::receive::<_, et_proto::Response>(&mut stream).await?.context("etd closed the connection")? {
+        et_proto::Response::SharedList(list) => list,
+        et_proto::Response::Error(e) => bail!("{e}"),
+        other => bail!("unexpected answer: {other:?}"),
+    };
+    if list.is_empty() {
+        println!("no files yet; send some with `etd send <path> <machine>`");
+        return Ok(());
+    }
+    let now = config::now_secs();
+    println!("{:<8} {:<12} {:<14} {:>9}  PATH", "WHEN", "MACHINE", "FROM", "SIZE");
+    for item in list {
+        let ago = now.saturating_sub(item.received);
+        let when = match ago {
+            0..60 => format!("{ago}s"),
+            60..3600 => format!("{}m", ago / 60),
+            3600..86400 => format!("{}h", ago / 3600),
+            _ => format!("{}d", ago / 86400),
+        };
+        let size =
+            if item.size >= 1_000_000 { format!("{:.1} MB", item.size as f64 / 1e6) } else { format!("{:.1} kB", item.size as f64 / 1e3) };
+        let path = if item.is_dir { format!("{}/", item.path) } else { item.path };
+        println!("{when:<8} {:<12} {:<14} {size:>9}  {path}", item.machine, item.from);
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -244,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         ["send", rest @ ..] if rest.len() >= 2 => send(&paths, rest).await,
+        ["files"] => files(&paths).await,
         ["-h" | "--help" | "help"] => {
             println!("{USAGE}");
             Ok(())

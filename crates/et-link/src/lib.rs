@@ -290,6 +290,82 @@ pub struct Delivered {
     pub typed: bool,
 }
 
+/// A file or folder sent to a machine (`shared_files`).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SharedFile {
+    /// The network's name for the machine it is on.
+    pub machine: String,
+    /// Its path there (use it with `fetch_file`, `share_file`, `unshare_file`).
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+    /// Who sent it (member name).
+    pub from: String,
+    /// Unix seconds.
+    pub received: u64,
+    /// The session it was typed into, if any.
+    pub session: Option<String>,
+}
+
+/// Fetches collection `hash` over `conn` (inside an et/1 `Blobs` stream)
+/// and writes it under `dir`. Returns the top-level item's path.
+async fn fetch_into(
+    conn: &iroh::endpoint::Connection,
+    hash: iroh_blobs::Hash,
+    dir: &std::path::Path,
+    total: u64,
+    progress: &dyn SendProgress,
+) -> Result<String, LinkError> {
+    use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
+    use iroh_blobs::api::remote::GetProgressItem;
+    use n0_future::StreamExt;
+    let files = files().await?;
+    let store = files.store();
+    let content = iroh_blobs::HashAndFormat::hash_seq(hash);
+    let tag = format!("fetch/{hash}");
+    let other = |e: anyhow::Error| LinkError::Protocol { message: format!("{e:#}") };
+    store.tags().set(&tag, content).await.map_err(|e| other(e.into()))?;
+    let result = async {
+        let (mut up, down) = conn.open_bi().await.map_err(|e| closed(&e))?;
+        write_frame(&mut up, &Request::Blobs).await.map_err(stream_error)?;
+        let pair = iroh_blobs::get::StreamPair::new(conn.stable_id() as u64, down, up);
+        let mut fetch = store.remote().fetch(pair, content).stream();
+        loop {
+            match fetch.next().await {
+                Some(GetProgressItem::Progress(done)) => progress.on_progress(done, total),
+                Some(GetProgressItem::Done(_)) => break,
+                Some(GetProgressItem::Error(e)) => return Err(LinkError::Closed { message: format!("fetch: {e}") }),
+                None => return Err(LinkError::Closed { message: "fetch ended".into() }),
+            }
+        }
+        progress.on_progress(total, total);
+        let collection =
+            iroh_blobs::format::collection::Collection::load(hash, store.as_ref()).await.map_err(|e| other(anyhow::anyhow!("{e}")))?;
+        let mut top = None;
+        for (name, item) in collection.iter() {
+            let parts: Vec<&str> = name.split('/').collect();
+            if parts.iter().any(|p| p.is_empty() || *p == "." || *p == ".." || p.contains('\\')) {
+                return Err(LinkError::Protocol { message: format!("bad file name {name:?}") });
+            }
+            top.get_or_insert_with(|| dir.join(parts[0]));
+            let target = parts.iter().fold(dir.to_path_buf(), |p, part| p.join(part));
+            if target.exists() {
+                continue;
+            }
+            std::fs::create_dir_all(target.parent().unwrap_or(dir)).map_err(invalid)?;
+            store
+                .export_with_opts(ExportOptions { hash: *item, target: target.clone(), mode: ExportMode::Copy })
+                .await
+                .map_err(|e| other(anyhow::anyhow!("write {}: {e}", target.display())))?;
+        }
+        top.map(|t| t.display().to_string()).ok_or_else(|| LinkError::Protocol { message: "empty".into() })
+    }
+    .await;
+    let _ = store.tags().delete(&tag).await;
+    result
+}
+
 /// The app's blob store for sending, in its temporary directory: it holds
 /// only references to the files being sent.
 static FILES: tokio::sync::OnceCell<Arc<Files>> = tokio::sync::OnceCell::const_new();
@@ -451,6 +527,76 @@ impl RemoteHost {
             files.send(&self.conn, &outgoing, session, |done, total| progress.on_progress(done, total)).await.map_err(stream_error)?;
         match answer {
             Response::Delivered { paths, typed } => Ok(Delivered { paths, typed }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// The files sent to this machine that are still there, newest first.
+    pub async fn shared_files(&self) -> Result<Vec<SharedFile>, LinkError> {
+        match self.call(Request::Shared).await? {
+            Response::SharedList(list) => Ok(list
+                .into_iter()
+                .map(|i| SharedFile {
+                    machine: i.machine,
+                    path: i.path,
+                    name: i.name,
+                    size: i.size,
+                    is_dir: i.is_dir,
+                    from: i.from,
+                    received: i.received,
+                    session: i.session,
+                })
+                .collect()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Copies a shared file or folder from this machine into the local
+    /// directory `into` (for a preview), and returns its local path. The same
+    /// content fetched again is not fetched twice.
+    pub async fn fetch_file(&self, path: String, into: String, progress: Arc<dyn SendProgress>) -> Result<String, LinkError> {
+        // The machine offers it while this stream stays open.
+        let (mut offer_up, mut offer_down) = self.conn.open_bi().await.map_err(|e| closed(&e))?;
+        write_frame(&mut offer_up, &Request::Offer { path }).await.map_err(stream_error)?;
+        let (hash, total) = match read_frame::<Response>(&mut offer_down).await.map_err(stream_error)? {
+            Some(Response::Offered { hash, total }) => (iroh_blobs::Hash::from_bytes(hash), total),
+            Some(other) => return Err(unexpected(other)),
+            None => return Err(LinkError::Protocol { message: "no answer".into() }),
+        };
+        progress.on_progress(0, total);
+        let dir = std::path::PathBuf::from(into).join(&hash.to_hex()[..16]);
+        let fetched = fetch_into(&self.conn, hash, &dir, total, progress.as_ref()).await;
+        let _ = offer_up.finish();
+        fetched
+    }
+
+    /// Uses a shared file again: types it into `session` on its machine (`to`
+    /// is this machine), or sends it from here to the machine `to` and types
+    /// it there. No bytes go through the app.
+    pub async fn share_file(
+        &self,
+        path: String,
+        to: String,
+        session: Option<String>,
+        progress: Arc<dyn SendProgress>,
+    ) -> Result<Delivered, LinkError> {
+        let (mut up, mut down) = self.conn.open_bi().await.map_err(|e| closed(&e))?;
+        write_frame(&mut up, &Request::Share { path, to, session }).await.map_err(stream_error)?;
+        up.finish().map_err(|e| LinkError::Closed { message: e.to_string() })?;
+        loop {
+            match read_frame::<Response>(&mut down).await.map_err(stream_error)? {
+                Some(Response::Progress { done, total }) => progress.on_progress(done, total),
+                Some(Response::Delivered { paths, typed }) => return Ok(Delivered { paths, typed }),
+                Some(other) => return Err(unexpected(other)),
+                None => return Err(LinkError::Protocol { message: "no answer".into() }),
+            }
+        }
+    }
+
+    /// Deletes a shared file or folder on this machine.
+    pub async fn unshare_file(&self, path: String) -> Result<(), LinkError> {
+        match self.call(Request::Unshare { path }).await? {
+            Response::Pong => Ok(()),
             other => Err(unexpected(other)),
         }
     }

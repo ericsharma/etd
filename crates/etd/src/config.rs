@@ -73,6 +73,11 @@ impl Paths {
         self.state.join("status.json")
     }
 
+    /// One JSON line per delivery of files to this machine (`Shared`).
+    pub fn deliveries(&self) -> PathBuf {
+        self.state.join("deliveries.jsonl")
+    }
+
     /// Held by the running daemon, so a second etd with these files stops.
     pub fn daemon_lock(&self) -> PathBuf {
         self.state.join("etd.lock")

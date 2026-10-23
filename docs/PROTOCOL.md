@@ -77,6 +77,11 @@ etd reads the peer's `EndpointId` from the connection and looks it up in the net
 | 16 | `NetworkRotate { chain, key }` | machine | `Pong` | — |
 | 17 | `Deliver { hash, session }` | member | `Progress { done, total }` frames, then `Delivered { paths, typed }` | etd fetches the files over this connection first (see below) |
 | 18 | `Send { paths, to, session }` | local socket only (`etd send`) | `Progress` frames, then the target's `Delivered` | — |
+| 19 | `Shared` | member (local socket: every machine's) | `SharedList([SharedItem])` | — |
+| 20 | `Offer { path }` | member | `Offered { hash, total }` | held open by the asker; the offer ends when it closes |
+| 21 | `Blobs` | member | — | the rest of the stream is an iroh-blobs request (offered hashes only) |
+| 22 | `Share { path, to, session }` | member | `Progress` frames, then `Delivered` | — |
+| 23 | `Unshare { path }` | member | `Pong` | — |
 
 Any request can get `Error(message)` instead.
 
@@ -110,6 +115,14 @@ The bytes move with [iroh-blobs](https://github.com/n0-computer/iroh-blobs) 0.10
 Blobs live only while a send or delivery runs; the store's garbage collection (every 10 minutes) removes the rest. The sender imports by reference, and the store never deletes a file it references, so the user's files are never removed.
 
 `etd send <path>… <machine>[:<session>]` sends `Send` on the local socket; the local etd does steps 1–3 to that machine and prints the paths.
+
+### Shared files (`Shared`, `Offer`, `Blobs`, `Share`, `Unshare`)
+
+Each etd writes a line to `deliveries.jsonl` in its state directory for each delivery (top-level path, sender's member name, time, session). `Shared` lists those still on disk, newest first, a path once. On the local socket (`etd files`) the local etd asks every machine and merges.
+
+- **Fetch to a device** (preview): the device sends `Offer { path }` (inside `~/etd-downloads/`) and keeps that stream open; etd imports it and answers `Offered`. On a second stream the device sends `Blobs` and then an iroh-blobs get for the hash; etd serves it from the offered collections only. The device closes the `Offer` stream when done.
+- **`Share`**: `to` is this machine: type `path` into `session` here. Otherwise this etd sends `path` to the machine `to` as `etd send` does (typed into `session` there).
+- **`Unshare`**: deletes the file or folder and its log lines.
 
 ### manymux (`Agent`, `Machines`)
 

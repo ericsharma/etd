@@ -162,6 +162,20 @@ impl Files {
     }
 }
 
+impl Files {
+    /// Serves one iroh-blobs request that arrives inside an et/1 stream
+    /// (after `Blobs`), from the offered collections only.
+    pub async fn serve_stream(
+        &self,
+        connection_id: u64,
+        recv: iroh::endpoint::RecvStream,
+        send: iroh::endpoint::SendStream,
+    ) -> anyhow::Result<()> {
+        let pair = iroh_blobs::provider::StreamPair::new(connection_id, recv, send, only_offered(self.offered.clone()));
+        iroh_blobs::provider::handle_stream(pair, (*self.store).clone()).await.map_err(|e| anyhow::anyhow!("{e:#}"))
+    }
+}
+
 /// Serves only offered roots (whole collections, with their children).
 fn only_offered(offered: Arc<Mutex<HashSet<Hash>>>) -> EventSender {
     let mask = EventMask {

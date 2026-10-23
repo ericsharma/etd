@@ -122,6 +122,7 @@ async fn handle(mut stream: UnixStream, endpoint: &Endpoint, paths: &Paths, conn
         return Ok(());
     };
     if let Request::Send { paths: sent, to, session } = request {
+        let sent: Vec<PathBuf> = sent.iter().map(PathBuf::from).collect();
         let reply = match send_files(endpoint, paths, connections, &sent, &to, session, &mut stream).await {
             Ok(reply) => reply,
             Err(e) => Response::Error(format!("{e:#}")),
@@ -129,25 +130,54 @@ async fn handle(mut stream: UnixStream, endpoint: &Endpoint, paths: &Paths, conn
         send(&mut stream, &reply).await?;
         return Ok(stream.shutdown().await?);
     }
+    if let Request::Shared = request {
+        let reply = Response::SharedList(shared_everywhere(endpoint, paths, connections).await);
+        send(&mut stream, &reply).await?;
+        return Ok(stream.shutdown().await?);
+    }
     let (rx, tx) = stream.into_split();
     forward(request, rx, tx, endpoint, paths, connections).await
 }
 
-/// `etd send`: `Progress` frames to `out`; returns the machine's answer.
-async fn send_files(
+/// The `Shared` lists of this machine and every other machine of the network
+/// (a machine that does not answer is left out).
+async fn shared_everywhere(endpoint: &Endpoint, paths: &Paths, connections: &Connections) -> Vec<et_proto::SharedItem> {
+    let me = endpoint.id();
+    let Ok(Some(signed)) = network::load(paths) else { return Vec::new() };
+    let mine = signed.network.member(&me).map(|m| m.name.to_string()).unwrap_or_default();
+    let mut all = crate::files::shared(paths, &mine);
+    for m in signed.network.machines().filter(|m| m.id != me) {
+        let asked = async {
+            let conn = connections.to(endpoint, m.id).await?;
+            let (mut up, mut down) = conn.open_bi().await?;
+            write_frame(&mut up, &Request::Shared).await?;
+            up.finish()?;
+            read_frame::<Response>(&mut down).await?.context("no answer")
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(10), asked).await {
+            Ok(Ok(Response::SharedList(list))) => all.extend(list),
+            other => debug!("no shared list from {}: {other:?}", m.name),
+        }
+    }
+    all.sort_by_key(|i| std::cmp::Reverse(i.received));
+    all
+}
+
+/// `etd send` (and `Share` to another machine): `Progress` frames to `out`;
+/// returns the machine's answer.
+pub async fn send_files<W: AsyncWrite + Unpin>(
     endpoint: &Endpoint,
     paths: &Paths,
     connections: &Connections,
-    sent: &[String],
+    sent: &[PathBuf],
     to: &str,
     session: Option<String>,
-    out: &mut UnixStream,
+    out: &mut W,
 ) -> anyhow::Result<Response> {
     let id = machine(paths, endpoint.id(), to)?;
     let files = connections.files.get(paths).await?;
     let conn = connections.to(endpoint, id).await.with_context(|| to.to_string())?;
-    let sent: Vec<PathBuf> = sent.iter().map(PathBuf::from).collect();
-    let outgoing = files.import(&sent).await?;
+    let outgoing = files.import(sent).await?;
     let (progress, mut updates) = tokio::sync::mpsc::unbounded_channel();
     let sending = files.send(&conn, &outgoing, session, move |done, total| {
         let _ = progress.send((done, total));

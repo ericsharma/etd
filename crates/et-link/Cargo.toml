@@ -25,6 +25,7 @@ serde.workspace = true
 # input (v0.2.2); a bump changes both.
 manymux = { git = "https://github.com/rayfish/manymux", rev = "ee00f0786ea67ad65e780a9b47e554461f009c50", default-features = false }
 iroh-blobs.workspace = true
+n0-future = "0.3"
 
 [dev-dependencies]
 etd = { path = "../etd" }

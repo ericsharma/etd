@@ -119,6 +119,46 @@ pub enum Request {
         to: String,
         session: Option<String>,
     },
+    /// The files delivered to this machine that are still on disk, newest
+    /// first. On the local socket (`etd files`): those of every machine.
+    Shared,
+    /// Offer `path` (inside `~/etd-downloads/`) for a `Blobs` fetch, while
+    /// this stream stays open.
+    Offer {
+        path: String,
+    },
+    /// The rest of this stream is an iroh-blobs request, served from the
+    /// offered collections only.
+    Blobs,
+    /// Use a shared file again: type `path` into `session` here (`to` is
+    /// this machine), or send it to the machine `to` and type it there.
+    /// `Progress` frames, then `Delivered`.
+    Share {
+        path: String,
+        to: String,
+        session: Option<String>,
+    },
+    /// Delete a shared file or folder (inside `~/etd-downloads/`).
+    Unshare {
+        path: String,
+    },
+}
+
+/// A file or folder delivered to a machine (`Shared`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SharedItem {
+    /// The network's name for the machine it is on.
+    pub machine: String,
+    /// Its top-level path there.
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+    /// The sender's member name.
+    pub from: String,
+    /// Unix seconds.
+    pub received: u64,
+    pub session: Option<String>,
 }
 
 /// What a push says. `machine` is the network's name for the machine.
@@ -186,6 +226,12 @@ pub enum Response {
     Delivered {
         paths: Vec<String>,
         typed: bool,
+    },
+    SharedList(Vec<SharedItem>),
+    /// The offered collection's root hash and its size in bytes.
+    Offered {
+        hash: [u8; 32],
+        total: u64,
     },
 }
 

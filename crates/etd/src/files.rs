@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use et_proto::files::{Files, GC_EVERY, RECV_TAG};
-use et_proto::Response;
+use et_proto::{Response, SharedItem};
 use iroh::endpoint::Connection;
 use iroh_blobs::api::blobs::{ExportMode, ExportOptions};
 use iroh_blobs::api::remote::GetProgressItem;
 use iroh_blobs::format::collection::Collection;
 use iroh_blobs::{Hash, HashAndFormat};
 use n0_future::StreamExt;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWrite;
 use tokio::sync::OnceCell;
 use tracing::{debug, info};
@@ -113,6 +114,97 @@ async fn fetch_and_export<W: AsyncWrite + Unpin>(
         debug!("wrote {}", target.display());
     }
     Ok(tops)
+}
+
+/// One line of `deliveries.jsonl`.
+#[derive(Debug, Serialize, Deserialize)]
+struct Logged {
+    path: String,
+    from: String,
+    received: u64,
+    session: Option<String>,
+}
+
+/// Notes a delivery for `Shared`.
+pub fn log_delivery(paths: &Paths, tops: &[PathBuf], from: &str, session: Option<&str>) -> anyhow::Result<()> {
+    let mut lines = String::new();
+    for top in tops {
+        let line = Logged {
+            path: top.display().to_string(),
+            from: from.to_string(),
+            received: crate::config::now_secs(),
+            session: session.map(str::to_string),
+        };
+        lines.push_str(&serde_json::to_string(&line)?);
+        lines.push('\n');
+    }
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(paths.deliveries())?;
+    std::io::Write::write_all(&mut file, lines.as_bytes())?;
+    Ok(())
+}
+
+fn logged(paths: &Paths) -> Vec<Logged> {
+    let text = std::fs::read_to_string(paths.deliveries()).unwrap_or_default();
+    text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+}
+
+/// The deliveries still on disk, newest first; a path delivered twice
+/// counts once (the latest).
+pub fn shared(paths: &Paths, machine: &str) -> Vec<SharedItem> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for l in logged(paths).into_iter().rev() {
+        let path = PathBuf::from(&l.path);
+        if !seen.insert(l.path.clone()) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        out.push(SharedItem {
+            machine: machine.to_string(),
+            name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            size: if meta.is_dir() {
+                et_proto::files::walk(&path).unwrap_or_default().iter().filter_map(|f| f.metadata().ok()).map(|m| m.len()).sum()
+            } else {
+                meta.len()
+            },
+            is_dir: meta.is_dir(),
+            path: l.path,
+            from: l.from,
+            received: l.received,
+            session: l.session,
+        });
+    }
+    out
+}
+
+/// `path` if it is inside `downloads` (after symlinks), not `downloads` itself.
+pub fn inside(downloads: &Path, path: &str) -> anyhow::Result<PathBuf> {
+    let full = Path::new(path).canonicalize().with_context(|| path.to_string())?;
+    let base = downloads.canonicalize().with_context(|| downloads.display().to_string())?;
+    if full == base || !full.starts_with(&base) {
+        bail!("{path} is not in {}", downloads.display());
+    }
+    Ok(full)
+}
+
+/// Deletes a shared file or folder, and its log lines.
+pub fn unshare(paths: &Paths, downloads: &Path, path: &str) -> anyhow::Result<()> {
+    let full = inside(downloads, path)?;
+    if full.is_dir() {
+        std::fs::remove_dir_all(&full)?;
+    } else {
+        std::fs::remove_file(&full)?;
+    }
+    let keep: Vec<Logged> = logged(paths).into_iter().filter(|l| l.path != path && Path::new(&l.path) != full).collect();
+    let mut text = String::new();
+    for l in keep {
+        text.push_str(&serde_json::to_string(&l)?);
+        text.push('\n');
+    }
+    let tmp = paths.deliveries().with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, paths.deliveries())?;
+    Ok(())
 }
 
 /// `$ETD_DOWNLOADS` (a leading `~/` is the home directory), else

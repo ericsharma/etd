@@ -518,6 +518,20 @@ async fn serve_stream(
         },
         Request::Deliver { hash, session } => return deliver(state, conn, peer, hash, session, send).await,
         Request::Send { .. } => Response::Error("Send is for the local socket (`etd send`)".into()),
+        Request::Shared => Response::SharedList(files::shared(&state.paths, &member_name(state, state.endpoint().id()))),
+        Request::Offer { path } => return offer(state, &path, send, recv).await,
+        Request::Blobs => {
+            let files = state.connections.files.get(&state.paths).await?;
+            return files.serve_stream(conn.stable_id() as u64, recv, send).await;
+        }
+        Request::Share { path, to, session } => return share(state, &path, &to, session, send).await,
+        Request::Unshare { path } => match files::downloads(&state.env).and_then(|d| files::unshare(&state.paths, &d, &path)) {
+            Ok(()) => {
+                info!("{} deleted {path}", member_name(state, peer));
+                Response::Pong
+            }
+            Err(e) => Response::Error(format!("{e:#}")),
+        },
     };
     write_frame(&mut send, &reply).await?;
     send.finish()?;
@@ -542,9 +556,13 @@ async fn deliver(
     }
     .await;
     let reply = match delivered {
-        Ok(paths) => {
-            let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-            info!("files from {}: {}", peer.fmt_short(), paths.join(", "));
+        Ok(tops) => {
+            let paths: Vec<String> = tops.iter().map(|p| p.display().to_string()).collect();
+            let from = member_name(state, peer);
+            info!("files from {from}: {}", paths.join(", "));
+            if let Err(e) = files::log_delivery(&state.paths, &tops, &from, session.as_deref()) {
+                warn!("delivery log: {e:#}");
+            }
             let mut typed = false;
             if let Some(session) = session {
                 match mm::type_into(&state.env, &session, &mm::typed_paths(&paths)).await {
@@ -559,6 +577,61 @@ async fn deliver(
             Response::Error(format!("{e:#}"))
         }
     };
+    write_frame(&mut send, &reply).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// The network's name for a member, else its short id.
+fn member_name(state: &State, id: EndpointId) -> String {
+    network::load(&state.paths)
+        .ok()
+        .flatten()
+        .and_then(|s| s.network.member(&id).map(|m| m.name.to_string()))
+        .unwrap_or_else(|| id.fmt_short().to_string())
+}
+
+/// `Offer`: offers a shared file or folder for `Blobs` until the asker
+/// closes this stream.
+async fn offer(state: &State, path: &str, mut send: SendStream, mut recv: RecvStream) -> anyhow::Result<()> {
+    let offered = async {
+        let full = files::inside(&files::downloads(&state.env)?, path)?;
+        let files = state.connections.files.get(&state.paths).await?;
+        files.import(&[full]).await
+    }
+    .await;
+    let outgoing = match offered {
+        Ok(outgoing) => outgoing,
+        Err(e) => {
+            write_frame(&mut send, &Response::Error(format!("{e:#}"))).await?;
+            send.finish()?;
+            return Ok(());
+        }
+    };
+    write_frame(&mut send, &Response::Offered { hash: *outgoing.hash().as_bytes(), total: outgoing.total }).await?;
+    // Held until the asker finishes or drops the stream (at most an hour).
+    let _ = tokio::time::timeout(Duration::from_secs(3600), recv.read_to_end(1024)).await;
+    drop(outgoing);
+    let _ = send.finish();
+    Ok(())
+}
+
+/// `Share`: type a shared path into a session here, or send it to another
+/// machine (typed into `session` there).
+async fn share(state: &State, path: &str, to: &str, session: Option<String>, mut send: SendStream) -> anyhow::Result<()> {
+    let me = member_name(state, state.endpoint().id());
+    let shared = async {
+        let full = files::inside(&files::downloads(&state.env)?, path)?;
+        if to == me {
+            let session = session.context("say which session to type into")?;
+            let paths = vec![full.display().to_string()];
+            mm::type_into(&state.env, &session, &mm::typed_paths(&paths)).await?;
+            return Ok(Response::Delivered { paths, typed: true });
+        }
+        local::send_files(state.endpoint(), &state.paths, &state.connections, &[full], to, session, &mut send).await
+    }
+    .await;
+    let reply = shared.unwrap_or_else(|e| Response::Error(format!("{e:#}")));
     write_frame(&mut send, &reply).await?;
     send.finish()?;
     Ok(())
