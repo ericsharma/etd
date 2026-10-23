@@ -11,7 +11,8 @@ use tracing_subscriber::EnvFilter;
 const USAGE: &str = "\
 usage:
   etd                          run the daemon (shows a QR code if no device is in the network yet)
-  etd install                  run etd as a user service (systemd or launchd) and start it
+  etd install [--no-service]   run etd as a user service (systemd or launchd) and start it, with
+                               the manymux node; --no-service: only manymux (E.T. for macOS)
   etd uninstall                stop and remove the user service
   etd invite [--machine] [--url]
                                invite a phone or tablet (QR code), or with --machine another
@@ -19,13 +20,58 @@ usage:
   etd join <link> [--name N]   join the network of the machine that made the link
   etd members                  list the network's machines and devices
   etd revoke <name|id>         remove a member everywhere and close its connections
-  etd status                   show the daemon's id, addresses, and connected members
+  etd status [--json]          show the daemon's id, addresses, and connected members
   etd id                       print this machine's endpoint id
   etd pair [--url]             the same as `etd invite` (a device)
   etd allow <id> [name]        add a device without a QR code (for tests)
 
 files: $ETD_HOME, else ~/.config/etd and ~/.local/state/etd
        (macOS: ~/Library/Application Support/etd)";
+
+/// `$ETD_LOG_FILE`, opened to append. A leading `~/` means the home
+/// directory (a login item's plist cannot know it).
+fn log_file() -> anyhow::Result<Option<std::fs::File>> {
+    let Some(path) = std::env::var("ETD_LOG_FILE").ok().filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let path = match path.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir().context("no home directory")?.join(rest),
+        None => path.into(),
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).with_context(|| format!("open {}", path.display()))?;
+    Ok(Some(file))
+}
+
+/// `etd status --json`, for E.T. for macOS: whether etd runs, who manages
+/// it, and this machine's network.
+fn status_json(paths: &Paths) -> anyhow::Result<String> {
+    let mut out = serde_json::json!({ "running": false });
+    if let Some(s) = config::running_status(paths)? {
+        let manager = s.exe.as_deref().map(|e| service::manager(std::path::Path::new(e)));
+        out = serde_json::json!({
+            "running": true,
+            "pid": s.pid,
+            "version": s.version,
+            "id": s.addr.id.to_string(),
+            "host": s.host_name,
+            "exe": s.exe,
+            "manager": manager.unwrap_or("unknown"),
+            "connected": s.connected,
+        });
+    }
+    if let Some(signed) = network::load(paths)? {
+        let members: Vec<_> = signed
+            .network
+            .members()
+            .map(|m| serde_json::json!({ "name": m.name.to_string(), "kind": kind_word(m.kind), "id": m.id.to_string() }))
+            .collect();
+        out["network"] = serde_json::json!({ "name": signed.network.name.to_string(), "members": members });
+    }
+    Ok(serde_json::to_string_pretty(&out)?)
+}
 
 fn kind_word(kind: Kind) -> &'static str {
     match kind {
@@ -36,10 +82,12 @@ fn kind_word(kind: Kind) -> &'static str {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("etd=info")))
-        .with_writer(std::io::stderr)
-        .init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("etd=info"));
+    match log_file()? {
+        // A login item (E.T. for macOS) has no place for stderr.
+        Some(file) => tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(file)).init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init(),
+    }
     let paths = Paths::from_env()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
@@ -63,7 +111,8 @@ async fn main() -> anyhow::Result<()> {
             let status = config::running_status(&paths)?.context("etd is not running; start it first (run `etd`)")?;
             pair::print(&paths, &status.addr, &status.host_name, kind, url_only)
         }
-        ["install"] => service::install(&paths),
+        ["install"] => service::install(&paths, true),
+        ["install", "--no-service"] => service::install(&paths, false),
         ["uninstall"] => service::uninstall(),
         ["join", url, rest @ ..] => {
             let name = match rest {
@@ -102,6 +151,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("revoked {name} ({id})");
             }
             println!("Every machine of the network closes its connections within seconds of hearing it.");
+            Ok(())
+        }
+        ["status", "--json"] => {
+            println!("{}", status_json(&paths)?);
             Ok(())
         }
         ["status"] => {

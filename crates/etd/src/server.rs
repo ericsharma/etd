@@ -152,6 +152,8 @@ impl State {
 /// Binds the endpoint and serves until SIGINT or SIGTERM.
 /// `show_pairing`: print a pairing QR code once online (a first run by hand).
 pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Result<()> {
+    // One etd per key: a second one (Nix and the app, say) would fight over it.
+    let _lock = config::DaemonLock::take(&paths)?;
     let env = tmux::login_env().await;
     let tmux_text = match tmux::find(&env).await {
         TmuxStatus::Found(t) => format!("{} ({}), TMUX_TMPDIR={}", t.path, t.version, t.tmpdir.as_deref().unwrap_or("default")),
@@ -275,6 +277,7 @@ pub async fn watch(endpoint: Endpoint, state: Arc<State>, tmux: String) {
             tmux: tmux.clone(),
             connected: state.connected_names(),
             updated: config::now_secs(),
+            exe: std::env::current_exe().ok().map(|p| p.display().to_string()),
         };
         if let Err(e) = config::write_json(&state.paths.status(), &status) {
             warn!("write status: {e:#}");
@@ -363,6 +366,9 @@ async fn admission(state: &State, conn: &Connection) -> Option<(String, Kind)> {
     } else {
         match pair::redeem(&state.paths, &secret) {
             None => Err("this invite is wrong, used, or expired; run `etd invite` again".to_string()),
+            Some(Kind::Device) if wanted == Kind::Machine => {
+                Err("this link is for a phone or tablet, not a machine; make one with `etd invite --machine`".to_string())
+            }
             Some(kind) if kind != wanted => Err(format!("this invite is for a {}, not a {}", kind_word(kind), kind_word(wanted))),
             Some(kind) => {
                 let name = if name.trim().is_empty() { id.fmt_short().to_string() } else { name };

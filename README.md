@@ -28,12 +28,12 @@ To try etd without a service, run `etd` in a terminal. When the network has no d
 | Command | What it does |
 |---|---|
 | `etd` | Run the daemon in the foreground |
-| `etd install` / `etd uninstall` | Add or remove the user services and the `MM_SSH` line in your shell's startup file |
+| `etd install [--no-service]` / `etd uninstall` | Add or remove the user services and the `MM_SSH` line in your shell's startup file. `--no-service`: only manymux (the macOS app runs etd itself) |
 | `etd invite [--machine] [--url]` | Invite a phone or tablet (QR code), or another machine. Valid for 10 minutes, for one member. |
 | `etd join <link> [--name N]` | Join the network of the machine that made the link |
 | `etd members` | List the network's machines and devices |
 | `etd revoke <name\|id>` | Remove a member from every machine, and close its connections |
-| `etd status` | The daemon's id, addresses, network, and connected members |
+| `etd status [--json]` | The daemon's id, addresses, network, and connected members. `--json` adds who manages etd: `nix`, `cli`, `app` or `manual` |
 
 ### How the machines work together
 
@@ -96,6 +96,8 @@ A member of the network can do what you can do in a shell on **every machine** o
 - Revoking a *machine* also moves the network to a new network key, because the revoked machine knows the old one. The other machines take the new key only together with the change signed by the old key, so the revoked machine cannot follow or make its own. A machine that was off gets the change when it starts again, from any machine that is on.
 - A machine that is lost while every other machine is off can still sign changes until one of them revokes it: revoke a lost machine soon.
 - Keys and the network: `~/.config/etd` (Linux) or `~/Library/Application Support/etd` (macOS), or `$ETD_HOME`.
+- One etd per key: a second etd with the same files stops at start.
+- `ETD_LOG_FILE` (a leading `~/` is the home directory) sends the log to a file.
 
 ## Parts
 

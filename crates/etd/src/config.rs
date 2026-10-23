@@ -72,6 +72,34 @@ impl Paths {
     pub fn status(&self) -> PathBuf {
         self.state.join("status.json")
     }
+
+    /// Held by the running daemon, so a second etd with these files stops.
+    pub fn daemon_lock(&self) -> PathBuf {
+        self.state.join("etd.lock")
+    }
+}
+
+/// The running daemon's hold on its files. Released when the process ends,
+/// however it ends.
+pub struct DaemonLock {
+    _file: fs::File,
+}
+
+impl DaemonLock {
+    /// Fails if another etd runs with the same files (the same iroh key).
+    pub fn take(paths: &Paths) -> anyhow::Result<Self> {
+        use std::os::fd::AsRawFd;
+        fs::create_dir_all(&paths.state)?;
+        let path = paths.daemon_lock();
+        let file = fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(&path)?;
+        // SAFETY: flock on a file descriptor we own; it is released on close.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let other = running_status(paths).ok().flatten();
+            let who = other.map(|s| format!(" (pid {}, {})", s.pid, s.exe.as_deref().unwrap_or("?"))).unwrap_or_default();
+            bail!("another etd already runs with {}{who}; stop it first", paths.state.display());
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 pub fn now_secs() -> u64 {
@@ -171,6 +199,9 @@ pub struct Status {
     pub connected: Vec<String>,
     /// Unix seconds.
     pub updated: u64,
+    /// The running program, to tell who manages it (`etd status --json`).
+    #[serde(default)]
+    pub exe: Option<String>,
 }
 
 /// The status of a running daemon. `None`: no daemon runs for these paths.
@@ -181,4 +212,22 @@ pub fn running_status(paths: &Paths) -> anyhow::Result<Option<Status>> {
     // SAFETY: kill with signal 0 only checks that the process exists.
     let alive = unsafe { libc::kill(status.pid as libc::pid_t, 0) } == 0;
     Ok(alive.then_some(status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_daemon_with_the_same_files_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().into());
+        let first = DaemonLock::take(&paths).unwrap();
+        let err = DaemonLock::take(&paths).err().expect("second lock");
+        assert!(format!("{err:#}").contains("another etd already runs"), "{err:#}");
+        drop(first);
+        DaemonLock::take(&paths).expect("free again after the first one ends");
+        let other = tempfile::tempdir().unwrap();
+        DaemonLock::take(&Paths::at(other.path().into())).expect("other files, other lock");
+    }
 }

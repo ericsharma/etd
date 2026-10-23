@@ -203,7 +203,27 @@ fn written_by_etd(path: &Path) -> bool {
     std::fs::read_to_string(path).is_ok_and(|t| t.contains(MARK))
 }
 
-pub fn install(paths: &Paths) -> anyhow::Result<()> {
+/// Who runs the etd at `exe`: `nix` (a Nix module), `app` (E.T. for macOS,
+/// from its bundle), `cli` (`etd install`), or `manual`.
+pub fn manager(exe: &Path) -> &'static str {
+    if exe.starts_with("/nix/store") {
+        "nix"
+    } else if exe.to_string_lossy().contains(".app/Contents/") {
+        "app"
+    } else if [plist_path(ETD_LABEL), unit_dir().map(|d| d.join(ETD_UNIT))]
+        .into_iter()
+        .flatten()
+        .any(|p| written_by_etd(&p) && std::fs::read_to_string(&p).is_ok_and(|t| t.contains(&*exe.to_string_lossy())))
+    {
+        "cli"
+    } else {
+        "manual"
+    }
+}
+
+/// `with_service: false` (`etd install --no-service`): everything but etd's
+/// own service, for E.T. for macOS, which runs etd as its own login item.
+pub fn install(paths: &Paths, with_service: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?.canonicalize()?;
     if exe.starts_with("/nix/store") {
         eprintln!("note: {} is in the Nix store; a garbage collection can remove it.", exe.display());
@@ -220,10 +240,11 @@ pub fn install(paths: &Paths) -> anyhow::Result<()> {
     let mut etd_env = Vec::new();
     match own_mm_hosts() {
         None => etd_env.push(("ETD_MANYMUX_HOSTS".to_string(), "1".to_string())),
-        Some(_) => {
+        Some(_) if with_service => {
             println!("note: manymux already lists machines (~/.config/manymux/hosts.toml), so etd leaves that list alone.");
             println!("      Empty it and run `etd install` again to let etd keep it equal to the network.");
         }
+        Some(_) => {}
     }
     let etd = Service {
         description: "etd: reach this machine from E.T. over iroh".into(),
@@ -249,12 +270,16 @@ pub fn install(paths: &Paths) -> anyhow::Result<()> {
     };
 
     if cfg!(target_os = "macos") {
-        install_launchd(ETD_LABEL, &etd, true)?;
+        if with_service {
+            install_launchd(ETD_LABEL, &etd, true)?;
+        }
         if start_node {
             install_launchd(MM_LABEL, &node, false)?;
         }
     } else {
-        install_systemd(ETD_UNIT, &etd, true)?;
+        if with_service {
+            install_systemd(ETD_UNIT, &etd, true)?;
+        }
         if start_node {
             install_systemd(MM_UNIT, &node, false)?;
         }
@@ -280,6 +305,10 @@ pub fn install(paths: &Paths) -> anyhow::Result<()> {
         None => println!("note: set MM_SSH={} in your shell's startup file", etd_ssh.display()),
     }
 
+    if !with_service {
+        println!("manymux is set up; etd's own service is not (--no-service).");
+        return Ok(());
+    }
     for _ in 0..40 {
         if config::running_status(paths)?.is_some() {
             println!("etd is running. `etd invite` adds a phone; `etd invite --machine` adds a machine.");
@@ -399,6 +428,13 @@ mod tests {
         assert!(plist.contains("<key>MM_SSH</key><string>/home/a b/.local/bin/etd-ssh</string>"));
         assert!(plist.contains(MARK));
         assert!(!plist.contains("a&b"));
+    }
+
+    #[test]
+    fn manager_from_the_program_path() {
+        assert_eq!(manager(Path::new("/nix/store/abc-etd/bin/etd")), "nix");
+        assert_eq!(manager(Path::new("/Applications/E.T.app/Contents/MacOS/etd")), "app");
+        assert_eq!(manager(Path::new("/opt/nowhere-etd-test/etd")), "manual");
     }
 
     #[test]

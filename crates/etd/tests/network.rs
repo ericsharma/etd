@@ -117,7 +117,7 @@ async fn three_machines_one_network() {
     // A device invite cannot make a machine.
     let device_url = a.invite(Kind::Device);
     let err = network::join(&c.endpoint, &c.paths, &device_url, "mac-mini").await.unwrap_err();
-    assert!(format!("{err:#}").contains("for a device"), "{err:#}");
+    assert!(format!("{err:#}").contains("for a phone or tablet, not a machine"), "{err:#}");
 
     // A phone joins on a; b learns of it.
     let phone_ep = phone(&book).await;
