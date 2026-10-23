@@ -218,20 +218,12 @@ const TICKET_PREFIX: &str = "et://pair?t=";
 impl Ticket {
     pub fn to_url(&self) -> anyhow::Result<String> {
         let bytes = postcard::to_stdvec(self)?;
-        Ok(format!(
-            "{TICKET_PREFIX}{}",
-            data_encoding::BASE32_NOPAD.encode(&bytes)
-        ))
+        Ok(format!("{TICKET_PREFIX}{}", data_encoding::BASE32_NOPAD.encode(&bytes)))
     }
 
     pub fn from_url(url: &str) -> anyhow::Result<Self> {
-        let body = url
-            .trim()
-            .strip_prefix(TICKET_PREFIX)
-            .context("not an et://pair link")?;
-        let bytes = data_encoding::BASE32_NOPAD
-            .decode(body.to_ascii_uppercase().as_bytes())
-            .context("bad ticket")?;
+        let body = url.trim().strip_prefix(TICKET_PREFIX).context("not an et://pair link")?;
+        let bytes = data_encoding::BASE32_NOPAD.decode(body.to_ascii_uppercase().as_bytes()).context("bad ticket")?;
         postcard::from_bytes(&bytes).context("bad ticket")
     }
 }
@@ -248,9 +240,7 @@ pub fn encode<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
 }
 
 pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> anyhow::Result<()> {
-    send.write_all(&encode(value)?)
-        .await
-        .context("write frame")?;
+    send.write_all(&encode(value)?).await.context("write frame")?;
     Ok(())
 }
 
@@ -267,9 +257,7 @@ pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> anyhow::R
         bail!("frame too large: {len} bytes");
     }
     let mut body = vec![0u8; len];
-    recv.read_exact(&mut body)
-        .await
-        .context("read frame body")?;
+    recv.read_exact(&mut body).await.context("read frame body")?;
     Ok(Some(postcard::from_bytes(&body).context("decode frame")?))
 }
 
@@ -281,10 +269,7 @@ mod tests {
     fn frame_round_trip() {
         let frame = ControlFrame::Stdout(b"%begin 1 2 1\n".to_vec());
         let bytes = encode(&frame).unwrap();
-        assert_eq!(
-            u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize,
-            bytes.len() - 4
-        );
+        assert_eq!(u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize, bytes.len() - 4);
         let back: ControlFrame = postcard::from_bytes(&bytes[4..]).unwrap();
         assert_eq!(back, frame);
     }

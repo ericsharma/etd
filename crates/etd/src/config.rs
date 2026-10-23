@@ -26,20 +26,13 @@ impl Paths {
         if let Some(dir) = std::env::var_os("ETD_HOME") {
             return Ok(Self::at(PathBuf::from(dir)));
         }
-        let config = dirs::config_dir()
-            .context("no config directory")?
-            .join("etd");
-        let state = dirs::state_dir()
-            .map(|d| d.join("etd"))
-            .unwrap_or_else(|| config.clone());
+        let config = dirs::config_dir().context("no config directory")?.join("etd");
+        let state = dirs::state_dir().map(|d| d.join("etd")).unwrap_or_else(|| config.clone());
         Ok(Self { config, state })
     }
 
     pub fn at(dir: PathBuf) -> Self {
-        Self {
-            config: dir.clone(),
-            state: dir,
-        }
+        Self { config: dir.clone(), state: dir }
     }
 
     pub fn key(&self) -> PathBuf {
@@ -81,25 +74,16 @@ impl Paths {
 }
 
 pub fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Loads the 32-byte key at `path`, or makes one (mode 0600).
 pub fn load_or_create_key(path: &Path) -> anyhow::Result<SecretKey> {
     match fs::read(path) {
         Ok(bytes) => {
-            let bytes: [u8; 32] = bytes
-                .try_into()
-                .ok()
-                .with_context(|| format!("{}: not a 32-byte key", path.display()))?;
+            let bytes: [u8; 32] = bytes.try_into().ok().with_context(|| format!("{}: not a 32-byte key", path.display()))?;
             if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
-                bail!(
-                    "{}: key is readable by others; run chmod 600",
-                    path.display()
-                );
+                bail!("{}: key is readable by others; run chmod 600", path.display());
             }
             Ok(SecretKey::from_bytes(&bytes))
         }
@@ -108,11 +92,7 @@ pub fn load_or_create_key(path: &Path) -> anyhow::Result<SecretKey> {
             if let Some(dir) = path.parent() {
                 fs::create_dir_all(dir)?;
             }
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
+            let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
             file.write_all(&key.to_bytes())?;
             Ok(key)
         }
@@ -123,9 +103,7 @@ pub fn load_or_create_key(path: &Path) -> anyhow::Result<SecretKey> {
 /// Reads JSON. A missing file is `None`.
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> anyhow::Result<Option<T>> {
     match fs::read(path) {
-        Ok(bytes) => Ok(Some(
-            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?,
-        )),
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
     }
@@ -164,11 +142,7 @@ pub fn save_clients(paths: &Paths, clients: &[Client]) -> anyhow::Result<()> {
 pub fn add_client(paths: &Paths, id: EndpointId, name: &str) -> anyhow::Result<()> {
     let mut clients = load_clients(paths)?;
     clients.retain(|c| c.id != id);
-    clients.push(Client {
-        id,
-        name: name.into(),
-        paired: now_secs(),
-    });
+    clients.push(Client { id, name: name.into(), paired: now_secs() });
     save_clients(paths, &clients)
 }
 
@@ -176,8 +150,7 @@ pub fn add_client(paths: &Paths, id: EndpointId, name: &str) -> anyhow::Result<(
 /// `who`. Returns the removed ones.
 pub fn remove_clients(paths: &Paths, who: &str) -> anyhow::Result<Vec<Client>> {
     let clients = load_clients(paths)?;
-    let matches =
-        |c: &Client| c.name == who || (who.len() >= 8 && c.id.to_string().starts_with(who));
+    let matches = |c: &Client| c.name == who || (who.len() >= 8 && c.id.to_string().starts_with(who));
     let (removed, kept): (Vec<_>, Vec<_>) = clients.into_iter().partition(matches);
     if !removed.is_empty() {
         save_clients(paths, &kept)?;

@@ -28,9 +28,7 @@ use crate::network;
 
 /// `$ETD_SOCKET`, else `etd.sock` in etd's state directory.
 pub fn socket_path(paths: &Paths) -> PathBuf {
-    std::env::var_os("ETD_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| paths.state.join("etd.sock"))
+    std::env::var_os("ETD_SOCKET").map(PathBuf::from).unwrap_or_else(|| paths.state.join("etd.sock"))
 }
 
 /// A frame (as `et_proto::encode`) to any writer.
@@ -40,9 +38,7 @@ pub async fn send<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, value: &T) -> 
 }
 
 /// A frame from any reader. `Ok(None)`: the stream ended cleanly first.
-pub async fn receive<R: AsyncRead + Unpin, T: DeserializeOwned>(
-    r: &mut R,
-) -> anyhow::Result<Option<T>> {
+pub async fn receive<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> anyhow::Result<Option<T>> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len).await {
         Ok(_) => {}
@@ -70,10 +66,7 @@ impl Connections {
                 return Ok(conn.clone());
             }
         }
-        let conn = endpoint
-            .connect(id, ALPN)
-            .await
-            .context("reach the machine")?;
+        let conn = endpoint.connect(id, ALPN).await.context("reach the machine")?;
         map.insert(id, conn.clone());
         Ok(conn)
     }
@@ -87,8 +80,7 @@ pub async fn serve(endpoint: Endpoint, paths: Paths) -> anyhow::Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     let _ = std::fs::remove_file(&path);
-    let listener =
-        UnixListener::bind(&path).with_context(|| format!("listen on {}", path.display()))?;
+    let listener = UnixListener::bind(&path).with_context(|| format!("listen on {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let connections = Arc::new(Connections::default());
     loop {
@@ -105,21 +97,10 @@ pub async fn serve(endpoint: Endpoint, paths: Paths) -> anyhow::Result<()> {
 /// The machine member called `name`.
 fn machine(paths: &Paths, me: EndpointId, name: &str) -> anyhow::Result<EndpointId> {
     let signed = network::load(paths)?.context("no network yet")?;
-    let found = signed
-        .network
-        .machines()
-        .find(|m| m.name == name)
-        .with_context(|| {
-            let names: Vec<String> = signed
-                .network
-                .machines()
-                .map(|m| m.name.to_string())
-                .collect();
-            format!(
-                "{name} is not a machine of the network (machines: {})",
-                names.join(", ")
-            )
-        })?;
+    let found = signed.network.machines().find(|m| m.name == name).with_context(|| {
+        let names: Vec<String> = signed.network.machines().map(|m| m.name.to_string()).collect();
+        format!("{name} is not a machine of the network (machines: {})", names.join(", "))
+    })?;
     if found.id == me {
         bail!("{name} is this machine");
     }
@@ -127,12 +108,7 @@ fn machine(paths: &Paths, me: EndpointId, name: &str) -> anyhow::Result<Endpoint
     Ok(found.id)
 }
 
-async fn handle(
-    mut stream: UnixStream,
-    endpoint: &Endpoint,
-    paths: &Paths,
-    connections: &Connections,
-) -> anyhow::Result<()> {
+async fn handle(mut stream: UnixStream, endpoint: &Endpoint, paths: &Paths, connections: &Connections) -> anyhow::Result<()> {
     let Some(request) = receive::<_, Request>(&mut stream).await? else {
         return Ok(());
     };
@@ -140,11 +116,7 @@ async fn handle(
         Request::Agent { host: Some(host) } => (host, Request::Agent { host: None }),
         Request::ExecOn { host, script } => (host, Request::Exec { script }),
         other => {
-            send(
-                &mut stream,
-                &Response::Error(format!("not a local request: {other:?}")),
-            )
-            .await?;
+            send(&mut stream, &Response::Error(format!("not a local request: {other:?}"))).await?;
             return Ok(());
         }
     };
@@ -163,9 +135,7 @@ async fn handle(
         if !is_agent {
             tx.finish()?;
         }
-        let reply = read_frame::<Response>(&mut rx)
-            .await?
-            .context("no answer")?;
+        let reply = read_frame::<Response>(&mut rx).await?.context("no answer")?;
         anyhow::Ok((tx, rx, reply))
     }
     .await;

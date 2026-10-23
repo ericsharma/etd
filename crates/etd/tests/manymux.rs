@@ -18,9 +18,7 @@ use iroh::{Endpoint, EndpointAddr, SecretKey};
 
 fn real_mm() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join("mm"))
-        .find(|p| p.is_file())
+    std::env::split_paths(&path).map(|d| d.join("mm")).find(|p| p.is_file())
 }
 
 fn script(path: &Path, body: &str) {
@@ -48,14 +46,7 @@ impl Node {
         let socket = dir.path().join("mm.sock");
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        script(
-            &bin.join("mm"),
-            &format!(
-                "#!/bin/sh\nexec '{}' --socket '{}' \"$@\"\n",
-                real.display(),
-                socket.display()
-            ),
-        );
+        script(&bin.join("mm"), &format!("#!/bin/sh\nexec '{}' --socket '{}' \"$@\"\n", real.display(), socket.display()));
         // ssh <options> [--] <host> [command…]: run the command here.
         script(
             &bin.join("ssh"),
@@ -71,10 +62,7 @@ impl Node {
             // The node logs to $XDG_STATE_HOME/manymux: keep it out of the real one.
             .env("XDG_STATE_HOME", dir.path().join("state"))
             // The node reaches watched machines with `ssh`: the stub.
-            .env(
-                "PATH",
-                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
-            )
+            .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
             .env_remove("TMUX")
             .spawn()
             .unwrap();
@@ -109,31 +97,15 @@ async fn call(conn: &Connection, request: Request) -> Response {
 
 /// Opens `Agent`, sends manymux `List`, and returns the decoded answer.
 #[allow(clippy::result_large_err)] // test helper
-async fn agent_list(
-    conn: &Connection,
-    host: Option<&str>,
-) -> Result<manymux::proto::Response, Response> {
+async fn agent_list(conn: &Connection, host: Option<&str>) -> Result<manymux::proto::Response, Response> {
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    write_frame(
-        &mut send,
-        &Request::Agent {
-            host: host.map(String::from),
-        },
-    )
-    .await
-    .unwrap();
+    write_frame(&mut send, &Request::Agent { host: host.map(String::from) }).await.unwrap();
     match read_frame::<Response>(&mut recv).await.unwrap().unwrap() {
         Response::AgentStarted => {}
         other => return Err(other),
     }
     let mut request = Vec::new();
-    manymux::proto::write_msg(
-        &mut request,
-        manymux::proto::tag::REQUEST,
-        &manymux::proto::Request::List,
-    )
-    .await
-    .unwrap();
+    manymux::proto::write_msg(&mut request, manymux::proto::tag::REQUEST, &manymux::proto::Request::List).await.unwrap();
     send.write_all(&request).await.unwrap();
     // manymux frames: [tag: u8][len: u32 BE][body], inside our ControlFrames.
     let mut bytes = Vec::new();
@@ -147,15 +119,7 @@ async fn agent_list(
                 return Ok(answer);
             }
         }
-        match tokio::time::timeout(
-            Duration::from_secs(10),
-            read_frame::<ControlFrame>(&mut recv),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-        {
+        match tokio::time::timeout(Duration::from_secs(10), read_frame::<ControlFrame>(&mut recv)).await.unwrap().unwrap().unwrap() {
             ControlFrame::Stdout(b) => bytes.extend(b),
             ControlFrame::Stderr(line) => eprintln!("mm agent stderr: {line}"),
             ControlFrame::Exit(code) => panic!("mm agent exited early: {code:?}"),
@@ -175,72 +139,32 @@ async fn manymux_through_etd() {
     let add = Command::new(node.bin().join("mm"))
         .args(["add", "fakehost"])
         .env("MM_CONFIG_DIR", node.config())
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                node.bin().display(),
-                std::env::var("PATH").unwrap()
-            ),
-        )
+        .env("PATH", format!("{}:{}", node.bin().display(), std::env::var("PATH").unwrap()))
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
-    assert!(
-        add.status.success(),
-        "mm add: {}",
-        String::from_utf8_lossy(&add.stderr)
-    );
+    assert!(add.status.success(), "mm add: {}", String::from_utf8_lossy(&add.stderr));
 
     let home = tempfile::tempdir().unwrap();
-    let mut env: etd::tmux::Env = std::env::vars()
-        .filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE")
-        .collect();
-    env.insert(
-        "PATH".into(),
-        format!("{}:{}", node.bin().display(), env["PATH"]),
-    );
+    let mut env: etd::tmux::Env = std::env::vars().filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE").collect();
+    env.insert("PATH".into(), format!("{}:{}", node.bin().display(), env["PATH"]));
     env.insert("MM_CONFIG_DIR".into(), node.config().display().to_string());
     env.insert("HOME".into(), home.path().display().to_string());
 
     let files = tempfile::tempdir().unwrap();
     let paths = Paths::at(files.path().into());
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await
-        .unwrap();
+    let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
     etd::network::ensure(&paths, endpoint.id(), "hub").unwrap();
     let state = server::State::new(paths.clone(), env);
     let _router = server::serve(endpoint.clone(), state);
     let phone = SecretKey::generate();
-    etd::network::admit(
-        &paths,
-        endpoint.id(),
-        phone.public(),
-        "phone",
-        et_proto::network::Kind::Device,
-    )
-    .unwrap();
-    let port = endpoint
-        .bound_sockets()
-        .iter()
-        .find(|a| a.is_ipv4())
-        .unwrap()
-        .port();
-    let addr = EndpointAddr::new(endpoint.id())
-        .with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
-    let client = Endpoint::builder(presets::Minimal)
-        .secret_key(phone)
-        .bind()
-        .await
-        .unwrap();
+    etd::network::admit(&paths, endpoint.id(), phone.public(), "phone", et_proto::network::Kind::Device).unwrap();
+    let port = endpoint.bound_sockets().iter().find(|a| a.is_ipv4()).unwrap().port();
+    let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+    let client = Endpoint::builder(presets::Minimal).secret_key(phone).bind().await.unwrap();
     let conn = client.connect(addr, ALPN).await.unwrap();
 
-    assert_eq!(
-        call(&conn, Request::Machines).await,
-        Response::Machines(vec!["fakehost".into()])
-    );
+    assert_eq!(call(&conn, Request::Machines).await, Response::Machines(vec!["fakehost".into()]));
 
     // This machine's node, and fakehost's (the same test node, through ssh).
     for host in [None, Some("fakehost")] {
@@ -251,11 +175,7 @@ async fn manymux_through_etd() {
             other => panic!("{host:?}: {other:?}"),
         }
     }
-    assert!(
-        node.ssh_log().lines().any(|h| h == "fakehost"),
-        "ssh was not used: {:?}",
-        node.ssh_log()
-    );
+    assert!(node.ssh_log().lines().any(|h| h == "fakehost"), "ssh was not used: {:?}", node.ssh_log());
 
     // A machine the node does not watch is refused before any ssh.
     let before = node.ssh_log();
@@ -263,33 +183,15 @@ async fn manymux_through_etd() {
         Err(Response::Error(e)) => assert!(e.contains("not a machine"), "{e}"),
         other => panic!("{other:?}"),
     }
-    match call(
-        &conn,
-        Request::ExecOn {
-            host: "evil.example".into(),
-            script: "true".into(),
-        },
-    )
-    .await
-    {
+    match call(&conn, Request::ExecOn { host: "evil.example".into(), script: "true".into() }).await {
         Response::Error(e) => assert!(e.contains("not a machine"), "{e}"),
         other => panic!("{other:?}"),
     }
     assert_eq!(node.ssh_log(), before, "a refused host must not reach ssh");
 
     // ExecOn: quoting survives, stderr is joined, the exit code comes back.
-    match call(
-        &conn,
-        Request::ExecOn {
-            host: "fakehost".into(),
-            script: "echo $((1+2)); echo 'it'\"'\"'s' >&2; exit 4".into(),
-        },
-    )
-    .await
-    {
-        Response::ExecResult {
-            output, exit_code, ..
-        } => {
+    match call(&conn, Request::ExecOn { host: "fakehost".into(), script: "echo $((1+2)); echo 'it'\"'\"'s' >&2; exit 4".into() }).await {
+        Response::ExecResult { output, exit_code, .. } => {
             assert_eq!(String::from_utf8_lossy(&output), "3\nit's\n");
             assert_eq!(exit_code, Some(4));
         }
@@ -305,30 +207,15 @@ async fn bells_run_the_notify_command() {
     };
     let node = Node::start(&real);
     let notes = node.dir.path().join("notes");
-    let mut env: etd::tmux::Env = std::env::vars()
-        .filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE")
-        .collect();
-    env.insert(
-        "PATH".into(),
-        format!("{}:{}", node.bin().display(), env["PATH"]),
-    );
+    let mut env: etd::tmux::Env = std::env::vars().filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE").collect();
+    env.insert("PATH".into(), format!("{}:{}", node.bin().display(), env["PATH"]));
     env.insert("MM_CONFIG_DIR".into(), node.config().display().to_string());
-    env.insert(
-        "XDG_STATE_HOME".into(),
-        node.dir.path().join("state").display().to_string(),
-    );
-    let command = format!(
-        "echo \"$ETD_KIND|$ETD_SESSION|$ETD_BODY\" >> '{}'",
-        notes.display()
-    );
+    env.insert("XDG_STATE_HOME".into(), node.dir.path().join("state").display().to_string());
+    let command = format!("echo \"$ETD_KIND|$ETD_SESSION|$ETD_BODY\" >> '{}'", notes.display());
     // A machine alone in its network: its own session's bell is pushed here.
     let files = tempfile::tempdir().unwrap();
     let paths = Paths::at(files.path().into());
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await
-        .unwrap();
+    let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
     etd::network::ensure(&paths, endpoint.id(), "hub").unwrap();
     let state = server::State::new(paths, env.clone());
     state.set_notify_command(command);
@@ -338,24 +225,12 @@ async fn bells_run_the_notify_command() {
 
     // Nobody attached: the bell is worth a note.
     let new = Command::new(node.bin().join("mm"))
-        .args([
-            "new",
-            "-d",
-            "-n",
-            "ringer",
-            "sh",
-            "-c",
-            "sleep 1; printf '\\a'; sleep 3",
-        ])
+        .args(["new", "-d", "-n", "ringer", "sh", "-c", "sleep 1; printf '\\a'; sleep 3"])
         .envs(env.iter())
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
-    assert!(
-        new.status.success(),
-        "mm new: {}",
-        String::from_utf8_lossy(&new.stderr)
-    );
+    assert!(new.status.success(), "mm new: {}", String::from_utf8_lossy(&new.stderr));
     let mut seen = String::new();
     for _ in 0..100 {
         seen = std::fs::read_to_string(&notes).unwrap_or_default();

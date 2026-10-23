@@ -43,12 +43,7 @@ async fn main() -> anyhow::Result<()> {
             let ticket = Ticket::from_url(url)?;
             ("pair", ticket.addr.clone(), Some(ticket), rest)
         }
-        [command, id, rest @ ..] => (
-            *command,
-            EndpointAddr::new(id.parse::<EndpointId>().context("not an endpoint id")?),
-            None,
-            rest,
-        ),
+        [command, id, rest @ ..] => (*command, EndpointAddr::new(id.parse::<EndpointId>().context("not an endpoint id")?), None, rest),
         _ => bail!("{USAGE}"),
     };
 
@@ -57,123 +52,49 @@ async fn main() -> anyhow::Result<()> {
         .keep_alive_interval(Duration::from_secs(5))
         .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
         .build();
-    let builder = Endpoint::builder(presets::N0)
-        .secret_key(key)
-        .transport_config(transport);
-    let builder = if relay_only {
-        builder.clear_ip_transports()
-    } else {
-        builder
-    };
+    let builder = Endpoint::builder(presets::N0).secret_key(key).transport_config(transport);
+    let builder = if relay_only { builder.clear_ip_transports() } else { builder };
     let endpoint = builder.bind().await?;
     let bound = start.elapsed();
     let conn = endpoint.connect(addr, ALPN).await.context("connect")?;
-    eprintln!(
-        "bind {:?}, connect {:?}, path: {}",
-        bound,
-        start.elapsed() - bound,
-        path(&conn)
-    );
+    eprintln!("bind {:?}, connect {:?}, path: {}", bound, start.elapsed() - bound, path(&conn));
 
     match (command, rest) {
         ("pair", name) => {
             let ticket = ticket.expect("pair has a ticket");
-            let device_name = if name.is_empty() {
-                "etd-probe".into()
-            } else {
-                name.join(" ")
-            };
-            println!(
-                "{:?}",
-                call(
-                    &conn,
-                    Request::Pair {
-                        secret: ticket.secret,
-                        device_name
-                    }
-                )
-                .await?
-            );
+            let device_name = if name.is_empty() { "etd-probe".into() } else { name.join(" ") };
+            println!("{:?}", call(&conn, Request::Pair { secret: ticket.secret, device_name }).await?);
         }
-        ("hello", []) => println!(
-            "{:#?}",
-            call(
-                &conn,
-                Request::Hello {
-                    app: "etd-probe".into()
-                }
-            )
-            .await?
-        ),
+        ("hello", []) => println!("{:#?}", call(&conn, Request::Hello { app: "etd-probe".into() }).await?),
         ("ping", []) => {
             let t = Instant::now();
-            println!(
-                "{:?} in {:?}",
-                call(&conn, Request::Ping).await?,
-                t.elapsed()
-            );
+            println!("{:?} in {:?}", call(&conn, Request::Ping).await?, t.elapsed());
         }
         ("sessions", []) => println!("{:#?}", call(&conn, Request::ListSessions).await?),
         ("machines", []) => println!("{:?}", call(&conn, Request::Machines).await?),
         ("exec-on", [host, script @ ..]) if !script.is_empty() => {
-            match call(
-                &conn,
-                Request::ExecOn {
-                    host: host.to_string(),
-                    script: script.join(" "),
-                },
-            )
-            .await?
-            {
-                Response::ExecResult {
-                    output, exit_code, ..
-                } => {
+            match call(&conn, Request::ExecOn { host: host.to_string(), script: script.join(" ") }).await? {
+                Response::ExecResult { output, exit_code, .. } => {
                     print!("{}", String::from_utf8_lossy(&output));
                     eprintln!("exit code {exit_code:?}");
                 }
                 other => println!("{other:?}"),
             }
         }
-        ("exec", script) if !script.is_empty() => match call(
-            &conn,
-            Request::Exec {
-                script: script.join(" "),
-            },
-        )
-        .await?
-        {
-            Response::ExecResult {
-                output,
-                exit_code,
-                truncated,
-            } => {
+        ("exec", script) if !script.is_empty() => match call(&conn, Request::Exec { script: script.join(" ") }).await? {
+            Response::ExecResult { output, exit_code, truncated } => {
                 print!("{}", String::from_utf8_lossy(&output));
-                eprintln!(
-                    "exit code {exit_code:?}{}",
-                    if truncated { " (output truncated)" } else { "" }
-                );
+                eprintln!("exit code {exit_code:?}{}", if truncated { " (output truncated)" } else { "" });
             }
             other => println!("{other:?}"),
         },
         ("upload", [file, remote]) => {
             let data = std::fs::read(file).with_context(|| format!("read {file}"))?;
             let (mut send, mut recv) = conn.open_bi().await?;
-            write_frame(
-                &mut send,
-                &Request::Upload {
-                    path: remote.to_string(),
-                    len: data.len() as u64,
-                },
-            )
-            .await?;
+            write_frame(&mut send, &Request::Upload { path: remote.to_string(), len: data.len() as u64 }).await?;
             send.write_all(&data).await?;
             send.finish()?;
-            println!(
-                "{:?}",
-                read_frame::<Response>(&mut recv)
-                    .await?
-                    .context("no response")?
-            );
+            println!("{:?}", read_frame::<Response>(&mut recv).await?.context("no response")?);
         }
         ("attach", [session]) => attach(&conn, session).await?,
         ("bench", [session, n @ ..]) => {
@@ -204,22 +125,10 @@ async fn call(conn: &Connection, request: Request) -> anyhow::Result<Response> {
     read_frame(&mut recv).await?.context("no response")
 }
 
-async fn open_control(
-    conn: &Connection,
-    session: &str,
-) -> anyhow::Result<(SendStream, RecvStream)> {
+async fn open_control(conn: &Connection, session: &str) -> anyhow::Result<(SendStream, RecvStream)> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    write_frame(
-        &mut send,
-        &Request::Control {
-            target: Target::Attach(session.into()),
-        },
-    )
-    .await?;
-    match read_frame::<Response>(&mut recv)
-        .await?
-        .context("no response")?
-    {
+    write_frame(&mut send, &Request::Control { target: Target::Attach(session.into()) }).await?;
+    match read_frame::<Response>(&mut recv).await?.context("no response")? {
         Response::ControlStarted => Ok((send, recv)),
         other => bail!("control refused: {other:?}"),
     }
@@ -230,11 +139,7 @@ async fn attach(conn: &Connection, session: &str) -> anyhow::Result<()> {
     let up = tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            if send
-                .write_all(format!("{line}\n").as_bytes())
-                .await
-                .is_err()
-            {
+            if send.write_all(format!("{line}\n").as_bytes()).await.is_err() {
                 break;
             }
         }
@@ -271,10 +176,7 @@ impl Lines {
                 self.buf.drain(..=i);
                 return Ok(line);
             }
-            match read_frame::<ControlFrame>(recv)
-                .await?
-                .context("stream ended")?
-            {
+            match read_frame::<ControlFrame>(recv).await?.context("stream ended")? {
                 ControlFrame::Stdout(bytes) => self.buf.extend_from_slice(&bytes),
                 ControlFrame::Stderr(line) => eprintln!("tmux stderr: {line}"),
                 ControlFrame::Exit(code) => bail!("tmux exited: {code:?}"),

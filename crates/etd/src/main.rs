@@ -37,26 +37,17 @@ fn kind_word(kind: Kind) -> &'static str {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("etd=info")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("etd=info")))
         .with_writer(std::io::stderr)
         .init();
     let paths = Paths::from_env()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] | ["run"] => {
             let key = config::load_or_create_key(&paths.key())?;
             // The out-of-the-box path: run `etd` by hand, scan, done.
             let alone = network::load(&paths)?.is_none_or(|s| s.network.members().count() <= 1);
-            let show_pairing = alone
-                && config::load_clients(&paths)?.is_empty()
-                && std::io::stdout().is_terminal();
+            let show_pairing = alone && config::load_clients(&paths)?.is_empty() && std::io::stdout().is_terminal();
             server::run(paths, key, show_pairing).await
         }
         [cmd @ ("invite" | "pair"), rest @ ..] => {
@@ -69,8 +60,7 @@ async fn main() -> anyhow::Result<()> {
                     _ => bail!("{USAGE}"),
                 }
             }
-            let status = config::running_status(&paths)?
-                .context("etd is not running; start it first (run `etd`)")?;
+            let status = config::running_status(&paths)?.context("etd is not running; start it first (run `etd`)")?;
             pair::print(&paths, &status.addr, &status.host_name, kind, url_only)
         }
         ["install"] => service::install(&paths),
@@ -82,10 +72,7 @@ async fn main() -> anyhow::Result<()> {
                 _ => bail!("{USAGE}"),
             };
             let key = config::load_or_create_key(&paths.key())?;
-            let endpoint = Endpoint::builder(presets::N0)
-                .secret_key(key)
-                .bind()
-                .await?;
+            let endpoint = Endpoint::builder(presets::N0).secret_key(key).bind().await?;
             let joined = network::join(&endpoint, &paths, url, &name).await;
             endpoint.close().await;
             let signed = joined?;
@@ -102,11 +89,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = cmd;
             let signed = network::load(&paths)?.context("no network yet; start etd once")?;
             let me = config::load_or_create_key(&paths.key())?.public();
-            println!(
-                "network {} ({})",
-                signed.network.name,
-                signed.network.key.fmt_short()
-            );
+            println!("network {} ({})", signed.network.name, signed.network.key.fmt_short());
             for m in signed.network.members() {
                 let here = if m.id == me { "  (this machine)" } else { "" };
                 println!("  {:<20} {:<8} {}{here}", m.name, kind_word(m.kind), m.id);
@@ -118,9 +101,7 @@ async fn main() -> anyhow::Result<()> {
             for (id, name) in network::revoke(&paths, me, &who.join(" "))? {
                 println!("revoked {name} ({id})");
             }
-            println!(
-                "Every machine of the network closes its connections within seconds of hearing it."
-            );
+            println!("Every machine of the network closes its connections within seconds of hearing it.");
             Ok(())
         }
         ["status"] => {
@@ -141,20 +122,9 @@ async fn main() -> anyhow::Result<()> {
             if let Some(signed) = network::load(&paths)? {
                 let machines = signed.network.machines().count();
                 let all = signed.network.members().count();
-                println!(
-                    "network     {}: {machines} machine(s), {} device(s)",
-                    signed.network.name,
-                    all - machines
-                );
+                println!("network     {}: {machines} machine(s), {} device(s)", signed.network.name, all - machines);
             }
-            println!(
-                "connected   {}",
-                if s.connected.is_empty() {
-                    "none".into()
-                } else {
-                    s.connected.join(", ")
-                }
-            );
+            println!("connected   {}", if s.connected.is_empty() { "none".into() } else { s.connected.join(", ") });
             Ok(())
         }
         ["id"] => {
@@ -163,11 +133,7 @@ async fn main() -> anyhow::Result<()> {
         }
         ["allow", id, rest @ ..] => {
             let id: EndpointId = id.parse().context("not an endpoint id")?;
-            let name = if rest.is_empty() {
-                id.fmt_short().to_string()
-            } else {
-                rest.join(" ")
-            };
+            let name = if rest.is_empty() { id.fmt_short().to_string() } else { rest.join(" ") };
             let me = config::load_or_create_key(&paths.key())?.public();
             network::ensure(&paths, me, &tmux::host_name())?;
             network::admit(&paths, me, id, &name, Kind::Device)?;

@@ -8,16 +8,8 @@ use crate::tmux::Env;
 
 /// No prompts (a prompt would hang the phone), a short connect, and a dead
 /// connection noticed within a minute.
-const SSH_OPTIONS: [&str; 8] = [
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=10",
-    "-o",
-    "ServerAliveInterval=15",
-    "-o",
-    "ServerAliveCountMax=3",
-];
+const SSH_OPTIONS: [&str; 8] =
+    ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"];
 
 /// manymux answers one request per stream, so the app opens many short
 /// `ssh <host> mm agent`s. One shared connection per machine (kept 2 minutes
@@ -53,18 +45,9 @@ pub async fn machines(env: &Env) -> anyhow::Result<Vec<String>> {
         .await
         .context("run `mm hosts` (is manymux installed?)")?;
     if !output.status.success() {
-        bail!(
-            "mm hosts: {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("mm hosts: {}: {}", output.status, String::from_utf8_lossy(&output.stderr).trim());
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(String::from)
-        .collect())
+    Ok(String::from_utf8_lossy(&output.stdout).lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
 }
 
 /// Only machines the node watches. A paired device must not be able to make
@@ -79,8 +62,7 @@ pub async fn check_host(env: &Env, host: &str) -> anyhow::Result<()> {
 
 /// `mm` is on the login environment's PATH.
 pub fn available(env: &Env) -> bool {
-    env.get("PATH")
-        .is_some_and(|path| std::env::split_paths(path).any(|d| d.join("mm").is_file()))
+    env.get("PATH").is_some_and(|path| std::env::split_paths(path).any(|d| d.join("mm").is_file()))
 }
 
 pub fn agent_local(env: &Env) -> Command {
@@ -101,12 +83,7 @@ pub fn agent_remote(env: &Env, host: &str) -> Command {
 pub fn exec_on_script(env: &Env, host: &str, script: &str) -> String {
     let remote = format!("/bin/sh -c {}", quote(script));
     let options: Vec<String> = ssh_options(env).iter().map(|o| quote(o)).collect();
-    format!(
-        "exec ssh {} -- {} {}",
-        options.join(" "),
-        quote(host),
-        quote(&remote)
-    )
+    format!("exec ssh {} -- {} {}", options.join(" "), quote(host), quote(&remote))
 }
 
 /// manymux's machine list: `$MM_CONFIG_DIR/hosts.toml`, else
@@ -122,10 +99,7 @@ pub fn hosts_file(env: &Env) -> Option<std::path::PathBuf> {
 pub fn hosts_toml(names: &[String]) -> String {
     let mut text = String::from("hosts = [\n");
     for name in names {
-        text.push_str(&format!(
-            "    \"{}\",\n",
-            name.replace('\\', "\\\\").replace('"', "\\\"")
-        ));
+        text.push_str(&format!("    \"{}\",\n", name.replace('\\', "\\\\").replace('"', "\\\"")));
     }
     text.push_str("]\n");
     text
@@ -168,10 +142,7 @@ mod tests {
         assert!(line.starts_with("exec ssh '-o' 'BatchMode=yes' "), "{line}");
         assert!(line.contains(" -- 'gmktec' "), "{line}");
         // The remote shell gets: /bin/sh -c 'echo '\''hi'\'''
-        assert!(
-            line.ends_with(&quote(&format!("/bin/sh -c {}", quote("echo 'hi'")))),
-            "{line}"
-        );
+        assert!(line.ends_with(&quote(&format!("/bin/sh -c {}", quote("echo 'hi'")))), "{line}");
     }
 
     #[test]
@@ -180,32 +151,19 @@ mod tests {
         let path = dir.path().join("manymux/hosts.toml");
         let names = vec!["gmktec".to_string(), "mac-mini".to_string()];
         assert!(write_hosts(&path, &names).unwrap());
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "hosts = [\n    \"gmktec\",\n    \"mac-mini\",\n]\n"
-        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hosts = [\n    \"gmktec\",\n    \"mac-mini\",\n]\n");
         assert!(!write_hosts(&path, &names).unwrap(), "unchanged");
         assert_eq!(hosts_toml(&[]), "hosts = [\n]\n");
-        let env: Env = [("MM_CONFIG_DIR".to_string(), "/x".to_string())]
-            .into_iter()
-            .collect();
-        assert_eq!(
-            hosts_file(&env).unwrap(),
-            std::path::Path::new("/x/hosts.toml")
-        );
+        let env: Env = [("MM_CONFIG_DIR".to_string(), "/x".to_string())].into_iter().collect();
+        assert_eq!(hosts_file(&env).unwrap(), std::path::Path::new("/x/hosts.toml"));
     }
 
     #[test]
     fn one_ssh_connection_per_machine_when_there_is_a_runtime_dir() {
-        let env: Env = [("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string())]
-            .into_iter()
-            .collect();
+        let env: Env = [("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string())].into_iter().collect();
         let options = ssh_options(&env).join(" ");
         assert!(options.contains("ControlMaster=auto"), "{options}");
-        assert!(
-            options.contains("ControlPath=/run/user/1000/etd-ssh-%C"),
-            "{options}"
-        );
+        assert!(options.contains("ControlPath=/run/user/1000/etd-ssh-%C"), "{options}");
         assert!(!ssh_options(&Env::new()).join(" ").contains("ControlMaster"));
     }
 }

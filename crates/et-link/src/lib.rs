@@ -58,9 +58,7 @@ impl std::fmt::Display for LinkError {
 impl std::error::Error for LinkError {}
 
 fn invalid(e: impl std::fmt::Display) -> LinkError {
-    LinkError::Invalid {
-        message: e.to_string(),
-    }
+    LinkError::Invalid { message: e.to_string() }
 }
 
 /// Maps a lost connection to a typed error, by etd's close reasons.
@@ -72,9 +70,7 @@ fn closed(e: &ConnectionError) -> LinkError {
         }
         return LinkError::Closed { message: reason };
     }
-    LinkError::Closed {
-        message: e.to_string(),
-    }
+    LinkError::Closed { message: e.to_string() }
 }
 
 /// An anyhow error from et-proto framing: a closed connection if it was one.
@@ -89,16 +85,11 @@ fn stream_error(e: anyhow::Error) -> LinkError {
         if let Some(iroh::endpoint::WriteError::ConnectionLost(c)) = cause.downcast_ref() {
             return closed(c);
         }
-        if let Some(iroh::endpoint::ReadExactError::ReadError(
-            iroh::endpoint::ReadError::ConnectionLost(c),
-        )) = cause.downcast_ref()
-        {
+        if let Some(iroh::endpoint::ReadExactError::ReadError(iroh::endpoint::ReadError::ConnectionLost(c))) = cause.downcast_ref() {
             return closed(c);
         }
     }
-    LinkError::Protocol {
-        message: format!("{e:#}"),
-    }
+    LinkError::Protocol { message: format!("{e:#}") }
 }
 
 /// A new 32-byte device key. Keep it in the Keychain (this device only).
@@ -121,12 +112,7 @@ pub struct TicketInfo {
 pub fn parse_ticket(url: String) -> Result<TicketInfo, LinkError> {
     let t = Ticket::from_url(&url).map_err(invalid)?;
     let relay_url = t.addr.relay_urls().next().map(|u| u.to_string());
-    Ok(TicketInfo {
-        host_name: t.host_name,
-        endpoint_id: t.addr.id.to_string(),
-        relay_url,
-        expires: t.expires,
-    })
+    Ok(TicketInfo { host_name: t.host_name, endpoint_id: t.addr.id.to_string(), relay_url, expires: t.expires })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -148,9 +134,7 @@ impl Link {
     /// Binds the endpoint with the device key from `generate_secret_key`.
     #[uniffi::constructor]
     pub async fn start(secret_key: Vec<u8>) -> Result<Arc<Self>, LinkError> {
-        let bytes: [u8; 32] = secret_key
-            .try_into()
-            .map_err(|_| invalid("the device key must be 32 bytes"))?;
+        let bytes: [u8; 32] = secret_key.try_into().map_err(|_| invalid("the device key must be 32 bytes"))?;
         let transport = QuicTransportConfig::builder()
             .keep_alive_interval(KEEP_ALIVE)
             .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().map_err(invalid)?))
@@ -160,9 +144,7 @@ impl Link {
             .transport_config(transport)
             .bind()
             .await
-            .map_err(|e| LinkError::Unreachable {
-                message: format!("start iroh: {e:#}"),
-            })?;
+            .map_err(|e| LinkError::Unreachable { message: format!("start iroh: {e:#}") })?;
         Ok(Arc::new(Self { endpoint }))
     }
 
@@ -177,18 +159,8 @@ impl Link {
         let ticket = Ticket::from_url(&url).map_err(invalid)?;
         let relay_url = ticket.addr.relay_urls().next().map(|u| u.to_string());
         let host = self.dial(ticket.addr.clone()).await?;
-        match host
-            .call(Request::Pair {
-                secret: ticket.secret,
-                device_name,
-            })
-            .await?
-        {
-            Response::Paired { host_name } => Ok(Paired {
-                host_name,
-                endpoint_id: ticket.addr.id.to_string(),
-                relay_url,
-            }),
+        match host.call(Request::Pair { secret: ticket.secret, device_name }).await? {
+            Response::Paired { host_name } => Ok(Paired { host_name, endpoint_id: ticket.addr.id.to_string(), relay_url }),
             Response::Rejected(message) => Err(LinkError::PairingRefused { message }),
             other => Err(unexpected(other)),
         }
@@ -196,11 +168,7 @@ impl Link {
 
     /// Connects to a paired machine. `relay_url` from `Paired` makes the
     /// first connect quicker; without it the id is looked up.
-    pub async fn connect(
-        &self,
-        endpoint_id: String,
-        relay_url: Option<String>,
-    ) -> Result<Arc<RemoteHost>, LinkError> {
+    pub async fn connect(&self, endpoint_id: String, relay_url: Option<String>) -> Result<Arc<RemoteHost>, LinkError> {
         let id: EndpointId = endpoint_id.parse().map_err(invalid)?;
         let mut addr = EndpointAddr::new(id);
         if let Some(url) = relay_url {
@@ -217,13 +185,7 @@ impl Link {
 
 impl Link {
     async fn dial(&self, addr: EndpointAddr) -> Result<RemoteHost, LinkError> {
-        let conn = self
-            .endpoint
-            .connect(addr, ALPN)
-            .await
-            .map_err(|e| LinkError::Unreachable {
-                message: format!("{e:#}"),
-            })?;
+        let conn = self.endpoint.connect(addr, ALPN).await.map_err(|e| LinkError::Unreachable { message: format!("{e:#}") })?;
         Ok(RemoteHost { conn })
     }
 
@@ -237,9 +199,7 @@ impl Link {
 fn unexpected(response: Response) -> LinkError {
     match response {
         Response::Error(message) => LinkError::Remote { message },
-        other => LinkError::Protocol {
-            message: format!("unexpected answer: {other:?}"),
-        },
+        other => LinkError::Protocol { message: format!("unexpected answer: {other:?}") },
     }
 }
 
@@ -326,23 +286,10 @@ impl RemoteHost {
         match self.call(Request::Hello { app }).await? {
             Response::HostInfo(info) => {
                 let (tmux, tmux_error) = match info.tmux {
-                    et_proto::TmuxStatus::Found(t) => (
-                        Some(TmuxInstall {
-                            path: t.path,
-                            version: t.version,
-                            tmpdir: t.tmpdir,
-                        }),
-                        None,
-                    ),
+                    et_proto::TmuxStatus::Found(t) => (Some(TmuxInstall { path: t.path, version: t.version, tmpdir: t.tmpdir }), None),
                     et_proto::TmuxStatus::NotFound(why) => (None, Some(why)),
                 };
-                Ok(HostInfo {
-                    host_name: info.host_name,
-                    os: info.os,
-                    etd_version: info.etd_version,
-                    tmux,
-                    tmux_error,
-                })
+                Ok(HostInfo { host_name: info.host_name, os: info.os, etd_version: info.etd_version, tmux, tmux_error })
             }
             other => Err(unexpected(other)),
         }
@@ -350,15 +297,9 @@ impl RemoteHost {
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>, LinkError> {
         match self.call(Request::ListSessions).await? {
-            Response::Sessions(list) => Ok(list
-                .into_iter()
-                .map(|s| SessionInfo {
-                    id: s.id,
-                    name: s.name,
-                    windows: s.windows,
-                    attached: s.attached,
-                })
-                .collect()),
+            Response::Sessions(list) => {
+                Ok(list.into_iter().map(|s| SessionInfo { id: s.id, name: s.name, windows: s.windows, attached: s.attached }).collect())
+            }
             other => Err(unexpected(other)),
         }
     }
@@ -366,15 +307,7 @@ impl RemoteHost {
     /// `/bin/sh -c` on the machine; stderr joined to stdout. Replaces `run`.
     pub async fn exec(&self, script: String) -> Result<ExecResult, LinkError> {
         match self.call(Request::Exec { script }).await? {
-            Response::ExecResult {
-                output,
-                exit_code,
-                truncated,
-            } => Ok(ExecResult {
-                output,
-                exit_code,
-                truncated,
-            }),
+            Response::ExecResult { output, exit_code, truncated } => Ok(ExecResult { output, exit_code, truncated }),
             other => Err(unexpected(other)),
         }
     }
@@ -383,58 +316,28 @@ impl RemoteHost {
     /// absolute path written.
     pub async fn upload(&self, path: String, data: Vec<u8>) -> Result<String, LinkError> {
         let (mut send, mut recv) = self.conn.open_bi().await.map_err(|e| closed(&e))?;
-        write_frame(
-            &mut send,
-            &Request::Upload {
-                path,
-                len: data.len() as u64,
-            },
-        )
-        .await
-        .map_err(stream_error)?;
-        send.write_all(&data)
-            .await
-            .map_err(|e| stream_error(e.into()))?;
-        send.finish().map_err(|e| LinkError::Closed {
-            message: e.to_string(),
-        })?;
-        match read_frame::<Response>(&mut recv)
-            .await
-            .map_err(stream_error)?
-        {
+        write_frame(&mut send, &Request::Upload { path, len: data.len() as u64 }).await.map_err(stream_error)?;
+        send.write_all(&data).await.map_err(|e| stream_error(e.into()))?;
+        send.finish().map_err(|e| LinkError::Closed { message: e.to_string() })?;
+        match read_frame::<Response>(&mut recv).await.map_err(stream_error)? {
             Some(Response::Uploaded { path }) => Ok(path),
             Some(other) => Err(unexpected(other)),
-            None => Err(LinkError::Protocol {
-                message: "no answer".into(),
-            }),
+            None => Err(LinkError::Protocol { message: "no answer".into() }),
         }
     }
 
     /// Starts `tmux -C`. Replaces `openControlChannel`.
-    pub async fn open_control(
-        &self,
-        target: ControlTarget,
-    ) -> Result<Arc<ControlStream>, LinkError> {
+    pub async fn open_control(&self, target: ControlTarget) -> Result<Arc<ControlStream>, LinkError> {
         let target = match target {
             ControlTarget::Attach { name } => et_proto::Target::Attach(name),
             ControlTarget::AttachOrCreate { name } => et_proto::Target::AttachOrCreate(name),
         };
         let (mut send, mut recv) = self.conn.open_bi().await.map_err(|e| closed(&e))?;
-        write_frame(&mut send, &Request::Control { target })
-            .await
-            .map_err(stream_error)?;
-        match read_frame::<Response>(&mut recv)
-            .await
-            .map_err(stream_error)?
-        {
-            Some(Response::ControlStarted) => Ok(Arc::new(ControlStream {
-                send: Mutex::new(Some(send)),
-                recv: Mutex::new(recv),
-            })),
+        write_frame(&mut send, &Request::Control { target }).await.map_err(stream_error)?;
+        match read_frame::<Response>(&mut recv).await.map_err(stream_error)? {
+            Some(Response::ControlStarted) => Ok(Arc::new(ControlStream { send: Mutex::new(Some(send)), recv: Mutex::new(recv) })),
             Some(other) => Err(unexpected(other)),
-            None => Err(LinkError::Protocol {
-                message: "no answer".into(),
-            }),
+            None => Err(LinkError::Protocol { message: "no answer".into() }),
         }
     }
 
@@ -451,18 +354,10 @@ impl RemoteHost {
     pub fn path(&self) -> PathInfo {
         let paths = self.conn.paths();
         match paths.iter().find(|p| p.is_selected()) {
-            Some(p) => PathInfo {
-                kind: if p.is_relay() {
-                    PathKind::Relay
-                } else {
-                    PathKind::Direct
-                },
-                rtt_ms: p.rtt().as_secs_f64() * 1000.0,
-            },
-            None => PathInfo {
-                kind: PathKind::None,
-                rtt_ms: 0.0,
-            },
+            Some(p) => {
+                PathInfo { kind: if p.is_relay() { PathKind::Relay } else { PathKind::Direct }, rtt_ms: p.rtt().as_secs_f64() * 1000.0 }
+            }
+            None => PathInfo { kind: PathKind::None, rtt_ms: 0.0 },
         }
     }
 
@@ -472,9 +367,7 @@ impl RemoteHost {
     pub async fn network(&self) -> Result<NetworkInfo, LinkError> {
         match self.call(Request::Network).await? {
             Response::NetworkDoc(signed) => {
-                signed.verify().map_err(|e| LinkError::Protocol {
-                    message: format!("{e:#}"),
-                })?;
+                signed.verify().map_err(|e| LinkError::Protocol { message: format!("{e:#}") })?;
                 let members = signed
                     .network
                     .members()
@@ -484,11 +377,7 @@ impl RemoteHost {
                         is_machine: m.kind == et_proto::network::Kind::Machine,
                     })
                     .collect();
-                Ok(NetworkInfo {
-                    name: signed.network.name.clone(),
-                    key: signed.network.key.to_string(),
-                    members,
-                })
+                Ok(NetworkInfo { name: signed.network.name.clone(), key: signed.network.key.to_string(), members })
             }
             other => Err(unexpected(other)),
         }
@@ -497,11 +386,7 @@ impl RemoteHost {
     /// An invite link (`et://pair?t=…`) for a new device, or with `machine`
     /// for a new machine (`etd join <link>` there). Valid 10 minutes, once.
     pub async fn invite(&self, machine: bool) -> Result<String, LinkError> {
-        let kind = if machine {
-            et_proto::network::Kind::Machine
-        } else {
-            et_proto::network::Kind::Device
-        };
+        let kind = if machine { et_proto::network::Kind::Machine } else { et_proto::network::Kind::Device };
         match self.call(Request::Invite { kind }).await? {
             Response::Invitation { url } => Ok(url),
             other => Err(unexpected(other)),
@@ -512,16 +397,8 @@ impl RemoteHost {
     /// sends no pushes until then. Send it every 20 s while open, to every
     /// machine.
     pub async fn foreground(&self, seconds: u32) -> Result<(), LinkError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        match self
-            .call(Request::Foreground {
-                until: now + u64::from(seconds),
-            })
-            .await?
-        {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        match self.call(Request::Foreground { until: now + u64::from(seconds) }).await? {
             Response::Pong => Ok(()),
             other => Err(unexpected(other)),
         }
@@ -540,24 +417,12 @@ impl RemoteHost {
 impl RemoteHost {
     async fn call(&self, request: Request) -> Result<Response, LinkError> {
         let (mut send, mut recv) = self.conn.open_bi().await.map_err(|e| closed(&e))?;
-        write_frame(&mut send, &request)
-            .await
-            .map_err(stream_error)?;
-        send.finish().map_err(|e| LinkError::Closed {
-            message: e.to_string(),
-        })?;
+        write_frame(&mut send, &request).await.map_err(stream_error)?;
+        send.finish().map_err(|e| LinkError::Closed { message: e.to_string() })?;
         match read_frame::<Response>(&mut recv).await {
             Ok(Some(response)) => Ok(response),
             // etd closes the connection of a device it does not know.
-            Ok(None) => {
-                Err(self
-                    .conn
-                    .close_reason()
-                    .map(|e| closed(&e))
-                    .unwrap_or(LinkError::Protocol {
-                        message: "no answer".into(),
-                    }))
-            }
+            Ok(None) => Err(self.conn.close_reason().map(|e| closed(&e)).unwrap_or(LinkError::Protocol { message: "no answer".into() })),
             Err(e) => Err(stream_error(e)),
         }
     }
@@ -590,28 +455,19 @@ impl ControlStream {
     /// The next event. After `Exit`, or when the stream ends, an error.
     pub async fn next(&self) -> Result<ControlEvent, LinkError> {
         let mut recv = self.recv.lock().await;
-        match read_frame::<ControlFrame>(&mut recv)
-            .await
-            .map_err(stream_error)?
-        {
+        match read_frame::<ControlFrame>(&mut recv).await.map_err(stream_error)? {
             Some(ControlFrame::Stdout(bytes)) => Ok(ControlEvent::Stdout { bytes }),
             Some(ControlFrame::Stderr(line)) => Ok(ControlEvent::Stderr { line }),
             Some(ControlFrame::Exit(code)) => Ok(ControlEvent::Exit { code }),
-            None => Err(LinkError::Closed {
-                message: "control stream ended".into(),
-            }),
+            None => Err(LinkError::Closed { message: "control stream ended".into() }),
         }
     }
 
     /// Bytes for tmux's stdin (commands, each ending in a newline).
     pub async fn write(&self, bytes: Vec<u8>) -> Result<(), LinkError> {
         let mut send = self.send.lock().await;
-        let send = send.as_mut().ok_or_else(|| LinkError::Closed {
-            message: "control stream finished".into(),
-        })?;
-        send.write_all(&bytes)
-            .await
-            .map_err(|e| stream_error(e.into()))
+        let send = send.as_mut().ok_or_else(|| LinkError::Closed { message: "control stream finished".into() })?;
+        send.write_all(&bytes).await.map_err(|e| stream_error(e.into()))
     }
 
     /// Closes tmux's stdin: tmux detaches, the session keeps running. Read
@@ -640,10 +496,7 @@ mod tests {
         assert_eq!(info.host_name, "box");
         assert_eq!(info.endpoint_id, id.to_string());
         assert_eq!(info.relay_url.as_deref(), Some("https://relay.example./"));
-        assert!(matches!(
-            parse_ticket("https://example.com".into()),
-            Err(LinkError::Invalid { .. })
-        ));
+        assert!(matches!(parse_ticket("https://example.com".into()), Err(LinkError::Invalid { .. })));
     }
 
     #[test]

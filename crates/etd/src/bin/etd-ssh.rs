@@ -27,15 +27,12 @@ fn parse(args: &[String]) -> anyhow::Result<(String, Vec<String>)> {
                 break;
             }
             // Options with a value, as ssh has them.
-            "-o" | "-p" | "-l" | "-i" | "-F" | "-J" | "-S" | "-E" | "-b" | "-c" | "-m" | "-O"
-            | "-W" | "-w" => i += 2,
+            "-o" | "-p" | "-l" | "-i" | "-F" | "-J" | "-S" | "-E" | "-b" | "-c" | "-m" | "-O" | "-W" | "-w" => i += 2,
             flag if flag.starts_with('-') => i += 1,
             _ => break,
         }
     }
-    let Some(host) = args.get(i) else {
-        bail!("usage: etd-ssh [options] <machine> [--] <command…>")
-    };
+    let Some(host) = args.get(i) else { bail!("usage: etd-ssh [options] <machine> [--] <command…>") };
     let mut rest = &args[i + 1..];
     if rest.first().is_some_and(|a| a == "--") {
         rest = &rest[1..];
@@ -55,29 +52,13 @@ async fn run() -> anyhow::Result<u8> {
         bail!("etd-ssh runs a command; it does not open a login shell");
     }
     let socket = socket_path(&Paths::from_env()?);
-    let mut stream = UnixStream::connect(&socket).await.with_context(|| {
-        format!(
-            "reach the etd daemon at {} (is etd running?)",
-            socket.display()
-        )
-    })?;
+    let mut stream =
+        UnixStream::connect(&socket).await.with_context(|| format!("reach the etd daemon at {} (is etd running?)", socket.display()))?;
 
     if !is_agent(&command) {
-        send(
-            &mut stream,
-            &Request::ExecOn {
-                host,
-                script: command.join(" "),
-            },
-        )
-        .await?;
-        return match receive::<_, Response>(&mut stream)
-            .await?
-            .context("no answer from etd")?
-        {
-            Response::ExecResult {
-                output, exit_code, ..
-            } => {
+        send(&mut stream, &Request::ExecOn { host, script: command.join(" ") }).await?;
+        return match receive::<_, Response>(&mut stream).await?.context("no answer from etd")? {
+            Response::ExecResult { output, exit_code, .. } => {
                 let mut stdout = tokio::io::stdout();
                 stdout.write_all(&output).await?;
                 stdout.flush().await?;
@@ -89,10 +70,7 @@ async fn run() -> anyhow::Result<u8> {
     }
 
     send(&mut stream, &Request::Agent { host: Some(host) }).await?;
-    match receive::<_, Response>(&mut stream)
-        .await?
-        .context("no answer from etd")?
-    {
+    match receive::<_, Response>(&mut stream).await?.context("no answer from etd")? {
         Response::AgentStarted => {}
         Response::Error(e) => bail!("{e}"),
         other => bail!("unexpected answer: {other:?}"),
@@ -122,9 +100,7 @@ async fn run() -> anyhow::Result<u8> {
                 stdout.flush().await?;
             }
             ControlFrame::Stderr(line) => eprintln!("{line}"),
-            ControlFrame::Exit(code) => {
-                return Ok(code.map(|c| c.clamp(0, 254) as u8).unwrap_or(255))
-            }
+            ControlFrame::Exit(code) => return Ok(code.map(|c| c.clamp(0, 254) as u8).unwrap_or(255)),
         }
     }
     Ok(255)
@@ -151,17 +127,11 @@ mod tests {
 
     #[test]
     fn reads_manymux_command_lines() {
-        let (host, command) = parse(&args(
-            "-T -o ControlMaster=auto -o ControlPath=/x -o BatchMode=yes gmktec -- mm agent",
-        ))
-        .unwrap();
+        let (host, command) = parse(&args("-T -o ControlMaster=auto -o ControlPath=/x -o BatchMode=yes gmktec -- mm agent")).unwrap();
         assert_eq!(host, "gmktec");
         assert!(is_agent(&command));
         let (host, command) = parse(&args("-t mac-mini -- true")).unwrap();
-        assert_eq!(
-            (host.as_str(), command),
-            ("mac-mini", vec!["true".to_string()])
-        );
+        assert_eq!((host.as_str(), command), ("mac-mini", vec!["true".to_string()]));
         let (_, command) = parse(&args("gmktec /home/u/.local/bin/mm agent")).unwrap();
         assert!(is_agent(&command));
         assert!(!is_agent(&args("echo agent")));
