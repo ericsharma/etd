@@ -1,7 +1,7 @@
 //! manymux through etd: sessions on every machine, for Swift.
 //!
-//! Each call opens an etd `Agent` stream, which is `mm agent` on the hub or
-//! `ssh <machine> mm agent` from it. A manymux node answers one request per
+//! Each call opens an etd `Agent` stream, which is `mm agent` on that etd's
+//! machine, or on another machine of the network through it. A manymux node answers one request per
 //! stream, except `Attach` (a live session) and `Events` (a feed).
 //!
 //! On the way down, etd wraps the agent's bytes in `ControlFrame`s; a task
@@ -34,7 +34,7 @@ fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, LinkError> {
 struct Agent {
     send: Mutex<Option<SendStream>>,
     reader: Mutex<FrameReader<DuplexStream>>,
-    /// The agent's stderr (for example an ssh error), for when it ends early.
+    /// The agent's stderr, for when it ends early.
     stderr: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -227,8 +227,8 @@ impl From<mp::HostedEvent> for MmEvent {
     }
 }
 
-/// `machine`: None is the hub (the machine etd runs on), else a name from
-/// `machines()`.
+/// `machine`: None is the machine this etd runs on, else the name of another
+/// machine of the network (reached through this etd).
 #[uniffi::export(async_runtime = "tokio")]
 impl RemoteHost {
     /// The machines the hub's manymux node watches (not the hub itself).
@@ -239,7 +239,7 @@ impl RemoteHost {
         }
     }
 
-    /// `exec` on another machine, over ssh from the hub.
+    /// `exec` on another machine of the network, through this etd.
     pub async fn exec_on(&self, machine: String, script: String) -> Result<ExecResult, LinkError> {
         match self.call(Request::ExecOn { host: machine, script }).await? {
             Response::ExecResult { output, exit_code, truncated } => Ok(ExecResult { output, exit_code, truncated }),

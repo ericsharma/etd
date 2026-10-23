@@ -1,8 +1,9 @@
 //! et-link's manymux API against an in-process etd and a throwaway node.
 //!
 //! Isolation: every `mm` is a wrapper that always passes `--socket <temp>`,
-//! with private `MM_CONFIG_DIR` and `XDG_STATE_HOME`; `ssh` is a stub that
-//! runs the remote command here. The real node is never reached. No paste:
+//! with private `MM_CONFIG_DIR` and `XDG_STATE_HOME`, and `MM_SSH=false`.
+//! "fakehost" is a second etd in the network, on the same node. The real node
+//! is never reached. No paste:
 //! manymux writes pasted files under `/tmp/manymux-<uid>` whatever the socket.
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
@@ -15,6 +16,7 @@ use et_link::{Link, MmAttachment, MmEventKind, MmOutput, MmSpawn, RemoteHost};
 use et_proto::ALPN;
 use etd::config::Paths;
 use etd::server;
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 
@@ -41,13 +43,14 @@ impl Node {
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         script(&bin.join("mm"), &format!("#!/bin/sh\nexec '{}' --socket '{}' \"$@\"\n", real.display(), socket.display()));
-        script(
-            &bin.join("ssh"),
-            "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in --) shift; break;; -o|-p|-l|-i|-F|-J|-S) shift 2;; -*) shift;; *) break;; esac; done\n\
-             shift\n[ \"$1\" = -- ] && shift\n[ $# -eq 0 ] && exit 0\nexec /bin/sh -c \"$*\"\n",
-        );
-        let child =
-            Command::new(bin.join("mm")).args(["daemon", "--no-notify"]).envs(Self::env_of(dir.path())).env_remove("TMUX").spawn().unwrap();
+        let child = Command::new(bin.join("mm"))
+            .args(["daemon", "--no-notify"])
+            .envs(Self::env_of(dir.path()))
+            // The node never reaches the machine it watches (fakehost).
+            .env("MM_SSH", "false")
+            .env_remove("TMUX")
+            .spawn()
+            .unwrap();
         for _ in 0..100 {
             if socket.exists() {
                 break;
@@ -108,29 +111,39 @@ async fn manymux_through_et_link() {
         return;
     };
     let node = Node::start(&real);
-    let add = Command::new(node.dir.path().join("bin/mm"))
-        .args(["add", "fakehost"])
-        .envs(node.env())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
-    assert!(add.status.success(), "mm add: {}", String::from_utf8_lossy(&add.stderr));
+    // The node watches "fakehost" (for `machines`). By hand: `mm add` would
+    // check it over ssh first.
+    std::fs::create_dir_all(node.dir.path().join("config")).unwrap();
+    std::fs::write(node.dir.path().join("config/hosts.toml"), "hosts = [\"fakehost\"]\n").unwrap();
 
     let home = tempfile::tempdir().unwrap();
     let mut env: etd::tmux::Env = std::env::vars().filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE").collect();
     env.extend(node.env());
     env.insert("HOME".into(), home.path().display().to_string());
-    env.remove("XDG_RUNTIME_DIR"); // no ssh ControlMaster with the stub
 
-    let files = tempfile::tempdir().unwrap();
-    let paths = Paths::at(files.path().into());
-    let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
-    etd::network::ensure(&paths, endpoint.id(), "hub").unwrap();
-    let _router = server::serve(endpoint.clone(), server::State::new(paths.clone(), env));
+    // Two etds on the same node: "hub", and "fakehost" in its network.
+    let book = MemoryLookup::new();
+    let start = |name: &'static str, env: etd::tmux::Env| {
+        let book = book.clone();
+        async move {
+            let files = tempfile::tempdir().unwrap();
+            let paths = Paths::at(files.path().into());
+            let endpoint =
+                Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).address_lookup(book.clone()).bind().await.unwrap();
+            let port = endpoint.bound_sockets().iter().find(|a| a.is_ipv4()).unwrap().port();
+            let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+            book.add_endpoint_info(addr.clone());
+            etd::network::ensure(&paths, endpoint.id(), name).unwrap();
+            let router = server::serve(endpoint.clone(), server::State::new(paths.clone(), env));
+            (endpoint, paths, addr, files, router)
+        }
+    };
+    let (endpoint, paths, addr, _files, _router) = start("hub", env.clone()).await;
+    let (fake, fake_paths, _, _fake_files, _fake_router) = start("fakehost", env).await;
+    let invite = etd::pair::invite_url(&paths, &addr, "hub", et_proto::network::Kind::Machine).unwrap();
+    etd::network::join(&fake, &fake_paths, &invite, "fakehost").await.unwrap();
     let phone = SecretKey::generate();
     etd::network::admit(&paths, endpoint.id(), phone.public(), "phone", et_proto::network::Kind::Device).unwrap();
-    let port = endpoint.bound_sockets().iter().find(|a| a.is_ipv4()).unwrap().port();
-    let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
     let url = etd::pair::create(&paths, addr, "hub".into(), et_proto::network::Kind::Device).unwrap().to_url().unwrap();
     let link = Link::from_endpoint(Endpoint::builder(presets::Minimal).secret_key(phone).bind().await.unwrap());
     let paired = link.pair(url, "phone".into()).await.unwrap();
@@ -162,7 +175,7 @@ async fn manymux_through_et_link() {
         }
     }
 
-    // The same node through the ssh path, as "fakehost".
+    // The same node through the network, as "fakehost".
     host.mm_spawn(Some("fakehost".into()), spawn("printf '\\a'; echo peekme; sleep 30", "t2")).await.unwrap();
     assert!(names(&host, Some("fakehost".into())).await.contains(&"t2".to_string()));
     tokio::time::sleep(Duration::from_millis(500)).await;

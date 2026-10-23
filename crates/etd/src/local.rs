@@ -1,12 +1,12 @@
-//! The local socket: how `etd-ssh` (manymux's `MM_SSH`) reaches the other
-//! machines of the network through this machine's etd, which keeps its iroh
-//! connections open. The socket is in etd's state directory, mode 0600, so
-//! only this user can use it.
-//!
-//! The same et/1 frames as over iroh, with two requests:
+//! Requests for another machine of the network, sent on through this
+//! machine's etd, which keeps its iroh connections open ([`forward`]):
 //! - `Agent { host: Some(name) }`: a pipe to `mm agent` on the machine
 //!   `name`. After `AgentStarted`, `ControlFrame`s come back and raw bytes go.
 //! - `ExecOn { host: name, script }`: `Exec` on that machine.
+//!
+//! They come from the local socket (`etd-ssh`, manymux's `MM_SSH`), with the
+//! same et/1 frames as over iroh, or from a member over iroh. The socket is
+//! in etd's state directory, mode 0600, so only this user can use it.
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -56,7 +56,7 @@ pub async fn receive<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> an
 
 /// Open iroh connections to other machines, reused across requests.
 #[derive(Debug, Default)]
-struct Connections(Mutex<HashMap<EndpointId, Connection>>);
+pub struct Connections(Mutex<HashMap<EndpointId, Connection>>);
 
 /// A machine that is off must not hold `etd-ssh` up for long.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -77,7 +77,7 @@ impl Connections {
 }
 
 /// Serves the local socket until the task is dropped.
-pub async fn serve(endpoint: Endpoint, paths: Paths) -> anyhow::Result<()> {
+pub async fn serve(endpoint: Endpoint, paths: Paths, connections: Arc<Connections>) -> anyhow::Result<()> {
     let path = socket_path(&paths);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -86,7 +86,6 @@ pub async fn serve(endpoint: Endpoint, paths: Paths) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).with_context(|| format!("listen on {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    let connections = Arc::new(Connections::default());
     loop {
         let (stream, _) = listener.accept().await?;
         let (endpoint, paths, connections) = (endpoint.clone(), paths.clone(), connections.clone());
@@ -116,78 +115,97 @@ async fn handle(mut stream: UnixStream, endpoint: &Endpoint, paths: &Paths, conn
     let Some(request) = receive::<_, Request>(&mut stream).await? else {
         return Ok(());
     };
+    let (rx, tx) = stream.into_split();
+    forward(request, rx, tx, endpoint, paths, connections).await
+}
+
+/// Sends `request` (`Agent { host: Some }` or `ExecOn`) on to that machine,
+/// and its answer back on `tx`; for an agent, then the pipe: frames down,
+/// raw bytes from `rx` up.
+pub async fn forward<R, W>(
+    request: Request,
+    mut rx: R,
+    mut tx: W,
+    endpoint: &Endpoint,
+    paths: &Paths,
+    connections: &Connections,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin,
+{
     let (host, remote) = match request {
         Request::Agent { host: Some(host) } => (host, Request::Agent { host: None }),
         Request::ExecOn { host, script } => (host, Request::Exec { script }),
         other => {
-            send(&mut stream, &Response::Error(format!("not a local request: {other:?}"))).await?;
-            return Ok(());
+            send(&mut tx, &Response::Error(format!("not a request for another machine: {other:?}"))).await?;
+            return Ok(tx.shutdown().await?);
         }
     };
     let id = match machine(paths, endpoint.id(), &host) {
         Ok(id) => id,
         Err(e) => {
-            send(&mut stream, &Response::Error(format!("{e:#}"))).await?;
-            return Ok(());
+            send(&mut tx, &Response::Error(format!("{e:#}"))).await?;
+            return Ok(tx.shutdown().await?);
         }
     };
     let is_agent = matches!(remote, Request::Agent { .. });
     let opened = async {
         let conn = connections.to(endpoint, id).await?;
-        let (mut tx, mut rx) = conn.open_bi().await?;
-        write_frame(&mut tx, &remote).await?;
+        let (mut up, mut down) = conn.open_bi().await?;
+        write_frame(&mut up, &remote).await?;
         if !is_agent {
-            tx.finish()?;
+            up.finish()?;
         }
-        let reply = read_frame::<Response>(&mut rx).await?.context("no answer")?;
-        anyhow::Ok((tx, rx, reply))
+        let reply = read_frame::<Response>(&mut down).await?.context("no answer")?;
+        anyhow::Ok((up, down, reply))
     }
     .await;
-    let (mut tx, mut rx, reply) = match opened {
+    let (mut up, mut down, reply) = match opened {
         Ok(opened) => opened,
         Err(e) => {
-            send(&mut stream, &Response::Error(format!("{host}: {e:#}"))).await?;
-            return Ok(());
+            send(&mut tx, &Response::Error(format!("{host}: {e:#}"))).await?;
+            return Ok(tx.shutdown().await?);
         }
     };
     let started = matches!(reply, Response::AgentStarted);
-    send(&mut stream, &reply).await?;
+    send(&mut tx, &reply).await?;
     if !started {
-        return Ok(());
+        return Ok(tx.shutdown().await?);
     }
     // The pipe: frames down as they come, raw bytes up.
-    let (mut local_rx, mut local_tx) = stream.into_split();
-    let up = tokio::spawn(async move {
+    let pump = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            match local_rx.read(&mut buf).await {
+            match rx.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if tx.write_all(&buf[..n]).await.is_err() {
+                    if up.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
             }
         }
-        let _ = tx.finish();
+        let _ = up.finish();
     });
-    while let Some(frame) = read_frame::<ControlFrame>(&mut rx).await? {
+    while let Some(frame) = read_frame::<ControlFrame>(&mut down).await? {
         let last = matches!(frame, ControlFrame::Exit(_));
-        if send(&mut local_tx, &frame).await.is_err() {
+        if send(&mut tx, &frame).await.is_err() {
             break;
         }
         if last {
             break;
         }
     }
-    up.abort();
+    pump.abort();
+    let _ = tx.shutdown().await;
     Ok(())
 }
 
 /// Starts the socket server next to the daemon; errors are logged.
-pub fn spawn(endpoint: Endpoint, paths: Paths) -> tokio::task::JoinHandle<()> {
+pub fn spawn(endpoint: Endpoint, paths: Paths, connections: Arc<Connections>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = serve(endpoint, paths).await {
+        if let Err(e) = serve(endpoint, paths, connections).await {
             warn!("local socket: {e:#}");
         }
     })

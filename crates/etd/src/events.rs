@@ -1,11 +1,10 @@
 //! Pushes from manymux (PLAN-network §4.6). Each etd follows its own
-//! machine's node. For a session that wants someone while nobody is attached:
-//! - its own session: run the push command here, if this machine has one,
-//!   and send `Notify` to the other machines of the network (a machine with
-//!   a push command runs it, the others ignore it);
-//! - a machine this node reaches by ssh that is NOT in the network (the setup
-//!   before N6): run the push command here, since no etd there reports it;
-//! - a machine in the network: skip; its own etd reports it.
+//! machine's node. For its own session that wants someone while nobody is
+//! attached, it runs the push command here, if this machine has one, and
+//! sends `Notify` to the other machines of the network (a machine with a push
+//! command runs it, the others ignore it). Events of other machines (a node
+//! also reports the machines it watches) are skipped: their own etd reports
+//! them.
 //!
 //! The push command (`$ETD_NOTIFY_COMMAND`) runs through `/bin/sh -c` with the
 //! login environment and `ETD_KIND` (`bell`, `notify`, `exit`), `ETD_MACHINE`
@@ -49,13 +48,10 @@ pub fn note(event: &mp::HostedEvent) -> Option<Note> {
 pub enum Route {
     /// This machine's session: push here and tell the other machines.
     Own(Note),
-    /// A machine reached by ssh that is not in the network: push here only.
-    Legacy(Note),
     Skip,
 }
 
-/// Where one event goes. The node names its own machine by its host name,
-/// and watched machines by the name they were added with.
+/// Where one event goes. The node names its own machine by its host name.
 pub fn route(event: &mp::HostedEvent, host_name: &str, network: Option<&Network>, me: EndpointId) -> Route {
     let Some(mut note) = note(event) else {
         return Route::Skip;
@@ -66,10 +62,7 @@ pub fn route(event: &mp::HostedEvent, host_name: &str, network: Option<&Network>
         }
         return Route::Own(note);
     }
-    if network.is_some_and(|n| n.machines().any(|m| m.name == event.host)) {
-        return Route::Skip;
-    }
-    Route::Legacy(note)
+    Route::Skip
 }
 
 /// Runs the push command for `note`, unless there is none or the app is open.
@@ -179,7 +172,6 @@ async fn follow_once(state: &Arc<State>) -> anyhow::Result<()> {
                     forward(&state, &note).await;
                 });
             }
-            Route::Legacy(note) => deliver(state, &note).await,
             Route::Skip => {}
         }
     }
@@ -233,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn routes_own_legacy_and_network_machines() {
+    fn routes_own_and_skips_other_machines() {
         let key = iroh::SecretKey::generate();
         let me = iroh::SecretKey::generate().public();
         let gmktec = iroh::SecretKey::generate().public();
@@ -243,9 +235,7 @@ mod tests {
             Route::Own(n) => assert_eq!(n.machine, "mac-mini"),
             other => panic!("{other:?}"),
         }
-        // gmktec reached by ssh, not in the network: this etd pushes for it.
-        assert!(matches!(route(&event("gmktec", mp::EventKind::Bell, 0), "m1-mini", Some(&net), me), Route::Legacy(_)));
-        // Once gmktec is in the network, its own etd does.
+        // Another machine's event: its own etd reports it.
         net.set(gmktec, Member::Member { name: "gmktec".into(), kind: Kind::Machine }, me);
         assert_eq!(route(&event("gmktec", mp::EventKind::Bell, 0), "m1-mini", Some(&net), me), Route::Skip);
         assert_eq!(route(&event("m1-mini", mp::EventKind::Bell, 1), "m1-mini", Some(&net), me), Route::Skip);

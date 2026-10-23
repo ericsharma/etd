@@ -100,7 +100,7 @@ Any request can get `Error(message)` instead.
 
 `Agent { host: None }` runs `mm agent` on etd's machine. The app then speaks [manymux](https://github.com/rayfish/manymux)'s own protocol through the pipe; etd does not read it. A manymux node answers one request per stream, except `Attach` and `Events`, so the app opens many short `Agent` streams.
 
-In a network, the app connects to each machine's etd and uses `Agent { host: None }` there. `Agent { host: Some(name) }` and `ExecOn` are for a machine that is *not* in the network but that etd's machine reaches with `ssh <name> mm agent` (it must be in `Machines`, the output of `mm hosts`; other names are refused before any ssh). They go away when nothing needs them.
+In a network, the app connects to each machine's etd and uses `Agent { host: None }` there. `Agent { host: Some(name) }` and `ExecOn` reach the machine of the network called `name` through this etd (as `etd-ssh` does); other names are refused. etd never runs ssh. `Machines` is the output of `mm hosts`.
 
 ### Pushes (`Notify`, `Foreground`)
 

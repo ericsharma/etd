@@ -52,6 +52,9 @@ pub struct State {
     notify: OnceLock<String>,
     /// Until when (Unix seconds) each device said the app is open.
     foreground: Mutex<HashMap<EndpointId, u64>>,
+    /// Connections to the other machines, for requests sent on to them
+    /// (`etd-ssh`, and `Agent`/`ExecOn` for another machine).
+    connections: Arc<local::Connections>,
 }
 
 /// The longest a single `Foreground` holds pushes back.
@@ -67,6 +70,7 @@ impl State {
             tries: Mutex::default(),
             notify: OnceLock::new(),
             foreground: Mutex::default(),
+            connections: Arc::default(),
         })
     }
 
@@ -174,9 +178,10 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
         info!("no manymux (mm) here: no pushes for manymux sessions from this machine");
     }
     let status_path = state.paths.status();
+    let connections = state.connections.clone();
     let watcher = tokio::spawn(watch(endpoint.clone(), state, tmux_text));
     // etd-ssh (manymux's MM_SSH) reaches the other machines through this.
-    let local = local::spawn(endpoint.clone(), state_paths.clone());
+    let local = local::spawn(endpoint.clone(), state_paths.clone(), connections);
     if tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await.is_err() {
         warn!("no relay after {ONLINE_TIMEOUT:?}; direct connections only until it comes up");
     }
@@ -430,11 +435,13 @@ async fn serve_stream(state: &State, peer: EndpointId, kind: Kind, mut send: Sen
         Request::Pair { .. } => Response::Paired { host_name: tmux::host_name() },
         Request::Exec { script } => ops::exec(&state.env, &script).await,
         Request::Upload { path, len } => ops::upload(&state.env, &path, len, &mut recv).await,
-        Request::Agent { host } => return agent(state, host, send, recv).await,
-        Request::ExecOn { host, script } => match mm::check_host(&state.env, &host).await {
-            Ok(()) => ops::exec(&state.env, &mm::exec_on_script(&state.env, &host, &script)).await,
-            Err(e) => Response::Error(format!("{e:#}")),
-        },
+        Request::Agent { host: None } => {
+            return pipe(state, mm::agent_local(&state.env), Response::AgentStarted, "mm agent on this machine", send, recv).await
+        }
+        // Another machine of the network: sent on over iroh.
+        request @ (Request::Agent { host: Some(_) } | Request::ExecOn { .. }) => {
+            return local::forward(request, recv, send, state.endpoint(), &state.paths, &state.connections).await
+        }
         Request::Join { .. } => Response::Error("already a member of this network".into()),
         Request::Network => match network::load(&state.paths) {
             Ok(Some(signed)) => {
@@ -521,24 +528,6 @@ async fn control(state: &State, target: Target, mut send: SendStream, recv: Recv
     // TERM=et-ios marks E.T.'s control clients (#{client_termname}).
     cmd.env("TERM", "et-ios");
     pipe(state, cmd, Response::ControlStarted, &format!("tmux -C {target:?}"), send, recv).await
-}
-
-/// `mm agent` here, or `ssh <host> mm agent` for a machine the node watches.
-/// etd does not read the manymux protocol; it only moves the bytes.
-async fn agent(state: &State, host: Option<String>, mut send: SendStream, recv: RecvStream) -> anyhow::Result<()> {
-    let label = format!("mm agent on {}", host.as_deref().unwrap_or("this machine"));
-    let cmd = match host {
-        None => mm::agent_local(&state.env),
-        Some(host) => match mm::check_host(&state.env, &host).await {
-            Ok(()) => mm::agent_remote(&state.env, &host),
-            Err(e) => {
-                write_frame(&mut send, &Response::Error(format!("{e:#}"))).await?;
-                send.finish()?;
-                return Ok(());
-            }
-        },
-    };
-    pipe(state, cmd, Response::AgentStarted, &label, send, recv).await
 }
 
 /// Runs `cmd` with its stdin fed from the phone, and its stdout and stderr

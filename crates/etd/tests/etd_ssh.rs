@@ -136,7 +136,7 @@ async fn manymux_over_etd_ssh() {
     network::join(&gmktec.endpoint, &gmktec.paths, &url, "gmktec").await.unwrap();
 
     let socket = local::socket_path(&hub.paths);
-    let _local = local::spawn(hub.endpoint.clone(), hub.paths.clone());
+    let _local = local::spawn(hub.endpoint.clone(), hub.paths.clone(), Default::default());
     for _ in 0..50 {
         if socket.exists() {
             break;

@@ -1,18 +1,20 @@
 //! `Agent`, `ExecOn` and `Machines` against a throwaway manymux node.
 //!
 //! Isolation: every `mm` here is a wrapper that always passes
-//! `--socket <temp>`, with `MM_CONFIG_DIR=<temp>`, and `ssh` is a stub that
-//! runs the remote command on this machine. The real node
-//! (`/tmp/manymux-<uid>`) and the real machines are never reached.
+//! `--socket <temp>`, with `MM_CONFIG_DIR=<temp>`. The node's `MM_SSH` is
+//! `false`. The real node (`/tmp/manymux-<uid>`) and the real machines are
+//! never reached. "fakehost" is a second etd in the network, on the same node.
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
+use et_proto::network::Kind;
 use et_proto::{read_frame, write_frame, ControlFrame, Request, Response, ALPN};
 use etd::config::Paths;
-use etd::server;
+use etd::{network, pair, server};
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{presets, Connection};
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 
@@ -47,22 +49,13 @@ impl Node {
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         script(&bin.join("mm"), &format!("#!/bin/sh\nexec '{}' --socket '{}' \"$@\"\n", real.display(), socket.display()));
-        // ssh <options> [--] <host> [command…]: run the command here.
-        script(
-            &bin.join("ssh"),
-            &format!(
-                "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in --) shift; break;; -o|-p|-l|-i|-F|-J|-S) shift 2;; -*) shift;; *) break;; esac; done\n\
-                 echo \"$1\" >> '{}'\nshift\n[ \"$1\" = -- ] && shift\n[ $# -eq 0 ] && exit 0\nexec /bin/sh -c \"$*\"\n",
-                dir.path().join("ssh.log").display()
-            ),
-        );
         let child = Command::new(bin.join("mm"))
             .args(["daemon", "--no-notify"])
             .env("MM_CONFIG_DIR", dir.path().join("config"))
             // The node logs to $XDG_STATE_HOME/manymux: keep it out of the real one.
             .env("XDG_STATE_HOME", dir.path().join("state"))
-            // The node reaches watched machines with `ssh`: the stub.
-            .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+            // The node never reaches the machine it watches (fakehost).
+            .env("MM_SSH", "false")
             .env_remove("TMUX")
             .spawn()
             .unwrap();
@@ -74,10 +67,6 @@ impl Node {
         }
         assert!(socket.exists(), "test node did not start");
         Self { dir, child }
-    }
-
-    fn ssh_log(&self) -> String {
-        std::fs::read_to_string(self.dir.path().join("ssh.log")).unwrap_or_default()
     }
 }
 
@@ -127,6 +116,22 @@ async fn agent_list(conn: &Connection, host: Option<&str>) -> Result<manymux::pr
     }
 }
 
+fn local_addr(endpoint: &Endpoint) -> EndpointAddr {
+    let port = endpoint.bound_sockets().iter().find(|a| a.is_ipv4()).unwrap().port();
+    EndpointAddr::new(endpoint.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+}
+
+/// An etd called `name` with `env`, reachable through `book`.
+async fn etd_on(book: &MemoryLookup, name: &str, env: etd::tmux::Env) -> (Endpoint, tempfile::TempDir, iroh::protocol::Router) {
+    let files = tempfile::tempdir().unwrap();
+    let paths = Paths::at(files.path().into());
+    let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).address_lookup(book.clone()).bind().await.unwrap();
+    book.add_endpoint_info(local_addr(&endpoint));
+    network::ensure(&paths, endpoint.id(), name).unwrap();
+    let router = server::serve(endpoint.clone(), server::State::new(paths, env));
+    (endpoint, files, router)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn manymux_through_etd() {
     let Some(real) = real_mm() else {
@@ -135,15 +140,10 @@ async fn manymux_through_etd() {
     };
     let node = Node::start(&real);
 
-    // The node watches one machine, "fakehost", reached through the stub.
-    let add = Command::new(node.bin().join("mm"))
-        .args(["add", "fakehost"])
-        .env("MM_CONFIG_DIR", node.config())
-        .env("PATH", format!("{}:{}", node.bin().display(), std::env::var("PATH").unwrap()))
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
-    assert!(add.status.success(), "mm add: {}", String::from_utf8_lossy(&add.stderr));
+    // The node watches one machine, "fakehost" (for `Machines`). Written
+    // by hand: `mm add` would check it over ssh first.
+    std::fs::create_dir_all(node.config()).unwrap();
+    std::fs::write(node.config().join("hosts.toml"), "hosts = [\"fakehost\"]\n").unwrap();
 
     let home = tempfile::tempdir().unwrap();
     let mut env: etd::tmux::Env = std::env::vars().filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE").collect();
@@ -151,22 +151,22 @@ async fn manymux_through_etd() {
     env.insert("MM_CONFIG_DIR".into(), node.config().display().to_string());
     env.insert("HOME".into(), home.path().display().to_string());
 
-    let files = tempfile::tempdir().unwrap();
-    let paths = Paths::at(files.path().into());
-    let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
-    etd::network::ensure(&paths, endpoint.id(), "hub").unwrap();
-    let state = server::State::new(paths.clone(), env);
-    let _router = server::serve(endpoint.clone(), state);
+    // Two etds on the same node: "hub", and "fakehost" in its network.
+    let book = MemoryLookup::new();
+    let (hub, hub_files, _hub_router) = etd_on(&book, "hub", env.clone()).await;
+    let (fake, fake_files, _fake_router) = etd_on(&book, "fakehost", env).await;
+    let hub_paths = Paths::at(hub_files.path().into());
+    let url = pair::invite_url(&hub_paths, &local_addr(&hub), "hub", Kind::Machine).unwrap();
+    network::join(&fake, &Paths::at(fake_files.path().into()), &url, "fakehost").await.unwrap();
     let phone = SecretKey::generate();
-    etd::network::admit(&paths, endpoint.id(), phone.public(), "phone", et_proto::network::Kind::Device).unwrap();
-    let port = endpoint.bound_sockets().iter().find(|a| a.is_ipv4()).unwrap().port();
-    let addr = EndpointAddr::new(endpoint.id()).with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+    network::admit(&hub_paths, hub.id(), phone.public(), "phone", Kind::Device).unwrap();
     let client = Endpoint::builder(presets::Minimal).secret_key(phone).bind().await.unwrap();
-    let conn = client.connect(addr, ALPN).await.unwrap();
+    let conn = client.connect(local_addr(&hub), ALPN).await.unwrap();
 
     assert_eq!(call(&conn, Request::Machines).await, Response::Machines(vec!["fakehost".into()]));
 
-    // This machine's node, and fakehost's (the same test node, through ssh).
+    // This machine's node, and fakehost's (the same test node, through the
+    // network).
     for host in [None, Some("fakehost")] {
         match agent_list(&conn, host).await {
             Ok(manymux::proto::Response::Sessions(list)) => {
@@ -175,10 +175,8 @@ async fn manymux_through_etd() {
             other => panic!("{host:?}: {other:?}"),
         }
     }
-    assert!(node.ssh_log().lines().any(|h| h == "fakehost"), "ssh was not used: {:?}", node.ssh_log());
 
-    // A machine the node does not watch is refused before any ssh.
-    let before = node.ssh_log();
+    // A name that is not a machine of the network is refused.
     match agent_list(&conn, Some("evil.example")).await {
         Err(Response::Error(e)) => assert!(e.contains("not a machine"), "{e}"),
         other => panic!("{other:?}"),
@@ -187,7 +185,6 @@ async fn manymux_through_etd() {
         Response::Error(e) => assert!(e.contains("not a machine"), "{e}"),
         other => panic!("{other:?}"),
     }
-    assert_eq!(node.ssh_log(), before, "a refused host must not reach ssh");
 
     // ExecOn: quoting survives, stderr is joined, the exit code comes back.
     match call(&conn, Request::ExecOn { host: "fakehost".into(), script: "echo $((1+2)); echo 'it'\"'\"'s' >&2; exit 4".into() }).await {

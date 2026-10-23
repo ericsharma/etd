@@ -52,13 +52,14 @@ pub enum Request {
         path: String,
         len: u64,
     },
-    /// A pipe to `mm agent` (manymux): on this machine (`None`), or through
-    /// `ssh <host> mm agent` for a machine in `Machines`. After `AgentStarted`
-    /// the stream carries `ControlFrame`s down and raw bytes up, as `Control`.
+    /// A pipe to `mm agent` (manymux): on this machine (`None`), or on the
+    /// machine of the network called `host`, through this one. After
+    /// `AgentStarted` the stream carries `ControlFrame`s down and raw bytes
+    /// up, as `Control`.
     Agent {
         host: Option<String>,
     },
-    /// `Exec` on a machine in `Machines`, through `ssh <host> /bin/sh -c`.
+    /// `Exec` on the machine of the network called `host`, through this one.
     ExecOn {
         host: String,
         script: String,
