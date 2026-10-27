@@ -2,6 +2,7 @@
 //! and typing into a session (`type_into`). For the app, etd only starts
 //! `mm agent` and moves the bytes. Other machines are reached through the
 //! network (local.rs).
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -29,6 +30,23 @@ pub async fn machines(env: &Env) -> anyhow::Result<Vec<String>> {
         bail!("mm hosts: {}: {}", output.status, String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&output.stdout).lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
+}
+
+/// Where this machine's node listens: manymux's own path, the same from every
+/// login (manymux `config::runtime_dir`). `ETD_MM_SOCKET` moves it, for tests
+/// whose `mm` passes its own `--socket`.
+pub fn node_socket(env: &Env) -> PathBuf {
+    match env.get("ETD_MM_SOCKET") {
+        Some(socket) => socket.into(),
+        // SAFETY: getuid has no preconditions and cannot fail.
+        None => format!("/tmp/manymux-{}/manymux.sock", unsafe { libc::getuid() }).into(),
+    }
+}
+
+/// A node answers on this machine's socket. `mm agent` starts a node when
+/// none does; etd asks this first, so the node stays the user's service's.
+pub async fn node_running(env: &Env) -> bool {
+    tokio::net::UnixStream::connect(node_socket(env)).await.is_ok()
 }
 
 /// `mm` is on the login environment's PATH.

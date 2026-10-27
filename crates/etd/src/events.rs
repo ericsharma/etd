@@ -134,6 +134,12 @@ async fn forward(state: &State, note: &Note) {
 
 /// Follows this machine's node until the feed ends. Errors say why.
 async fn follow_once(state: &Arc<State>) -> anyhow::Result<()> {
+    // `mm agent` starts a node when none answers. That node is not the user's
+    // service, which then finds its socket taken and restarts forever (seen
+    // after `etd install`, which starts etd first). Wait for the node instead.
+    if !mm::node_running(state.env()).await {
+        bail!("no manymux node yet");
+    }
     let mut child = mm::agent_local(state.env())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -60,6 +60,7 @@ impl Node {
             ("PATH".into(), format!("{}:{}", dir.join("bin").display(), std::env::var("PATH").unwrap())),
             ("MM_CONFIG_DIR".into(), dir.join("config").display().to_string()),
             ("XDG_STATE_HOME".into(), dir.join("state").display().to_string()),
+            ("ETD_MM_SOCKET".into(), dir.join("mm.sock").display().to_string()),
         ]
     }
 

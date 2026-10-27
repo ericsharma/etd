@@ -208,6 +208,7 @@ async fn bells_run_the_notify_command() {
     env.insert("PATH".into(), format!("{}:{}", node.bin().display(), env["PATH"]));
     env.insert("MM_CONFIG_DIR".into(), node.config().display().to_string());
     env.insert("XDG_STATE_HOME".into(), node.dir.path().join("state").display().to_string());
+    env.insert("ETD_MM_SOCKET".into(), node.dir.path().join("mm.sock").display().to_string());
     let command = format!("echo \"$ETD_KIND|$ETD_SESSION|$ETD_BODY\" >> '{}'", notes.display());
     // A machine alone in its network: its own session's bell is pushed here.
     let files = tempfile::tempdir().unwrap();
@@ -238,4 +239,35 @@ async fn bells_run_the_notify_command() {
     }
     follower.abort();
     assert!(seen.contains("bell|ringer|"), "notes: {seen:?}");
+}
+
+/// With no node running, etd waits for one and starts none: a node started by
+/// `mm agent` takes the socket from the user's service, which then restarts
+/// forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_follower_starts_no_node() {
+    let Some(real) = real_mm() else {
+        eprintln!("skipped: no `mm` on PATH");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("mm.sock");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    script(&bin.join("mm"), &format!("#!/bin/sh\nexec '{}' --socket '{}' \"$@\"\n", real.display(), socket.display()));
+    let mut env: etd::tmux::Env = std::env::vars().filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE").collect();
+    env.insert("PATH".into(), format!("{}:{}", bin.display(), env["PATH"]));
+    env.insert("MM_CONFIG_DIR".into(), dir.path().join("config").display().to_string());
+    env.insert("XDG_STATE_HOME".into(), dir.path().join("state").display().to_string());
+    env.insert("ETD_MM_SOCKET".into(), socket.display().to_string());
+    let files = tempfile::tempdir().unwrap();
+    let state = server::State::new(Paths::at(files.path().into()), env.clone());
+    let follower = tokio::spawn(etd::events::follow(state));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    follower.abort();
+    let started = socket.exists();
+    if started {
+        let _ = Command::new(bin.join("mm")).arg("stop").envs(env.iter()).status();
+    }
+    assert!(!started, "the follower started a node");
 }

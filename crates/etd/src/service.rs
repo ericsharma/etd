@@ -186,8 +186,7 @@ fn ensure_mm() -> anyhow::Result<PathBuf> {
 
 /// A manymux node answers on the default socket.
 fn node_running() -> bool {
-    let socket = PathBuf::from(format!("/tmp/manymux-{}/manymux.sock", uid()));
-    UnixStream::connect(socket).is_ok()
+    UnixStream::connect(crate::mm::node_socket(&Default::default())).is_ok()
 }
 
 /// manymux's machine list, if it already lists machines. etd manages the list
