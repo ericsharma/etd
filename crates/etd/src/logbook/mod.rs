@@ -11,6 +11,7 @@ pub mod claude;
 pub mod send;
 pub mod serve;
 pub mod store;
+pub mod watcher;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -63,6 +64,8 @@ pub struct Local {
     appended: Arc<Notify>,
     /// The archives' names, and when they were found.
     names: std::sync::Mutex<Option<(Instant, Vec<String>)>>,
+    /// Reports (watcher.rs).
+    pub(crate) watcher: Arc<watcher::Watcher>,
 }
 
 /// `LogArchives` answers from the capture's last look if it is this fresh.

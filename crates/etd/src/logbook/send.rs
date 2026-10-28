@@ -19,7 +19,7 @@ pub struct Turn {
 }
 
 /// The text blocks of a message's content.
-fn text_of(content: &Value) -> String {
+pub(super) fn text_of(content: &Value) -> String {
     match content {
         Value::String(s) => s.trim().to_string(),
         Value::Array(blocks) => blocks

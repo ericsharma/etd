@@ -26,6 +26,9 @@ usage:
   etd files                    list the files sent to every machine of the network
   etd logbook                  show what the Logbook sends from here (and keeps, on an archive)
   etd logbook archive on|off   make this machine keep the AI agents' transcripts of the network
+  etd logbook report [--refresh]
+                               show the last progress report of an archive; --refresh makes
+                               a new one with claude -p (1 to 3 min)
   etd status [--json]          show the daemon's id, addresses, and connected members
   etd id                       print this machine's endpoint id
   etd pair [--url]             the same as `etd invite` (a device)
@@ -174,6 +177,35 @@ fn ago(secs: u64) -> String {
         3600..86400 => format!("{}h", ago / 3600),
         _ => format!("{}d", ago / 86400),
     }
+}
+
+/// `etd logbook report [--refresh]`: the report in short.
+async fn logbook_report(paths: &Paths, refresh: bool) -> anyhow::Result<()> {
+    if !etd::logbook::settings(paths).archive {
+        bail!("not a Logbook archive (etd logbook archive on)");
+    }
+    let env = tmux::login_env().await;
+    let Some(r) = etd::logbook::watcher::cli(paths, &env, refresh).await? else {
+        println!("No report yet: etd logbook report --refresh");
+        return Ok(());
+    };
+    println!("Report {}, {}: {} project(s)", r.id, ago(r.taken), r.projects.len());
+    for p in &r.projects {
+        println!("\n{} [{}] ({})\n  goal: {}\n  {}", p.name, p.id, p.status, p.goal, p.progress);
+        for m in &p.sessions {
+            println!("  - {}: {}", m.key, m.role);
+        }
+        for step in &p.next {
+            println!("  next: {step}");
+        }
+    }
+    if !r.unassigned.is_empty() {
+        println!("\nunassigned: {}", r.unassigned.join(", "));
+    }
+    for p in &r.proposals {
+        println!("\nproposal ({}): {}\n  why: {}", p.kind, p.detail, p.why);
+    }
+    Ok(())
 }
 
 /// `etd logbook`: what this machine sends, and what it keeps if it is an
@@ -338,6 +370,8 @@ async fn main() -> anyhow::Result<()> {
         ["send", rest @ ..] if rest.len() >= 2 => send(&paths, rest).await,
         ["files"] => files(&paths).await,
         ["logbook"] => logbook_status(&paths),
+        ["logbook", "report"] => logbook_report(&paths, false).await,
+        ["logbook", "report", "--refresh"] => logbook_report(&paths, true).await,
         ["logbook", "archive", on @ ("on" | "off")] => {
             let archive = *on == "on";
             etd::logbook::save_settings(&paths, &etd::logbook::Settings { archive })?;

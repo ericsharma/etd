@@ -559,8 +559,8 @@ async fn serve_stream(
             return logbook::serve::follow(state, &machine, &session_id, from, send, recv).await
         }
         Request::LogPause { machine, mm_session, paused } => logbook::serve::pause(state, &machine, &mm_session, paused).await,
-        Request::Report { refresh } => logbook::serve::report(refresh),
-        Request::Grouping { .. } => Response::Error("Logbook grouping is not built yet (PLAN-logbook L3)".into()),
+        Request::Report { refresh } => return logbook::watcher::serve(state, refresh, send).await,
+        Request::Grouping { change_json } => logbook::watcher::grouping(state, &change_json).await,
         Request::LogSend { selection, to, session } => return log_send(state, selection, &to, session, send).await,
     };
     write_frame(&mut send, &reply).await?;

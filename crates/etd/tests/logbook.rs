@@ -41,7 +41,14 @@ impl Machine {
         let endpoint = Endpoint::builder(presets::Minimal).alpns(vec![ALPN.to_vec()]).address_lookup(book.clone()).bind().await.unwrap();
         book.add_endpoint_info(local_addr(&endpoint));
         network::ensure(&paths, endpoint.id(), name).unwrap();
-        let env = [("HOME".to_string(), dir.path().display().to_string())].into_iter().collect();
+        // The watcher's `claude -p` is a script (`fake_claude`).
+        let env = [
+            ("HOME".to_string(), dir.path().display().to_string()),
+            ("PATH".to_string(), std::env::var("PATH").unwrap_or_default()),
+            ("ETD_WATCHER_COMMAND".to_string(), dir.path().join("claude").display().to_string()),
+        ]
+        .into_iter()
+        .collect();
         let router = server::serve(endpoint.clone(), server::State::new(paths.clone(), env));
         Self { endpoint, paths, _dir: dir, _router: router }
     }
@@ -283,4 +290,59 @@ async fn the_apps_read_the_archive() {
     up.finish().unwrap();
     let Some(Response::Delivered { paths, .. }) = read_frame::<Response>(&mut down).await.unwrap() else { panic!("delivered") };
     assert!(std::fs::read_to_string(&paths[0]).unwrap().contains("Why does CI fail?"));
+
+    // Refresh the report: progress, then the report.
+    fake_claude(trigkey._dir.path(), &format!("gmktec/{id}"));
+    let (mut up, mut down) = conn.open_bi().await.unwrap();
+    write_frame(&mut up, &Request::Report { refresh: true }).await.unwrap();
+    up.finish().unwrap();
+    let mut stages = Vec::new();
+    let json = loop {
+        match next(&mut down).await {
+            Some(Response::ReportProgress { stage, done, total }) => stages.push(format!("{stage} {done}/{total}")),
+            Some(Response::Report { json }) => break json,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert!(stages.contains(&"Report 0/1".to_string()), "{stages:?}");
+    let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(report["projects"][0]["sessions"][0]["key"], format!("gmktec/{id}"));
+    let report_id = report["id"].as_str().unwrap().to_string();
+
+    // The owner renames the project; the last report shows it at once.
+    let rename = r#"{"decision":"edit","kind":"rename","name":"Green CI","project":"ci"}"#;
+    assert_eq!(ask(&conn, Request::Grouping { change_json: rename.into() }).await, Response::Pong);
+    assert!(matches!(ask(&conn, Request::Grouping { change_json: "{}".into() }).await, Response::Error(_)));
+    let Response::Report { json } = ask(&conn, Request::Report { refresh: false }).await else { panic!("a report") };
+    assert!(json.contains(r#""name":"Green CI""#), "{json}");
+
+    // Send the project's card into gmktec.
+    let selection = LogSelection::ReportSection { report_id, project_id: "ci".into() };
+    let (mut up, mut down) = conn.open_bi().await.unwrap();
+    write_frame(&mut up, &Request::LogSend { selection, to: "gmktec".into(), session: String::new() }).await.unwrap();
+    up.finish().unwrap();
+    let paths = loop {
+        match read_frame::<Response>(&mut down).await.unwrap() {
+            Some(Response::Progress { .. }) => continue,
+            Some(Response::Delivered { paths, .. }) => break paths,
+            other => panic!("{other:?}"),
+        }
+    };
+    let doc = std::fs::read_to_string(&paths[0]).unwrap();
+    assert!(doc.starts_with("# From the Logbook report: Green CI") && doc.contains("gmktec/claude (Fix the build): works"), "{doc}");
+}
+
+/// A stand-in for `claude -p` (the archive's `ETD_WATCHER_COMMAND`): a
+/// digest, or a report with one project that holds `key`.
+fn fake_claude(dir: &Path, key: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let report = format!(
+        r#"{{\"projects\":[{{\"id\":\"ci\",\"name\":\"CI\",\"goal\":\"green CI\",\"status\":\"active\",\"sessions\":[{{\"key\":\"{key}\",\"role\":\"works\"}}],\"progress\":\"ok\",\"next\":[]}}]}}"#
+    );
+    let script = format!(
+        "#!/bin/sh\ncase \"$(cat)\" in\n  *\"progress report of the owner\"*) printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"{report}\"}}' ;;\n  *) printf '%s' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"Goal: green CI\"}}' ;;\nesac\n"
+    );
+    let path = dir.join("claude");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }

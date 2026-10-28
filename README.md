@@ -48,6 +48,7 @@ Run the install script on the new machine, then run the printed `etd join <link>
 | `etd status [--json]` | Show the daemon's id, addresses and connected members |
 | `etd logbook` | Show which AI agent transcripts this machine sends to the Logbook archive (and keeps, on an archive) |
 | `etd logbook archive on\|off` | Make this machine keep the transcripts of the AI agents in every machine's manymux sessions |
+| `etd logbook report [--refresh]` | On an archive: show the last progress report of the Logbook; `--refresh` makes a new one with `claude -p` (1 to 3 min) |
 | `etd` | Run the daemon in the foreground, with no service |
 
 ## Security

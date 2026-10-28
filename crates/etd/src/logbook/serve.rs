@@ -1,9 +1,10 @@
 //! The Logbook's reading side, for the apps (PLAN-logbook §4.2): which
 //! machines are archives, the list of transcripts, a transcript followed
-//! live, "do not record", and sending a part of a transcript into a session.
+//! live, "do not record", and sending a part of a transcript or of a report
+//! into a session (reports: watcher.rs).
 use std::time::Duration;
 
-use et_proto::logbook::{LogSelection, NO_REPORT};
+use et_proto::logbook::LogSelection;
 use et_proto::{write_frame, Response};
 use iroh::endpoint::{RecvStream, SendStream};
 use tracing::{debug, info};
@@ -63,14 +64,6 @@ pub async fn pause(state: &State, machine: &str, mm_session: &str, paused: bool)
             Response::Pong
         }
         Err(e) => Response::Error(format!("{e:#}")),
-    }
-}
-
-/// `Report`, until the watcher (L3): no report yet.
-pub fn report(refresh: bool) -> Response {
-    match refresh {
-        false => Response::Report { json: NO_REPORT.into() },
-        true => Response::Error("the Logbook report is not built yet (PLAN-logbook L3)".into()),
     }
 }
 
@@ -155,6 +148,9 @@ pub async fn markdown(state: &State, selection: &LogSelection) -> anyhow::Result
             let short: String = session_id.chars().take(8).collect();
             Ok((format!("logbook-{machine}-{short}-{}.md", config::now_secs()), doc))
         }
-        LogSelection::ReportSection { .. } => anyhow::bail!("reports are not built yet (PLAN-logbook L3)"),
+        LogSelection::ReportSection { report_id, project_id } => {
+            let entries: Vec<store::Entry> = state.logbook().get(state.paths()).await?.lock().await.entries().cloned().collect();
+            super::watcher::section(&state.paths().logbook(), &entries, report_id, project_id)
+        }
     }
 }
