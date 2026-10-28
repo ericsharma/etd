@@ -16,7 +16,9 @@ use iroh::endpoint::{presets, ConnectionError, QuicTransportConfig, RecvStream, 
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use tokio::sync::Mutex;
 
+mod logbook;
 mod mm;
+pub use logbook::*;
 pub use mm::*;
 
 uniffi::setup_scaffolding!();
@@ -254,6 +256,9 @@ pub struct NetworkInfo {
     /// The network key (the network's id).
     pub key: String,
     pub members: Vec<NetworkMember>,
+    /// The Logbook archives (machine names), the one to use first. Empty:
+    /// none, or the machine did not say.
+    pub archive: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -482,7 +487,8 @@ impl RemoteHost {
                         is_machine: m.kind == et_proto::network::Kind::Machine,
                     })
                     .collect();
-                Ok(NetworkInfo { name: signed.network.name.clone(), key: signed.network.key.to_string(), members })
+                let archive = self.archive_names().await;
+                Ok(NetworkInfo { name: signed.network.name.clone(), key: signed.network.key.to_string(), members, archive })
             }
             other => Err(unexpected(other)),
         }

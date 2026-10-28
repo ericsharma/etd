@@ -157,6 +157,48 @@ pub enum Request {
         offset: u64,
         bytes: Vec<u8>,
     },
+    /// The Logbook archives of the network, as this machine sees them (any
+    /// member): `Machines([name])`, the one to use first.
+    LogArchives,
+    /// Logbook, to an archive (any member): the transcripts that changed at
+    /// or after `since` (Unix seconds; 0: all). `LogList`.
+    LogSessions {
+        since: u64,
+    },
+    /// Logbook, to an archive (any member): the archive's copy of a
+    /// transcript from byte `from` (from the next line start, if `from` is
+    /// inside a line), as `LogChunk` frames, then new lines as they come,
+    /// until the asker finishes its side.
+    LogRead {
+        machine: String,
+        session_id: String,
+        from: u64,
+    },
+    /// Logbook, to an archive (any member): record a manymux session of a
+    /// machine, or not. `Pong`.
+    LogPause {
+        machine: String,
+        mm_session: String,
+        paused: bool,
+    },
+    /// Logbook, to an archive (any member): the last report (`refresh`
+    /// false), or a new one (`ReportProgress` frames first). `Report`.
+    Report {
+        refresh: bool,
+    },
+    /// Logbook, to an archive (any member): the owner accepts or edits a
+    /// report's proposal (JSON). `Pong`.
+    Grouping {
+        change_json: String,
+    },
+    /// Logbook, to an archive (any member): the selection as a Markdown
+    /// file to the machine `to`, typed into `session` there (empty: not
+    /// typed). `Progress` frames, then `Delivered`.
+    LogSend {
+        selection: logbook::LogSelection,
+        to: String,
+        session: String,
+    },
 }
 
 /// A file or folder delivered to a machine (`Shared`).
@@ -257,6 +299,24 @@ pub enum Response {
     /// The source offset the archive has for that transcript: send from here.
     LogAck {
         offset: u64,
+    },
+    LogList(Vec<logbook::LogEntry>),
+    /// Whole lines of a transcript; `offset`: the byte after them. `live`:
+    /// the bytes the archive had when `LogRead` came are all sent (true on
+    /// the chunk that reaches their end, or on an empty chunk).
+    LogChunk {
+        offset: u64,
+        bytes: Vec<u8>,
+        live: bool,
+    },
+    ReportProgress {
+        stage: String,
+        done: u32,
+        total: u32,
+    },
+    /// The report as JSON (PLAN-logbook §4.4, with "id" and "taken").
+    Report {
+        json: String,
     },
 }
 

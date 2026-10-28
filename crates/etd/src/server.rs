@@ -553,6 +553,15 @@ async fn serve_stream(
         Request::LogAppend { session_id, meta, offset, bytes } => {
             logbook::append(&state.paths, &state.logbook, &member_name(state, peer), &session_id, meta, offset, &bytes).await
         }
+        Request::LogArchives => logbook::serve::archive_names(state).await,
+        Request::LogSessions { since } => logbook::serve::sessions(state, since).await,
+        Request::LogRead { machine, session_id, from } => {
+            return logbook::serve::follow(state, &machine, &session_id, from, send, recv).await
+        }
+        Request::LogPause { machine, mm_session, paused } => logbook::serve::pause(state, &machine, &mm_session, paused).await,
+        Request::Report { refresh } => logbook::serve::report(refresh),
+        Request::Grouping { .. } => Response::Error("Logbook grouping is not built yet (PLAN-logbook L3)".into()),
+        Request::LogSend { selection, to, session } => return log_send(state, selection, &to, session, send).await,
     };
     write_frame(&mut send, &reply).await?;
     send.finish()?;
@@ -653,6 +662,52 @@ async fn share(state: &State, path: &str, to: &str, session: Option<String>, mut
     }
     .await;
     let reply = shared.unwrap_or_else(|e| Response::Error(format!("{e:#}")));
+    write_frame(&mut send, &reply).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// `LogSend`: a part of a transcript as a Markdown file on the machine `to`,
+/// typed into `session` there (empty: not typed). As `Share`.
+async fn log_send(
+    state: &State,
+    selection: et_proto::logbook::LogSelection,
+    to: &str,
+    session: String,
+    mut send: SendStream,
+) -> anyhow::Result<()> {
+    let me = member_name(state, state.endpoint().id());
+    let session = Some(session).filter(|s| !s.is_empty());
+    let sent = async {
+        let (name, doc) = logbook::serve::markdown(state, &selection).await?;
+        if to == me {
+            let dir = files::downloads(&state.env)?;
+            std::fs::create_dir_all(&dir)?;
+            let path = dir.join(name);
+            std::fs::write(&path, doc)?;
+            let paths = vec![path.display().to_string()];
+            let typed = match session {
+                Some(session) => {
+                    mm::type_into(&state.env, &session, &mm::typed_paths(&paths)).await?;
+                    true
+                }
+                None => false,
+            };
+            return Ok(Response::Delivered { paths, typed });
+        }
+        // Sent from a temporary copy: the target keeps the file.
+        let dir = state.paths.state.join("logbook-send");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(name);
+        std::fs::write(&path, doc)?;
+        let delivered =
+            local::send_files(state.endpoint(), &state.paths, &state.connections, std::slice::from_ref(&path), to, session, &mut send)
+                .await;
+        let _ = std::fs::remove_file(&path);
+        delivered
+    }
+    .await;
+    let reply = sent.unwrap_or_else(|e| Response::Error(format!("{e:#}")));
     write_frame(&mut send, &reply).await?;
     send.finish()?;
     Ok(())

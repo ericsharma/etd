@@ -27,6 +27,36 @@ pub struct LogMeta {
     pub previous: Option<String>,
 }
 
+/// One transcript on an archive (`LogSessions`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEntry {
+    /// The network's name for the source machine.
+    pub machine: String,
+    pub session_id: String,
+    pub meta: LogMeta,
+    /// The size of the archive's copy: offsets for `LogRead` are in it.
+    pub bytes: u64,
+    /// Unix seconds: when the archive first and last heard of it.
+    pub first: u64,
+    pub last: u64,
+    /// Its manymux session is not recorded ("do not record").
+    pub paused: bool,
+    /// The agent's own title for it (Claude's last `ai-title` line).
+    pub title: Option<String>,
+}
+
+/// What `LogSend` sends.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LogSelection {
+    /// Exchanges of one transcript, by the uuid of each prompt.
+    Turns { machine: String, session_id: String, turn_ids: Vec<String> },
+    /// One project of a report (L3).
+    ReportSection { report_id: String, project_id: String },
+}
+
+/// The answer to `Report { refresh: false }` before the first report.
+pub const NO_REPORT: &str = r#"{"id":null,"taken":0,"projects":[],"unassigned":[],"proposals":[]}"#;
+
 /// A transcript id: an agent's session id. Also its file name on the
 /// archive, so only letters, digits, `-` and `_`.
 pub fn valid_session_id(id: &str) -> bool {

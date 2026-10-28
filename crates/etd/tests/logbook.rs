@@ -168,3 +168,119 @@ async fn transcripts_go_to_the_archive() {
     assert_eq!(entry.meta.cwd, cwd);
     assert_eq!(entry.offset, std::fs::metadata(&transcript).unwrap().len());
 }
+
+/// The next frame of a stream, within 10 s.
+async fn next(down: &mut iroh::endpoint::RecvStream) -> Option<et_proto::Response> {
+    tokio::time::timeout(Duration::from_secs(10), et_proto::read_frame(down)).await.expect("a frame in time").unwrap()
+}
+
+/// One et/1 request and its first answer.
+async fn ask(conn: &iroh::endpoint::Connection, request: et_proto::Request) -> et_proto::Response {
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    et_proto::write_frame(&mut send, &request).await.unwrap();
+    send.finish().unwrap();
+    et_proto::read_frame(&mut recv).await.unwrap().expect("an answer")
+}
+
+/// What the apps do (PLAN-logbook §4.5): find the archive, list, follow a
+/// transcript live, pause, and send exchanges into another machine.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_apps_read_the_archive() {
+    use et_proto::logbook::LogSelection;
+    use et_proto::{read_frame, write_frame, Request, Response};
+
+    let book = MemoryLookup::new();
+    let trigkey = Machine::start("trigkey", &book).await;
+    let gmktec = Machine::start("gmktec", &book).await;
+    let url = pair::invite_url(&trigkey.paths, &local_addr(&trigkey.endpoint), "trigkey", Kind::Machine).unwrap();
+    network::join(&gmktec.endpoint, &gmktec.paths, &url, "gmktec").await.unwrap();
+    logbook::save_settings(&trigkey.paths, &Settings { archive: true }).unwrap();
+    let env: etd::tmux::Env = std::env::vars().collect();
+    let net = Net { endpoint: gmktec.endpoint.clone(), connections: Arc::default(), me: "gmktec".into() };
+    let (archives, _) = logbook::archives(&gmktec.paths, &Default::default(), &net).await;
+
+    // The agent is the session's leader here (as `ws` starts claude).
+    let agent = Proc(Command::new("sleep").arg("60").spawn().unwrap());
+    let sessions = vec![("claude".to_string(), agent.0.id())];
+    let claude = tempfile::tempdir().unwrap();
+    let id = "23eba963-d720-4ef2-be81-4c77fa6c9f7b";
+    std::fs::create_dir_all(claude.path().join("sessions")).unwrap();
+    std::fs::create_dir_all(claude.path().join("projects/-home-eric")).unwrap();
+    let pid = agent.0.id();
+    std::fs::write(
+        claude.path().join(format!("sessions/{pid}.json")),
+        format!(r#"{{"pid":{pid},"sessionId":"{id}","cwd":"/tmp","status":"busy"}}"#),
+    )
+    .unwrap();
+    let transcript = claude.path().join(format!("projects/-home-eric/{id}.jsonl"));
+    let first = r#"{"type":"user","uuid":"p1","message":{"role":"user","content":"Why does CI fail?"}}"#;
+    let reply = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"nixfmt."}]}}"#;
+    let title = r#"{"type":"ai-title","aiTitle":"Fix the build"}"#;
+    std::fs::write(&transcript, format!("{first}\n{reply}\n{title}\n")).unwrap();
+    let mut capture = Capture::new(vec![Box::new(Claude::at(claude.path().into()))], env);
+    let none_paused = HashSet::new();
+    capture.tick(&sessions, &archives, &net, &none_paused).await;
+
+    // A device would do the same; gmktec's endpoint is a member too.
+    let conn = gmktec.endpoint.connect(local_addr(&trigkey.endpoint), ALPN).await.unwrap();
+    assert_eq!(ask(&conn, Request::LogArchives).await, Response::Machines(vec!["trigkey".into()]));
+    let Response::LogList(list) = ask(&conn, Request::LogSessions { since: 0 }).await else { panic!("a list") };
+    assert_eq!(list.len(), 1);
+    assert_eq!(
+        (list[0].machine.as_str(), list[0].meta.mm_session.as_str(), list[0].title.as_deref()),
+        ("gmktec", "claude", Some("Fix the build"))
+    );
+    let stored = list[0].bytes;
+    assert_eq!(ask(&conn, Request::Report { refresh: false }).await, Response::Report { json: et_proto::logbook::NO_REPORT.into() });
+
+    // Follow from inside the first line: it starts at the second; the
+    // stored bytes come in one chunk, which says "live".
+    let (mut up, mut down) = conn.open_bi().await.unwrap();
+    write_frame(&mut up, &Request::LogRead { machine: "gmktec".into(), session_id: id.into(), from: 5 }).await.unwrap();
+    let Some(Response::LogChunk { offset, bytes, live }) = next(&mut down).await else { panic!("a chunk") };
+    assert_eq!(String::from_utf8(bytes.clone()).unwrap(), format!("{reply}\n{title}\n"));
+    assert_eq!((offset, offset - bytes.len() as u64, live), (stored, first.len() as u64 + 1, true));
+    // A new line on gmktec arrives at once (the append wakes the follower).
+    let later = r#"{"type":"user","uuid":"p2","message":{"role":"user","content":"Deploy it."}}"#;
+    append(&transcript, &format!("{later}\n"));
+    capture.tick(&sessions, &archives, &net, &none_paused).await;
+    let Some(Response::LogChunk { bytes, live, .. }) = next(&mut down).await else { panic!("a live chunk") };
+    assert_eq!((String::from_utf8(bytes).unwrap(), live), (format!("{later}\n"), true));
+    // The app closes its side: the archive ends the stream.
+    up.finish().unwrap();
+    assert_eq!(next(&mut down).await, None);
+
+    // Do not record: the archive drops the lines even before gmktec knows.
+    assert_eq!(ask(&conn, Request::LogPause { machine: "gmktec".into(), mm_session: "claude".into(), paused: true }).await, Response::Pong);
+    append(&transcript, "{\"secret\":\"hunter2\"}\n");
+    capture.tick(&sessions, &archives, &net, &none_paused).await;
+    assert!(!archived(&trigkey, id).contains("hunter2"));
+    let Response::LogList(list) = ask(&conn, Request::LogSessions { since: 0 }).await else { panic!("a list") };
+    assert!(list[0].paused);
+
+    // Send the first exchange into gmktec (not typed: no session given).
+    let selection = LogSelection::Turns { machine: "gmktec".into(), session_id: id.into(), turn_ids: vec!["p1".into()] };
+    let (mut up, mut down) = conn.open_bi().await.unwrap();
+    write_frame(&mut up, &Request::LogSend { selection: selection.clone(), to: "gmktec".into(), session: String::new() }).await.unwrap();
+    up.finish().unwrap();
+    let paths = loop {
+        match read_frame::<Response>(&mut down).await.unwrap() {
+            Some(Response::Progress { .. }) => continue,
+            Some(Response::Delivered { paths, typed }) => {
+                assert!(!typed);
+                break paths;
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    assert!(paths[0].starts_with(&gmktec._dir.path().join("etd-downloads").display().to_string()), "{paths:?}");
+    let doc = std::fs::read_to_string(&paths[0]).unwrap();
+    assert!(doc.contains("# From the Logbook: gmktec/claude") && doc.contains("Why does CI fail?") && doc.contains("nixfmt."), "{doc}");
+    assert!(!doc.contains("Deploy it."), "only the chosen exchange");
+    // To the archive itself.
+    let (mut up, mut down) = conn.open_bi().await.unwrap();
+    write_frame(&mut up, &Request::LogSend { selection, to: "trigkey".into(), session: String::new() }).await.unwrap();
+    up.finish().unwrap();
+    let Some(Response::Delivered { paths, .. }) = read_frame::<Response>(&mut down).await.unwrap() else { panic!("delivered") };
+    assert!(std::fs::read_to_string(&paths[0]).unwrap().contains("Why does CI fail?"));
+}

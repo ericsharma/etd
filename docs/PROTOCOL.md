@@ -84,6 +84,13 @@ etd reads the peer's `EndpointId` from the connection and looks it up in the net
 | 23 | `Unshare { path }` | member | `Pong` | — |
 | 24 | `LogInfo` | member | `LogInfo { archive, paused }` | — |
 | 25 | `LogAppend { session_id, meta, offset, bytes }` | machine | `LogAck { offset }` | — |
+| 26 | `LogArchives` | member | `Machines([name])` | — |
+| 27 | `LogSessions { since }` | member (archive) | `LogList([LogEntry])` | — |
+| 28 | `LogRead { machine, session_id, from }` | member (archive) | `LogChunk { offset, bytes, live }` frames | until the asker finishes its side |
+| 29 | `LogPause { machine, mm_session, paused }` | member (archive) | `Pong` | — |
+| 30 | `Report { refresh }` | member (archive) | `ReportProgress` frames, then `Report { json }` | — |
+| 31 | `Grouping { change_json }` | member (archive) | `Pong` | — |
+| 32 | `LogSend { selection, to, session }` | member (archive) | `Progress` frames, then `Delivered` | — |
 
 Any request can get `Error(message)` instead.
 
@@ -140,7 +147,7 @@ The push command runs through `/bin/sh -c` with `ETD_KIND` (`bell`, `notify`, `e
 
 `Foreground { until }` (Unix seconds, at most 2 minutes ahead): the app is open; this machine runs no push command until then. The app sends it every 20 s to every machine while it is in the foreground.
 
-### Logbook (`LogInfo`, `LogAppend`)
+### Logbook (`LogInfo`, `LogAppend`, and the apps' requests 26–32)
 
 Each etd sends the transcripts of the AI agents (Claude Code) that run in its manymux sessions to the archive machines of the network. A machine is an archive after `etd logbook archive on` (`logbook.json`). The other machines ask each machine with `LogInfo`, at start and every minute. With no archive, nothing is read or sent.
 
@@ -149,6 +156,12 @@ Each etd sends the transcripts of the AI agents (Claude Code) that run in its ma
 - `meta` (`LogMeta`): `agent`, `mm_session`, `cwd`, `repo` (the `origin` URL, else the repository root), `branch`, `status` (`busy`, `idle`, or `gone`), `previous` (the transcript before it in the same manymux session).
 - `LogInfo.paused`: the asker's manymux sessions that the archive does not record. The source skips their new lines (a gap); the lines never leave the machine.
 - An archive keeps `logbook/<machine>/<session id>.jsonl` (mode 0600) and `index.json` in etd's data directory.
+- `LogArchives`: the archives this machine found (its own name first if it is one), from its last look (at most 90 s old), else asked now.
+- `LogSessions { since }`: the transcripts that changed at or after `since` (lines, state, pause). `LogEntry`: `machine`, `session_id`, `meta`, `bytes` (the size of the archive's copy), `first`, `last`, `paused`, `title` (Claude's last `ai-title`).
+- `LogRead`: offsets are in the archive's copy. A `from` inside a line starts at the next line. Whole lines, about 1 MB per chunk; `offset` is the byte after the chunk. `live` is true on the chunk that reaches the end of the bytes stored when the request came (or on an empty chunk, when they ended at a chunk's end), and on all later chunks. New lines come as they arrive. The asker ends the follow by finishing its side.
+- `LogPause`: the archive drops new lines of that session at once (one gap line per batch); its source stops sending them within a minute (`LogInfo.paused`).
+- `Report` and `Grouping`: the watcher (PLAN-logbook L3). Until then `Report { refresh: false }` answers `{"id":null,…}` and the rest answer `Error`.
+- `LogSend`: `Turns { machine, session_id, turn_ids }` (the `uuid` of each prompt) becomes a Markdown file (each prompt and Claude's text replies; no tool output) in `~/etd-downloads/` of the machine `to`, typed into `session` there (empty: not typed).
 
 ## The local socket (`etd-ssh`)
 

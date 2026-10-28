@@ -19,7 +19,7 @@ use et_proto::{read_frame, write_frame, Request, Response};
 use iroh::{Endpoint, EndpointId};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
 use super::claude::{Live, Reader};
@@ -44,8 +44,8 @@ const MAX_DEPTH: usize = 64;
 /// Where transcripts go.
 #[derive(Debug, Clone)]
 pub enum Archive {
-    /// This machine is an archive.
-    Here(Arc<Mutex<Store>>),
+    /// This machine is an archive. `appended` wakes its `LogRead` followers.
+    Here { store: Arc<Mutex<Store>>, appended: Arc<Notify> },
     /// Another machine of the network. `paused`: this machine's manymux
     /// sessions it does not record.
     There { id: EndpointId, name: String, paused: HashSet<String> },
@@ -54,14 +54,14 @@ pub enum Archive {
 impl Archive {
     pub fn name<'a>(&'a self, me: &'a str) -> &'a str {
         match self {
-            Archive::Here(_) => me,
+            Archive::Here { .. } => me,
             Archive::There { name, .. } => name,
         }
     }
 
     fn paused(&self, session: &str, here: &HashSet<String>) -> bool {
         match self {
-            Archive::Here(_) => here.contains(session),
+            Archive::Here { .. } => here.contains(session),
             Archive::There { paused, .. } => paused.contains(session),
         }
     }
@@ -120,20 +120,25 @@ pub fn owner(pid: u32, leaders: &HashMap<u32, String>, parents: &HashMap<u32, u3
 /// A line longer than `BATCH` comes whole (up to `LONGEST`). Empty: no
 /// whole line yet.
 pub fn whole_lines(path: &Path, from: u64) -> std::io::Result<Vec<u8>> {
+    lines_from(path, from, BATCH)
+}
+
+/// `whole_lines` with at most about `max` bytes (`max` < `LONGEST`).
+pub fn lines_from(path: &Path, from: u64, max: usize) -> std::io::Result<Vec<u8>> {
     let mut file = fs::File::open(path)?;
     file.seek(SeekFrom::Start(from))?;
     let mut buf = Vec::new();
-    (&mut file).take(BATCH as u64).read_to_end(&mut buf)?;
+    (&mut file).take(max as u64).read_to_end(&mut buf)?;
     if let Some(end) = buf.iter().rposition(|&b| b == b'\n') {
         buf.truncate(end + 1);
         return Ok(buf);
     }
-    if buf.len() < BATCH {
+    if buf.len() < max {
         return Ok(Vec::new());
     }
     // One long line: read on to its end.
     let mut rest = Vec::new();
-    (&mut file).take((LONGEST - BATCH) as u64).read_to_end(&mut rest)?;
+    (&mut file).take(LONGEST.saturating_sub(max) as u64).read_to_end(&mut rest)?;
     match rest.iter().position(|&b| b == b'\n') {
         Some(end) => buf.extend_from_slice(&rest[..=end]),
         None if buf.len() + rest.len() >= LONGEST => buf.extend_from_slice(&rest),
@@ -377,7 +382,11 @@ fn ends_with_newline(path: &Path, size: u64) -> bool {
 /// One `LogAppend`; the archive's offset.
 async fn append(archive: &Archive, net: &Net, id: &str, meta: &LogMeta, offset: u64, bytes: Vec<u8>) -> anyhow::Result<u64> {
     match archive {
-        Archive::Here(store) => store.lock().await.append(&net.me, id, meta.clone(), offset, &bytes, config::now_secs()),
+        Archive::Here { store, appended } => {
+            let reached = store.lock().await.append(&net.me, id, meta.clone(), offset, &bytes, config::now_secs())?;
+            appended.notify_waiters();
+            Ok(reached)
+        }
         Archive::There { id: machine, .. } => {
             let request = Request::LogAppend { session_id: id.into(), meta: meta.clone(), offset, bytes };
             let asked = async {

@@ -8,17 +8,19 @@
 //! and nothing is sent.
 pub mod capture;
 pub mod claude;
+pub mod send;
+pub mod serve;
 pub mod store;
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use et_proto::logbook::LogMeta;
 use et_proto::{read_frame, write_frame, Request, Response};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, Notify, OnceCell};
 use tracing::{debug, info, warn};
 
 use crate::config::{self, Paths};
@@ -52,14 +54,32 @@ pub fn save_settings(paths: &Paths, settings: &Settings) -> anyhow::Result<()> {
     config::write_json(&paths.logbook_settings(), settings)
 }
 
-/// This machine's archive, opened at first use.
+/// This machine's archive, opened at first use, and what the capture last
+/// found out about the network's archives.
 #[derive(Debug, Default)]
-pub struct Local(OnceCell<Arc<Mutex<Store>>>);
+pub struct Local {
+    store: OnceCell<Arc<Mutex<Store>>>,
+    /// Woken at each append, for `LogRead` followers.
+    appended: Arc<Notify>,
+    /// The archives' names, and when they were found.
+    names: std::sync::Mutex<Option<(Instant, Vec<String>)>>,
+}
+
+/// `LogArchives` answers from the capture's last look if it is this fresh.
+const NAMES_FRESH: Duration = Duration::from_secs(90);
 
 impl Local {
     pub async fn get(&self, paths: &Paths) -> anyhow::Result<Arc<Mutex<Store>>> {
         let dir = paths.logbook();
-        self.0.get_or_try_init(|| async move { Ok(Arc::new(Mutex::new(Store::open(&dir)?))) }).await.cloned()
+        self.store.get_or_try_init(|| async move { Ok(Arc::new(Mutex::new(Store::open(&dir)?))) }).await.cloned()
+    }
+
+    fn set_names(&self, names: Vec<String>) {
+        *self.names.lock().unwrap() = Some((Instant::now(), names));
+    }
+
+    fn fresh_names(&self) -> Option<Vec<String>> {
+        self.names.lock().unwrap().as_ref().filter(|(when, _)| when.elapsed() < NAMES_FRESH).map(|(_, names)| names.clone())
     }
 }
 
@@ -81,7 +101,10 @@ pub async fn append(paths: &Paths, local: &Local, from: &str, session_id: &str, 
     }
     let appended = async { local.get(paths).await?.lock().await.append(from, session_id, meta, offset, bytes, config::now_secs()) };
     match appended.await {
-        Ok(offset) => Response::LogAck { offset },
+        Ok(offset) => {
+            local.appended.notify_waiters();
+            Response::LogAck { offset }
+        }
         Err(e) => {
             warn!("logbook: {from}/{session_id}: {e:#}");
             Response::Error(format!("{e:#}"))
@@ -99,7 +122,7 @@ pub async fn archives(paths: &Paths, local: &Local, net: &Net) -> (Vec<Archive>,
         match local.get(paths).await {
             Ok(store) => {
                 here_paused = store.lock().await.paused_for(&net.me).into_iter().collect();
-                found.push(Archive::Here(store));
+                found.push(Archive::Here { store, appended: local.appended.clone() });
             }
             Err(e) => warn!("logbook: this machine's archive: {e:#}"),
         }
@@ -169,6 +192,7 @@ pub async fn run(state: Arc<State>) {
                         info!("logbook: archives: {}", if now.is_empty() { "none".into() } else { now.join(", ") });
                         names = now;
                     }
+                    state.logbook().set_names(names.clone());
                 }
                 ticks = ticks.wrapping_add(1);
                 status.archives = names.clone();
