@@ -90,31 +90,18 @@ pub async fn type_into(env: &Env, name: &str, text: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Lists this machine's sessions again and again over one `mm agent`
-/// (the Logbook asks every 2 seconds).
-pub struct Lister {
-    _child: tokio::process::Child,
-    stdin: ChildStdin,
-    reader: FrameReader<tokio::process::ChildStdout>,
-}
-
-impl Lister {
-    /// Never starts a node: see `events::follow_once`.
-    pub async fn start(env: &Env) -> anyhow::Result<Self> {
-        if !node_running(env).await {
-            bail!("no manymux node yet");
-        }
-        let (child, stdin, reader) = agent(env)?;
-        Ok(Self { _child: child, stdin, reader })
-    }
-
-    /// (name, leader pid) of each session.
-    pub async fn sessions(&mut self) -> anyhow::Result<Vec<(String, u32)>> {
-        mp::write_msg(&mut self.stdin, tag::REQUEST, &mp::Request::List).await?;
-        match answer(&mut self.reader).await? {
-            mp::Response::Sessions(list) => Ok(list.into_iter().map(|s| (s.name, s.pid)).collect()),
-            other => bail!("mm list: {other:?}"),
-        }
+/// (name, leader pid) of each session on this machine's node, asked on its
+/// socket (the Logbook asks every 2 seconds). A node answers one request per
+/// connection, and `mm agent` is only a pipe to that socket, so this opens
+/// one connection per call and no process. Never starts a node.
+pub async fn sessions(env: &Env) -> anyhow::Result<Vec<(String, u32)>> {
+    let node = tokio::net::UnixStream::connect(node_socket(env)).await.context("no manymux node yet")?;
+    let (read, mut write) = node.into_split();
+    let mut reader = FrameReader::new(read);
+    mp::write_msg(&mut write, tag::REQUEST, &mp::Request::List).await?;
+    match answer(&mut reader).await? {
+        mp::Response::Sessions(list) => Ok(list.into_iter().map(|s| (s.name, s.pid)).collect()),
+        other => bail!("mm list: {other:?}"),
     }
 }
 
@@ -133,7 +120,7 @@ fn agent(env: &Env) -> anyhow::Result<(tokio::process::Child, ChildStdin, FrameR
 }
 
 /// The node's answer to a request, skipping other frames.
-async fn answer(reader: &mut FrameReader<tokio::process::ChildStdout>) -> anyhow::Result<mp::Response> {
+async fn answer<R: tokio::io::AsyncRead + Unpin>(reader: &mut FrameReader<R>) -> anyhow::Result<mp::Response> {
     let read = async {
         loop {
             let frame = reader.next().await?.context("mm agent ended")?;

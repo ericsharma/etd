@@ -271,3 +271,35 @@ async fn the_follower_starts_no_node() {
     }
     assert!(!started, "the follower started a node");
 }
+
+/// The Logbook lists the sessions every 2 seconds. A node answers one
+/// request per connection, so each list must work, not only the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_can_be_listed_again_and_again() {
+    let Some(real) = real_mm() else {
+        eprintln!("skipped: no `mm` on PATH");
+        return;
+    };
+    let node = Node::start(&real);
+    let mut env: etd::tmux::Env = std::env::vars().filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE").collect();
+    env.insert("PATH".into(), format!("{}:{}", node.bin().display(), env["PATH"]));
+    env.insert("MM_CONFIG_DIR".into(), node.config().display().to_string());
+    env.insert("ETD_MM_SOCKET".into(), node.dir.path().join("mm.sock").display().to_string());
+    let new = Command::new(node.bin().join("mm"))
+        .args(["new", "-d", "-n", "agent", "sh", "-c", "sleep 30; true"])
+        .envs(env.iter())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(new.status.success(), "mm new: {}", String::from_utf8_lossy(&new.stderr));
+    for round in 0..3 {
+        let sessions = etd::mm::sessions(&env).await.unwrap_or_else(|e| panic!("list {round}: {e:#}"));
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        assert_eq!(sessions[0].0, "agent");
+        assert!(sessions[0].1 > 1, "a leader pid");
+    }
+    // No node: an error, and no node is started.
+    env.insert("ETD_MM_SOCKET".into(), node.dir.path().join("none.sock").display().to_string());
+    assert!(etd::mm::sessions(&env).await.is_err());
+    assert!(!node.dir.path().join("none.sock").exists());
+}

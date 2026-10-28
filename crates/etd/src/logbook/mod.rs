@@ -151,7 +151,6 @@ pub async fn run(state: Arc<State>) {
         return;
     };
     let mut capture = Capture::new(vec![Box::new(claude)], state.env().clone());
-    let mut lister: Option<mm::Lister> = None;
     let (mut archives, mut here_paused) = (Vec::new(), HashSet::new());
     let mut names: Vec<String> = Vec::new();
     let mut ticks = 0u32;
@@ -176,12 +175,9 @@ pub async fn run(state: Arc<State>) {
                 if archives.is_empty() {
                     status.note = Some("no archive in the network (etd logbook archive on)".into());
                 } else {
-                    match sessions(&mut lister, state.env()).await {
+                    match mm::sessions(state.env()).await {
                         Ok(sessions) => status.transcripts = capture.tick(&sessions, &archives, &net, &here_paused).await,
-                        Err(e) => {
-                            status.note = Some(format!("{e:#}"));
-                            lister = None;
-                        }
+                        Err(e) => status.note = Some(format!("{e:#}")),
                     }
                 }
             }
@@ -191,12 +187,4 @@ pub async fn run(state: Arc<State>) {
         }
         tokio::time::sleep(TICK).await;
     }
-}
-
-/// This machine's manymux sessions (name, leader pid).
-async fn sessions(lister: &mut Option<mm::Lister>, env: &crate::tmux::Env) -> anyhow::Result<Vec<(String, u32)>> {
-    if lister.is_none() {
-        *lister = Some(mm::Lister::start(env).await?);
-    }
-    lister.as_mut().expect("just set").sessions().await
 }
