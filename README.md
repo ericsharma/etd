@@ -46,6 +46,8 @@ Run the install script on the new machine, then run the printed `etd join <link>
 | `etd revoke <name\|id>` | Remove a member from every machine |
 | `etd send <path>… <machine>[:<session>]` | Send files to `~/etd-downloads/` on another machine, and type their paths into a session |
 | `etd status [--json]` | Show the daemon's id, addresses and connected members |
+| `etd logbook` | Show which AI agent transcripts this machine sends to the Logbook archive (and keeps, on an archive) |
+| `etd logbook archive on\|off` | Make this machine keep the transcripts of the AI agents in every machine's manymux sessions |
 | `etd` | Run the daemon in the foreground, with no service |
 
 ## Security

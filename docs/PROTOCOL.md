@@ -82,6 +82,8 @@ etd reads the peer's `EndpointId` from the connection and looks it up in the net
 | 21 | `Blobs` | member | — | the rest of the stream is an iroh-blobs request (offered hashes only) |
 | 22 | `Share { path, to, session }` | member | `Progress` frames, then `Delivered` | — |
 | 23 | `Unshare { path }` | member | `Pong` | — |
+| 24 | `LogInfo` | member | `LogInfo { archive, paused }` | — |
+| 25 | `LogAppend { session_id, meta, offset, bytes }` | machine | `LogAck { offset }` | — |
 
 Any request can get `Error(message)` instead.
 
@@ -137,6 +139,16 @@ Each etd follows its own manymux node. For a session that nobody is attached to,
 The push command runs through `/bin/sh -c` with `ETD_KIND` (`bell`, `notify`, `exit`), `ETD_MACHINE`, `ETD_SESSION`, `ETD_TITLE` and `ETD_BODY`.
 
 `Foreground { until }` (Unix seconds, at most 2 minutes ahead): the app is open; this machine runs no push command until then. The app sends it every 20 s to every machine while it is in the foreground.
+
+### Logbook (`LogInfo`, `LogAppend`)
+
+Each etd sends the transcripts of the AI agents (Claude Code) that run in its manymux sessions to the archive machines of the network. A machine is an archive after `etd logbook archive on` (`logbook.json`). The other machines ask each machine with `LogInfo`, at start and every minute. With no archive, nothing is read or sent.
+
+- An agent belongs to the manymux session whose leader process is its parent (or the parent of its parent, and so on). An agent in no live session is not sent.
+- `LogAppend` carries whole JSONL lines of the transcript `session_id`, from `offset` in the file on the source machine. The archive keys it by the sender's member name and answers how far into that file it is (`LogAck`). Empty `bytes` asks only for that offset (and updates `meta`). An `offset` above the archive's skips bytes: the archive writes `{"type":"etd-gap","skipped":N}` in their place. An `offset` below writes nothing.
+- `meta` (`LogMeta`): `agent`, `mm_session`, `cwd`, `repo` (the `origin` URL, else the repository root), `branch`, `status` (`busy`, `idle`, or `gone`), `previous` (the transcript before it in the same manymux session).
+- `LogInfo.paused`: the asker's manymux sessions that the archive does not record. The source skips their new lines (a gap); the lines never leave the machine.
+- An archive keeps `logbook/<machine>/<session id>.jsonl` (mode 0600) and `index.json` in etd's data directory.
 
 ## The local socket (`etd-ssh`)
 

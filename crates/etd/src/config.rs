@@ -16,23 +16,41 @@ pub struct Paths {
     pub config: PathBuf,
     /// `pending/`, `status.json`.
     pub state: PathBuf,
+    /// `logbook/` (an archive's transcripts).
+    pub data: PathBuf,
 }
 
 impl Paths {
-    /// `$ETD_HOME` for both, else the platform directories + `etd`
-    /// (Linux: `~/.config/etd`, `~/.local/state/etd`; macOS: both in
-    /// `~/Library/Application Support/etd`).
+    /// `$ETD_HOME` for all, else the platform directories + `etd`
+    /// (Linux: `~/.config/etd`, `~/.local/state/etd`, `~/.local/share/etd`;
+    /// macOS: all in `~/Library/Application Support/etd`).
     pub fn from_env() -> anyhow::Result<Self> {
         if let Some(dir) = std::env::var_os("ETD_HOME") {
             return Ok(Self::at(PathBuf::from(dir)));
         }
         let config = dirs::config_dir().context("no config directory")?.join("etd");
         let state = dirs::state_dir().map(|d| d.join("etd")).unwrap_or_else(|| config.clone());
-        Ok(Self { config, state })
+        let data = dirs::data_dir().map(|d| d.join("etd")).unwrap_or_else(|| config.clone());
+        Ok(Self { config, state, data })
     }
 
     pub fn at(dir: PathBuf) -> Self {
-        Self { config: dir.clone(), state: dir }
+        Self { config: dir.clone(), state: dir.clone(), data: dir }
+    }
+
+    /// Logbook settings of this machine (`etd logbook archive on`).
+    pub fn logbook_settings(&self) -> PathBuf {
+        self.config.join("logbook.json")
+    }
+
+    /// What the Logbook capture sends, for `etd logbook`.
+    pub fn logbook_status(&self) -> PathBuf {
+        self.state.join("logbook-status.json")
+    }
+
+    /// An archive's transcripts, one folder per machine, and `index.json`.
+    pub fn logbook(&self) -> PathBuf {
+        self.data.join("logbook")
     }
 
     pub fn key(&self) -> PathBuf {

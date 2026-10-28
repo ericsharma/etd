@@ -24,6 +24,8 @@ usage:
                                send files or folders to ~/etd-downloads/ on another machine
                                of the network; prints the paths there
   etd files                    list the files sent to every machine of the network
+  etd logbook                  show what the Logbook sends from here (and keeps, on an archive)
+  etd logbook archive on|off   make this machine keep the AI agents' transcripts of the network
   etd status [--json]          show the daemon's id, addresses, and connected members
   etd id                       print this machine's endpoint id
   etd pair [--url]             the same as `etd invite` (a device)
@@ -146,23 +148,76 @@ async fn files(paths: &Paths) -> anyhow::Result<()> {
         println!("no files yet; send some with `etd send <path> <machine>`");
         return Ok(());
     }
-    let now = config::now_secs();
     println!("{:<8} {:<12} {:<14} {:>9}  PATH", "WHEN", "MACHINE", "FROM", "SIZE");
     for item in list {
-        let ago = now.saturating_sub(item.received);
-        let when = match ago {
-            0..60 => format!("{ago}s"),
-            60..3600 => format!("{}m", ago / 60),
-            3600..86400 => format!("{}h", ago / 3600),
-            _ => format!("{}d", ago / 86400),
-        };
-        let size = match item.size {
-            0..1_000 => format!("{} B", item.size),
-            1_000..1_000_000 => format!("{:.1} kB", item.size as f64 / 1e3),
-            _ => format!("{:.1} MB", item.size as f64 / 1e6),
-        };
+        let (when, size) = (ago(item.received), size(item.size));
         let path = if item.is_dir { format!("{}/", item.path) } else { item.path };
         println!("{when:<8} {:<12} {:<14} {size:>9}  {path}", item.machine, item.from);
+    }
+    Ok(())
+}
+
+fn size(bytes: u64) -> String {
+    match bytes {
+        0..1_000 => format!("{bytes} B"),
+        1_000..1_000_000 => format!("{:.1} kB", bytes as f64 / 1e3),
+        1_000_000..1_000_000_000 => format!("{:.1} MB", bytes as f64 / 1e6),
+        _ => format!("{:.2} GB", bytes as f64 / 1e9),
+    }
+}
+
+fn ago(secs: u64) -> String {
+    let ago = config::now_secs().saturating_sub(secs);
+    match ago {
+        0..60 => format!("{ago}s"),
+        60..3600 => format!("{}m", ago / 60),
+        3600..86400 => format!("{}h", ago / 3600),
+        _ => format!("{}d", ago / 86400),
+    }
+}
+
+/// `etd logbook`: what this machine sends, and what it keeps if it is an
+/// archive.
+fn logbook_status(paths: &Paths) -> anyhow::Result<()> {
+    use etd::logbook::{self, store::Store, Status};
+    let archive = logbook::settings(paths).archive;
+    let running = config::running_status(paths)?.is_some();
+    let status: Option<Status> = if running { config::read_json(&paths.logbook_status())? } else { None };
+    match &status {
+        None => println!("sending     etd is not running"),
+        Some(s) => {
+            println!("archives    {}", if s.archives.is_empty() { "none".into() } else { s.archives.join(", ") });
+            if let Some(note) = &s.note {
+                println!("note        {note}");
+            }
+            println!("sending     {} transcript(s)", s.transcripts.len());
+            for t in &s.transcripts {
+                let sent: Vec<String> = t
+                    .sent
+                    .iter()
+                    .map(|(name, done)| format!("{name} {}%", (done * 100).checked_div(t.size).unwrap_or(100).min(100)))
+                    .collect();
+                let paused = if t.paused { "  (not recorded)" } else { "" };
+                println!("  {:<12} {:.8}  {:<5} {:>9}  {}{paused}", t.mm_session, t.session_id, t.status, size(t.size), sent.join(", "));
+            }
+        }
+    }
+    if !archive {
+        println!("archive     no (etd logbook archive on)");
+        return Ok(());
+    }
+    let entries = Store::read_entries(&paths.logbook())?;
+    let total: u64 = entries.iter().map(|e| e.bytes).sum();
+    println!("archive     yes: {} transcript(s), {} in {}", entries.len(), size(total), paths.logbook().display());
+    let mut machines: std::collections::BTreeMap<&str, (usize, u64, u64)> = Default::default();
+    for e in &entries {
+        let m = machines.entry(&e.machine).or_default();
+        m.0 += 1;
+        m.1 += e.bytes;
+        m.2 = m.2.max(e.last);
+    }
+    for (machine, (count, bytes, last)) in machines {
+        println!("  {machine:<12} {count:>4} transcript(s) {:>9}  last {}", size(bytes), ago(last));
     }
     Ok(())
 }
@@ -282,6 +337,19 @@ async fn main() -> anyhow::Result<()> {
         }
         ["send", rest @ ..] if rest.len() >= 2 => send(&paths, rest).await,
         ["files"] => files(&paths).await,
+        ["logbook"] => logbook_status(&paths),
+        ["logbook", "archive", on @ ("on" | "off")] => {
+            let archive = *on == "on";
+            etd::logbook::save_settings(&paths, &etd::logbook::Settings { archive })?;
+            if archive {
+                println!("This machine is now a Logbook archive: the machines of the network send it the");
+                println!("transcripts of the AI agents in their manymux sessions within a minute.");
+                println!("They go to {}", paths.logbook().display());
+            } else {
+                println!("This machine is no longer a Logbook archive. What it has stays in {}", paths.logbook().display());
+            }
+            Ok(())
+        }
         ["-h" | "--help" | "help"] => {
             println!("{USAGE}");
             Ok(())

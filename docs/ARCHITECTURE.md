@@ -27,6 +27,7 @@ Keep `etd` and `etd-ssh` in the same directory.
 |---|---|
 | Keys and the network | `~/.config/etd` (Linux), `~/Library/Application Support/etd` (macOS), or `$ETD_HOME` |
 | Received files | `~/etd-downloads/` |
+| Logbook archive (`etd logbook archive on`) | `~/.local/share/etd/logbook` (Linux), `~/Library/Application Support/etd/logbook` (macOS), or `$ETD_HOME/logbook` |
 | Log to a file | `ETD_LOG_FILE` (a leading `~/` is the home directory) |
 | Who manages etd | `etd status --json` → `manager`: `nix`, `cli`, `app` or `manual` |
 

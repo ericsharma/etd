@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{self, Paths, Status};
 use crate::tmux::{self, Env};
-use crate::{events, files, local, mm, network, ops, pair};
+use crate::{events, files, local, logbook, mm, network, ops, pair};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -55,6 +55,8 @@ pub struct State {
     /// Connections to the other machines, for requests sent on to them
     /// (`etd-ssh`, and `Agent`/`ExecOn` for another machine).
     connections: Arc<local::Connections>,
+    /// This machine's Logbook archive, if it is one.
+    logbook: logbook::Local,
 }
 
 /// The longest a single `Foreground` holds pushes back.
@@ -71,6 +73,7 @@ impl State {
             notify: OnceLock::new(),
             foreground: Mutex::default(),
             connections: Arc::default(),
+            logbook: logbook::Local::default(),
         })
     }
 
@@ -99,6 +102,14 @@ impl State {
 
     pub(crate) fn endpoint(&self) -> &Endpoint {
         self.endpoint.get().expect("set by serve")
+    }
+
+    pub(crate) fn connections(&self) -> &Arc<local::Connections> {
+        &self.connections
+    }
+
+    pub(crate) fn logbook(&self) -> &logbook::Local {
+        &self.logbook
     }
 
     fn add_live(&self, id: EndpointId, name: &str, conn: &Connection) {
@@ -176,6 +187,8 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
     // Pushes for manymux sessions (events.rs): follow this machine's node.
     if has_mm {
         tokio::spawn(events::follow(state.clone()));
+        // The Logbook: agents' transcripts to the archives (logbook/).
+        tokio::spawn(logbook::run(state.clone()));
     } else {
         info!("no manymux (mm) here: no pushes for manymux sessions from this machine");
     }
@@ -424,6 +437,9 @@ async fn serve_stream(
     };
     match &request {
         Request::Upload { path, len } => debug!("request: Upload {path} ({len} bytes)"),
+        Request::LogAppend { session_id, offset, bytes, .. } => {
+            debug!("request: LogAppend {session_id} at {offset} ({} bytes)", bytes.len())
+        }
         Request::Pair { device_name, .. } => debug!("request: Pair from {device_name}"),
         other => debug!("request: {other:?}"),
     }
@@ -532,6 +548,11 @@ async fn serve_stream(
             }
             Err(e) => Response::Error(format!("{e:#}")),
         },
+        Request::LogInfo => logbook::info(&state.paths, &state.logbook, &member_name(state, peer)).await,
+        Request::LogAppend { .. } if kind != Kind::Machine => Response::Error("only machines send transcripts".into()),
+        Request::LogAppend { session_id, meta, offset, bytes } => {
+            logbook::append(&state.paths, &state.logbook, &member_name(state, peer), &session_id, meta, offset, &bytes).await
+        }
     };
     write_frame(&mut send, &reply).await?;
     send.finish()?;

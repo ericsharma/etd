@@ -16,6 +16,7 @@ use iroh::EndpointAddr;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub mod files;
+pub mod logbook;
 pub mod network;
 
 pub const ALPN: &[u8] = b"et/1";
@@ -142,6 +143,20 @@ pub enum Request {
     Unshare {
         path: String,
     },
+    /// Is this machine a Logbook archive, and which manymux sessions of the
+    /// asking machine must it not record (any member).
+    LogInfo,
+    /// Logbook (machines only, to an archive): `bytes` of the transcript
+    /// `session_id` of the sending machine, from `offset` in its file. Whole
+    /// lines only. Empty `bytes`: only `meta`, and the archive's offset.
+    /// `offset` above the archive's: the bytes between are skipped (not
+    /// recorded). Below: nothing is written. `LogAck` either way.
+    LogAppend {
+        session_id: String,
+        meta: logbook::LogMeta,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
 }
 
 /// A file or folder delivered to a machine (`Shared`).
@@ -232,6 +247,16 @@ pub enum Response {
     Offered {
         hash: [u8; 32],
         total: u64,
+    },
+    /// `paused`: the asker's manymux sessions that this archive does not
+    /// record. Empty when `archive` is false.
+    LogInfo {
+        archive: bool,
+        paused: Vec<String>,
+    },
+    /// The source offset the archive has for that transcript: send from here.
+    LogAck {
+        offset: u64,
     },
 }
 

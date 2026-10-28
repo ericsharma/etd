@@ -68,7 +68,7 @@ pub struct Connections {
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl Connections {
-    async fn to(&self, endpoint: &Endpoint, id: EndpointId) -> anyhow::Result<Connection> {
+    pub(crate) async fn to(&self, endpoint: &Endpoint, id: EndpointId) -> anyhow::Result<Connection> {
         if let Some(conn) = self.open.lock().await.get(&id).filter(|c| c.close_reason().is_none()) {
             return Ok(conn.clone());
         }

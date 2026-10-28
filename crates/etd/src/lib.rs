@@ -3,6 +3,7 @@ pub mod config;
 pub mod events;
 pub mod files;
 pub mod local;
+pub mod logbook;
 pub mod mm;
 pub mod network;
 pub mod ops;
