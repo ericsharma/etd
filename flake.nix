@@ -44,8 +44,13 @@
             "etd"
           ];
           # The end-to-end test needs tmux and loopback networking; unit tests only.
+          # Not et-link: the daemon does not use it, and its uniffi build doubles the
+          # build time (`cargo test --workspace` tests it).
           cargoTestFlags = [
-            "--workspace"
+            "-p"
+            "etd"
+            "-p"
+            "et-proto"
             "--lib"
           ];
           meta = {
