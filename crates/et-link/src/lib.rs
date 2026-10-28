@@ -200,6 +200,12 @@ impl Link {
     }
 }
 
+/// The stream ended with no answer. From a member, most often: its etd is
+/// older than this app and does not know the request.
+fn no_answer() -> LinkError {
+    LinkError::Protocol { message: "no answer (the etd there may be too old for this request: update etd on that machine)".into() }
+}
+
 fn unexpected(response: Response) -> LinkError {
     match response {
         Response::Error(message) => LinkError::Remote { message },
@@ -432,7 +438,7 @@ impl RemoteHost {
         match read_frame::<Response>(&mut recv).await.map_err(stream_error)? {
             Some(Response::Uploaded { path }) => Ok(path),
             Some(other) => Err(unexpected(other)),
-            None => Err(LinkError::Protocol { message: "no answer".into() }),
+            None => Err(no_answer()),
         }
     }
 
@@ -447,7 +453,7 @@ impl RemoteHost {
         match read_frame::<Response>(&mut recv).await.map_err(stream_error)? {
             Some(Response::ControlStarted) => Ok(Arc::new(ControlStream { send: Mutex::new(Some(send)), recv: Mutex::new(recv) })),
             Some(other) => Err(unexpected(other)),
-            None => Err(LinkError::Protocol { message: "no answer".into() }),
+            None => Err(no_answer()),
         }
     }
 
@@ -567,7 +573,7 @@ impl RemoteHost {
         let (hash, total) = match read_frame::<Response>(&mut offer_down).await.map_err(stream_error)? {
             Some(Response::Offered { hash, total }) => (iroh_blobs::Hash::from_bytes(hash), total),
             Some(other) => return Err(unexpected(other)),
-            None => return Err(LinkError::Protocol { message: "no answer".into() }),
+            None => return Err(no_answer()),
         };
         progress.on_progress(0, total);
         let dir = std::path::PathBuf::from(into).join(&hash.to_hex()[..16]);
@@ -594,7 +600,7 @@ impl RemoteHost {
                 Some(Response::Progress { done, total }) => progress.on_progress(done, total),
                 Some(Response::Delivered { paths, typed }) => return Ok(Delivered { paths, typed }),
                 Some(other) => return Err(unexpected(other)),
-                None => return Err(LinkError::Protocol { message: "no answer".into() }),
+                None => return Err(no_answer()),
             }
         }
     }
@@ -625,7 +631,7 @@ impl RemoteHost {
         match read_frame::<Response>(&mut recv).await {
             Ok(Some(response)) => Ok(response),
             // etd closes the connection of a device it does not know.
-            Ok(None) => Err(self.conn.close_reason().map(|e| closed(&e)).unwrap_or(LinkError::Protocol { message: "no answer".into() })),
+            Ok(None) => Err(self.conn.close_reason().map(|e| closed(&e)).unwrap_or(no_answer())),
             Err(e) => Err(stream_error(e)),
         }
     }

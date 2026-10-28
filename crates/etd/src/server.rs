@@ -432,8 +432,16 @@ async fn serve_stream(
     mut send: SendStream,
     mut recv: RecvStream,
 ) -> anyhow::Result<()> {
-    let Some(request) = read_frame::<Request>(&mut recv).await? else {
-        return Ok(());
+    let request = match read_frame::<Request>(&mut recv).await {
+        Ok(Some(request)) => request,
+        Ok(None) => return Ok(()),
+        // Most often a request from a newer app or etd: say so.
+        Err(e) => {
+            let why = format!("etd {} here does not know this request ({e:#}); update etd on this machine", env!("CARGO_PKG_VERSION"));
+            let _ = write_frame(&mut send, &Response::Error(why)).await;
+            let _ = send.finish();
+            return Ok(());
+        }
     };
     match &request {
         Request::Upload { path, len } => debug!("request: Upload {path} ({len} bytes)"),

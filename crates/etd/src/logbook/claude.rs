@@ -115,7 +115,7 @@ impl Reader for Claude {
                 pid: file.pid,
                 session_id: file.session_id,
                 cwd: file.cwd,
-                status: file.status.unwrap_or_else(|| "unknown".into()),
+                status: status(file.status.as_deref()),
                 transcript,
             });
         }
@@ -124,9 +124,27 @@ impl Reader for Claude {
     }
 }
 
+/// The Logbook's status (`busy`, `idle`) for Claude's own: `shell` (a shell
+/// command runs) is busy; `waiting` (a question to the owner) is idle.
+fn status(claude: Option<&str>) -> String {
+    match claude {
+        Some("busy" | "shell") => "busy",
+        Some("idle" | "waiting") => "idle",
+        Some(other) => other,
+        None => "unknown",
+    }
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_statuses_become_busy_or_idle() {
+        let got: Vec<String> = [Some("busy"), Some("shell"), Some("idle"), Some("waiting"), None].map(status).into();
+        assert_eq!(got, ["busy", "busy", "idle", "idle", "unknown"]);
+    }
 
     #[test]
     fn live_agents_with_transcripts_only() {

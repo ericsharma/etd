@@ -9,7 +9,7 @@ use et_proto::{read_frame, write_frame, Request, Response};
 use iroh::endpoint::{RecvStream, SendStream};
 use tokio::sync::Mutex;
 
-use crate::{closed, stream_error, unexpected, Delivered, LinkError, RemoteHost, SendProgress};
+use crate::{closed, no_answer, stream_error, unexpected, Delivered, LinkError, RemoteHost, SendProgress};
 
 /// A transcript: its machine and the agent's session id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
@@ -173,7 +173,7 @@ impl RemoteHost {
                 Some(Response::Report { json }) => return Ok(json),
                 Some(Response::Error(message)) => return Err(LinkError::Remote { message }),
                 Some(other) => return Err(unexpected(other)),
-                None => return Err(LinkError::Protocol { message: "no answer".into() }),
+                None => return Err(no_answer()),
             }
         }
     }
@@ -213,7 +213,7 @@ impl RemoteHost {
                 Some(Response::Delivered { paths, typed }) => return Ok(Delivered { paths, typed }),
                 Some(Response::Error(message)) => return Err(LinkError::Remote { message }),
                 Some(other) => return Err(unexpected(other)),
-                None => return Err(LinkError::Protocol { message: "no answer".into() }),
+                None => return Err(no_answer()),
             }
         }
     }
