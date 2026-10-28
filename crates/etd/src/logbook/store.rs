@@ -157,6 +157,12 @@ impl Store {
         // A session paused here: its source learns it within a minute
         // (`LogInfo`); until then the archive drops the lines itself.
         let paused = self.index.paused.contains(&format!("{machine}/{}", meta.mm_session));
+        // A link once known stays: a back-filled transcript (capture.rs)
+        // comes with none.
+        let mut meta = meta;
+        if meta.previous.is_none() {
+            meta.previous = entry.meta.previous.clone();
+        }
         let mut changed = entry.meta != meta;
         entry.meta = meta;
         // Behind the archive: the source resends what it is not sure of.
@@ -251,6 +257,18 @@ mod tests {
     }
 
     const ID: &str = "23eba963-d720-4ef2-be81-4c77fa6c9f7b";
+
+    #[test]
+    fn a_known_link_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let linked = LogMeta { previous: Some("a1".into()), ..meta("busy") };
+        store.append("gmktec", ID, linked, 0, b"", 1).unwrap();
+        // Back-filled later, with no link.
+        store.append("gmktec", ID, meta("gone"), 0, b"", 2).unwrap();
+        let entry = store.entry("gmktec", ID).unwrap();
+        assert_eq!((entry.meta.status.as_str(), entry.meta.previous.as_deref()), ("gone", Some("a1")));
+    }
 
     #[test]
     fn appends_in_order_and_acks_the_offset() {

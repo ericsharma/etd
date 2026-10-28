@@ -153,7 +153,8 @@ Each etd sends the transcripts of the AI agents (Claude Code) that run in its ma
 
 - An agent belongs to the manymux session whose leader process is its parent (or the parent of its parent, and so on). An agent in no live session is not sent.
 - `LogAppend` carries whole JSONL lines of the transcript `session_id`, from `offset` in the file on the source machine. The archive keys it by the sender's member name and answers how far into that file it is (`LogAck`). Empty `bytes` asks only for that offset (and updates `meta`). An `offset` above the archive's skips bytes: the archive writes `{"type":"etd-gap","skipped":N}` in their place. An `offset` below writes nothing.
-- `meta` (`LogMeta`): `agent`, `mm_session`, `cwd`, `repo` (the `origin` URL, else the repository root), `branch`, `status` (`busy`, `idle`, or `gone`), `previous` (the transcript before it in the same manymux session).
+- `meta` (`LogMeta`): `agent`, `mm_session`, `cwd`, `repo` (the `origin` URL, else the repository root), `branch`, `status` (`busy`, `idle`, or `gone`), `previous` (the transcript before it in the same manymux session). The archive keeps a known `previous` when a later `meta` has none.
+- A resumed agent (`claude --resume <id>`, from its command line) writes a new transcript without the old one: the source also sends transcript `<id>` whole, as `gone`, and the new one gets `previous = <id>`.
 - `LogInfo.paused`: the asker's manymux sessions that the archive does not record. The source skips their new lines (a gap); the lines never leave the machine.
 - An archive keeps `logbook/<machine>/<session id>.jsonl` (mode 0600) and `index.json` in etd's data directory.
 - `LogArchives`: the archives this machine found (its own name first if it is one), from its last look (at most 90 s old), else asked now.

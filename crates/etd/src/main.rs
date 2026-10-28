@@ -264,6 +264,12 @@ async fn main() -> anyhow::Result<()> {
     }
     let paths = Paths::from_env()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if !matches!(args.first().map(String::as_str), None | Some("run")) {
+        // A command, not the daemon: end quietly when the reader of its
+        // output goes away (`etd status | head`), as other CLI tools do.
+        // SAFETY: done before any thread writes to a pipe.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] | ["run"] => {
             let key = config::load_or_create_key(&paths.key())?;

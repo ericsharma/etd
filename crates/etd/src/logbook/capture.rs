@@ -290,10 +290,44 @@ impl Capture {
                 found
             }
         };
-        let previous = self.last.insert(mm_session.clone(), agent.session_id.clone()).filter(|p| *p != agent.session_id);
+        let mut previous = self.last.insert(mm_session.clone(), agent.session_id.clone()).filter(|p| *p != agent.session_id);
         info!("logbook: {} in {mm_session}: {}", agent.agent, agent.session_id);
-        let meta = LogMeta { agent: agent.agent.into(), mm_session, cwd: agent.cwd, repo, branch, status: agent.status, previous };
+        let meta = LogMeta {
+            agent: agent.agent.into(),
+            mm_session,
+            cwd: agent.cwd.clone(),
+            repo,
+            branch,
+            status: agent.status.clone(),
+            previous: None,
+        };
+        // Back-fill: a resumed agent writes a new transcript, without the
+        // one it goes on from. Send that one too, as ended.
+        if let Some((earlier, path)) = self.resumed(&agent).await {
+            if !self.tracked.contains_key(&earlier) {
+                info!("logbook: {} goes on from {earlier}: sending that too", agent.session_id);
+                let meta = LogMeta { status: "gone".into(), ..meta.clone() };
+                self.tracked.insert(earlier.clone(), Tracked { path, meta, sent: HashMap::new(), gone_since: Some(Instant::now()) });
+            }
+            previous = Some(earlier);
+        }
+        let meta = LogMeta { previous, ..meta };
         self.tracked.insert(agent.session_id, Tracked { path: agent.transcript, meta, sent: HashMap::new(), gone_since: None });
+    }
+
+    /// The transcript `agent` goes on from, from its command line.
+    async fn resumed(&mut self, agent: &Live) -> Option<(String, PathBuf)> {
+        let out = Command::new("ps")
+            .args(["-o", "args=", "-p", &agent.pid.to_string()])
+            .env_clear()
+            .envs(&self.env)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()?;
+        let command_line = String::from_utf8_lossy(&out.stdout);
+        let reader = self.readers.iter_mut().find(|r| r.agent() == agent.agent)?;
+        reader.resumed(command_line.trim()).filter(|(id, _)| *id != agent.session_id)
     }
 
     /// Sends what `archive` does not have of transcript `id`. True when it

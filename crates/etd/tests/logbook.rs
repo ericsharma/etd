@@ -346,3 +346,53 @@ fn fake_claude(dir: &Path, key: &str) {
     std::fs::write(&path, script).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+/// `claude --resume <id>` writes a new transcript without the old one: the
+/// capture sends the old one too, as ended, and links the new one to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_session_brings_its_earlier_transcript() {
+    let book = MemoryLookup::new();
+    let trigkey = Machine::start("trigkey", &book).await;
+    let gmktec = Machine::start("gmktec", &book).await;
+    let url = pair::invite_url(&trigkey.paths, &local_addr(&trigkey.endpoint), "trigkey", Kind::Machine).unwrap();
+    network::join(&gmktec.endpoint, &gmktec.paths, &url, "gmktec").await.unwrap();
+    logbook::save_settings(&trigkey.paths, &Settings { archive: true }).unwrap();
+    let env: etd::tmux::Env = std::env::vars().collect();
+    let net = Net { endpoint: gmktec.endpoint.clone(), connections: Arc::default(), me: "gmktec".into() };
+    let (archives, _) = logbook::archives(&gmktec.paths, &Default::default(), &net).await;
+
+    let old = "14bbbb56-d376-4aeb-868a-1e3b09abb04e";
+    let new = "fcca3b1b-6946-4e74-98f0-44205e969389";
+    // The agent (and session leader): its command line says `--resume <old>`.
+    let agent = Proc(Command::new("sh").args(["-c", "sleep 60; true", "claude", "--resume", old]).spawn().unwrap());
+    let pid = agent.0.id();
+    let sessions = vec![("claude2".to_string(), pid)];
+    let claude = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(claude.path().join("sessions")).unwrap();
+    std::fs::create_dir_all(claude.path().join("projects/-Users-x")).unwrap();
+    std::fs::write(
+        claude.path().join(format!("sessions/{pid}.json")),
+        format!(r#"{{"pid":{pid},"sessionId":"{new}","cwd":"/tmp","status":"busy"}}"#),
+    )
+    .unwrap();
+    let earlier = "{\"type\":\"user\",\"uuid\":\"p0\",\"message\":{\"role\":\"user\",\"content\":\"Plan the Logbook\"}}\n";
+    std::fs::write(claude.path().join(format!("projects/-Users-x/{old}.jsonl")), earlier).unwrap();
+    std::fs::write(claude.path().join(format!("projects/-Users-x/{new}.jsonl")), "{\"a\":1}\n").unwrap();
+
+    let mut capture = Capture::new(vec![Box::new(Claude::at(claude.path().into()))], env);
+    let none = HashSet::new();
+    capture.tick(&sessions, &archives, &net, &none).await;
+    assert_eq!(archived(&trigkey, old), earlier, "the earlier transcript, whole");
+    assert_eq!(archived(&trigkey, new), "{\"a\":1}\n");
+    let entries = Store::read_entries(&trigkey.paths.logbook()).unwrap();
+    let get = |id: &str| entries.iter().find(|e| e.session_id == id).unwrap().clone();
+    assert_eq!((get(old).meta.status.as_str(), get(old).meta.mm_session.as_str()), ("gone", "claude2"));
+    assert_eq!(get(new).meta.previous.as_deref(), Some(old));
+
+    // A restart of etd: nothing twice, and the link stays.
+    let mut again = Capture::new(vec![Box::new(Claude::at(claude.path().into()))], std::env::vars().collect());
+    again.tick(&sessions, &archives, &net, &none).await;
+    assert_eq!(archived(&trigkey, old), earlier);
+    let entries = Store::read_entries(&trigkey.paths.logbook()).unwrap();
+    assert_eq!(entries.iter().find(|e| e.session_id == new).unwrap().meta.previous.as_deref(), Some(old));
+}

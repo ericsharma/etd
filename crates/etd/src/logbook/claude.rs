@@ -27,8 +27,15 @@ pub struct Live {
 
 /// An agent whose transcripts the Logbook records (D5: Claude Code first).
 pub trait Reader: Send {
+    /// The name in `Live::agent`.
+    fn agent(&self) -> &'static str;
     /// The running agents of this user that have a transcript.
     fn live(&mut self) -> Vec<Live>;
+    /// The transcript that an agent started with this command line goes on
+    /// from (`claude --resume <id>`): its session id and file.
+    fn resumed(&mut self, _command_line: &str) -> Option<(String, PathBuf)> {
+        None
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +95,16 @@ fn read_pid_file(path: &Path) -> Option<PidFile> {
 }
 
 impl Reader for Claude {
+    fn agent(&self) -> &'static str {
+        "claude"
+    }
+
+    fn resumed(&mut self, command_line: &str) -> Option<(String, PathBuf)> {
+        let id = resume_id(command_line)?;
+        let path = self.transcript(&id)?;
+        Some((id, path))
+    }
+
     fn live(&mut self) -> Vec<Live> {
         let Ok(dir) = fs::read_dir(self.dir.join("sessions")) else {
             return Vec::new();
@@ -124,6 +141,21 @@ impl Reader for Claude {
     }
 }
 
+/// The session id after `--resume` (or `-r`) in a `claude` command line.
+fn resume_id(command_line: &str) -> Option<String> {
+    let mut words = command_line.split_whitespace();
+    while let Some(word) = words.next() {
+        let id = match word {
+            "--resume" | "-r" => words.next(),
+            _ => word.strip_prefix("--resume="),
+        };
+        if let Some(id) = id.filter(|id| valid_session_id(id)) {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
 /// The Logbook's status (`busy`, `idle`) for Claude's own: `shell` (a shell
 /// command runs) is busy; `waiting` (a question to the owner) is idle.
 fn status(claude: Option<&str>) -> String {
@@ -139,6 +171,17 @@ fn status(claude: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resumed_session_ids() {
+        let id = "14bbbb56-d376-4aeb-868a-1e3b09abb04e";
+        assert_eq!(resume_id(&format!("claude --resume {id}")).as_deref(), Some(id));
+        assert_eq!(resume_id(&format!("/nix/store/x/claude --model opus -r {id} --verbose")).as_deref(), Some(id));
+        assert_eq!(resume_id(&format!("claude --resume={id}")).as_deref(), Some(id));
+        assert_eq!(resume_id("claude --continue"), None);
+        assert_eq!(resume_id("claude --resume"), None);
+        assert_eq!(resume_id("claude --resume ../x"), None);
+    }
 
     #[test]
     fn claude_statuses_become_busy_or_idle() {
