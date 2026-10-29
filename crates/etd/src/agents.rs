@@ -100,7 +100,7 @@ mod tests {
 
         let info = look(&env).await;
         let by_id = |id: &str| info.agents.iter().find(|a| a.id == id).unwrap().clone();
-        assert_eq!(info.agents.len(), 4);
+        assert_eq!(info.agents.len(), 5);
         let claude = by_id("claude");
         assert_eq!(
             (claude.version.as_deref(), claude.transcript, claude.state.as_str(), claude.alerts),

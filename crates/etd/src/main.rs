@@ -217,7 +217,7 @@ async fn agents() -> anyhow::Result<()> {
     let info = etd::agents::look(&tmux::login_env().await).await;
     let profiles = et_proto::agents::builtin();
     let yes = |b: bool| if b { "yes" } else { "no" };
-    println!("{:<12} {:<10} {:<11} {:<7} alerts", "agent", "version", "transcript", "state");
+    println!("{:<16} {:<10} {:<11} {:<7} alerts", "agent", "version", "transcript", "state");
     for agent in &info.agents {
         let name = profiles.iter().find(|p| p.id == agent.id).map_or(agent.id.as_str(), |p| p.name.as_str());
         let version = match agent.version.as_deref() {
@@ -226,10 +226,10 @@ async fn agents() -> anyhow::Result<()> {
             Some(v) => v,
         };
         if agent.version.is_none() {
-            println!("{name:<12} {version:<10} not installed");
+            println!("{name:<16} {version:<10} not installed");
             continue;
         }
-        println!("{name:<12} {version:<10} {:<11} {:<7} {}", yes(agent.transcript), agent.state, yes(agent.alerts));
+        println!("{name:<16} {version:<10} {:<11} {:<7} {}", yes(agent.transcript), agent.state, yes(agent.alerts));
     }
     for hint in info.agents.iter().filter(|a| a.version.is_some()).filter_map(|a| a.setup_hint.as_deref()) {
         println!("  {hint}");

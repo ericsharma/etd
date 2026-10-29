@@ -169,7 +169,7 @@ Each etd sends the transcripts of the AI agents (Claude Code) that run in its ma
 
 ### Agents (`Agents`)
 
-- `Agents`: the AI agents of this machine (et-ios `docs/PLAN-multi-agent.md`), as JSON (`et_proto::agents::AgentsInfo`), so new fields do not break older peers. `agents`: one entry per built-in profile (`claude`, `codex`, `gemini`, `grok`): `id`, `version` (null: not installed), `path`, `transcript` (the Logbook reads it), `state` (`own`, `hooks`, `transcript` or `none`: where its live state comes from), `alerts` ("needs you" reaches etd), `setup_hint`. The machine finds each launch command in its login `PATH` and runs it with `--version` (at most 5 s); the answer is kept for 60 s.
+- `Agents`: the AI agents of this machine (et-ios `docs/PLAN-multi-agent.md`), as JSON (`et_proto::agents::AgentsInfo`), so new fields do not break older peers. `agents`: one entry per built-in profile (`claude`, `codex`, `gemini`, `grok`, `antigravity`): `id`, `version` (null: not installed), `path`, `transcript` (the Logbook reads it), `state` (`own`, `hooks`, `transcript` or `none`: where its live state comes from), `alerts` ("needs you" reaches etd), `setup_hint`. The machine finds each launch command in its login `PATH` and runs it with `--version` (at most 5 s); the answer is kept for 60 s.
 
 ## The local socket (`etd-ssh`)
 

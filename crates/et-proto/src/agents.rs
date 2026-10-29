@@ -129,6 +129,21 @@ pub fn builtin() -> Vec<AgentProfile> {
             reply_marker: None,
             headless: strings(&["grok", "-p"]),
         },
+        // The owner's addition to D1 (2026-10-29): Google's Antigravity CLI.
+        AgentProfile {
+            id: "antigravity".into(),
+            name: "Antigravity CLI".into(),
+            mark: "A".into(),
+            accent: "teal".into(),
+            launch: strings(&["agy"]),
+            processes: strings(&["agy"]),
+            version_args: strings(&["--version"]),
+            keys: strings(&claude_keys),
+            multiline: "bracketed-paste".into(),
+            mention: Some("@".into()),
+            reply_marker: None,
+            headless: strings(&["agy", "-p"]),
+        },
     ]
 }
 
@@ -151,7 +166,7 @@ mod tests {
     fn builtin_ids_are_unique_and_complete() {
         let all = builtin();
         let ids: Vec<&str> = all.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, ["claude", "codex", "gemini", "grok"]);
+        assert_eq!(ids, ["claude", "codex", "gemini", "grok", "antigravity"]);
         for p in &all {
             assert_eq!(p.mark.chars().count(), 1, "{}", p.id);
             assert!(!p.launch.is_empty() && !p.processes.is_empty() && !p.keys.is_empty(), "{}", p.id);

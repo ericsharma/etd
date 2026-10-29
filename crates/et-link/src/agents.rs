@@ -8,12 +8,12 @@ use crate::{unexpected, LinkError, RemoteHost};
 /// it, and show it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
 pub struct AgentProfile {
-    /// "claude", "codex", "gemini", "grok": also the Logbook's agent.
+    /// "claude", "codex", "gemini", "grok", "antigravity": also the Logbook's agent.
     pub id: String,
     pub name: String,
     /// One letter, shown on the accent color.
     pub mark: String,
-    /// A Catppuccin Mocha color name: "peach", "green", "blue", "mauve".
+    /// A Catppuccin Mocha color name: "peach", "green", "blue", "mauve", "teal".
     pub accent: String,
     pub launch: Vec<String>,
     /// Program names that mean "this agent runs".
@@ -80,7 +80,8 @@ impl From<et_proto::agents::AgentOnMachine> for AgentOnMachine {
     }
 }
 
-/// The built-in profiles: Claude Code, Codex, Gemini CLI, Grok Build.
+/// The built-in profiles: Claude Code, Codex, Gemini CLI, Grok Build,
+/// Antigravity CLI.
 #[uniffi::export]
 pub fn agent_profiles() -> Vec<AgentProfile> {
     et_proto::agents::builtin().into_iter().map(Into::into).collect()

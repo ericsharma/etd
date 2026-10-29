@@ -54,5 +54,5 @@ async fn a_member_asks_which_agents_a_machine_has() {
     let Some(Response::Agents { json }) = read_frame(&mut recv).await.unwrap() else { panic!("an Agents answer") };
     let info: AgentsInfo = serde_json::from_str(&json).unwrap();
     let found: Vec<(&str, Option<&str>)> = info.agents.iter().map(|a| (a.id.as_str(), a.version.as_deref())).collect();
-    assert_eq!(found, [("claude", Some("2.1.4")), ("codex", None), ("gemini", Some("0.66.0")), ("grok", None)]);
+    assert_eq!(found, [("claude", Some("2.1.4")), ("codex", None), ("gemini", Some("0.66.0")), ("grok", None), ("antigravity", None)]);
 }
