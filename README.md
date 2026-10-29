@@ -2,63 +2,59 @@
 
 Your terminal sessions, on your iPhone, from every machine you own. No VPN, no open port, no ssh keys.
 
-`etd` is the daemon for [E.T.](https://github.com/ericsharma/et-ios). Install it on each machine, scan one QR code with the phone, and every tmux and [manymux](https://github.com/rayfish/manymux) session on those machines is one tap away.
+`etd` is the daemon for [E.T.](https://github.com/ericsharma/et-ios). Install it on each machine, scan one QR code with your phone, and every tmux and [manymux](https://github.com/rayfish/manymux) session is one tap away.
 
 > **Experimental.** The protocol can change between releases.
 
-## Quick start
+## Why it is cool
 
-Linux or macOS, aarch64 or x86_64:
+- **It works from anywhere.** Each machine is known by its key, not by its IP address ([iroh](https://iroh.computer)). Connections are direct when possible, and go through an encrypted relay when not. You do not configure a router or a firewall.
+- **One setup for each device.** Scan a QR code on the phone. Paste one link on a new machine. All the machines learn about each new member.
+- **Sessions stay alive.** If you lose Wi-Fi, the session continues on its machine. You go back to it when you connect again.
+- **Every machine reaches every machine.** `mm ls` and `mm attach` on any machine show the sessions of all machines, with no ssh config.
+- **Files go where you need them.** `etd send report.pdf laptop` puts the file in `~/etd-downloads/` on the laptop.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/ericsharma/etd/main/install.sh | sh
-~/.local/bin/etd invite    # shows a QR code
-```
+## Get started
 
-The script puts `etd` and `etd-ssh` in `~/.local/bin` (checksum verified) and runs `etd install`, which starts etd and a manymux node as user services. `ETD_VERSION=v0.0.6` pins a release. `ETD_BIN=<dir>` installs to another directory.
+1. Install etd (Linux or macOS):
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/ericsharma/etd/main/install.sh | sh
+   ```
+2. Show a QR code: `etd invite` (the install script prints the full path if `~/.local/bin` is not in your `PATH`)
+3. Install **E.T.** on your iPhone or iPad from [TestFlight](https://testflight.apple.com/join/TODO) <!-- TODO: public TestFlight link -->, then scan the QR code.
+4. Start a session: `mm new -n hello`. It shows in the app.
 
-1. Install **E.T.** on the iPhone or iPad from [TestFlight](https://testflight.apple.com/join/TODO). <!-- TODO: public TestFlight link -->
-2. Scan the QR code.
-3. Run `mm new -n hello` on the machine. The session shows in the app.
+On a Mac, you can use [E.T. for Mac](https://github.com/ericsharma/et-ios/releases/latest) instead. It runs etd for you.
 
-On a Mac, you can use [E.T. for Mac](https://github.com/ericsharma/et-ios/releases/latest) instead of these commands. It runs etd for you and is also a client.
+On Linux without a desktop login, run `loginctl enable-linger $USER`. If you do not, the services stop when you log out.
 
-On Linux without a desktop login, run `loginctl enable-linger $USER`. Otherwise the services stop when you log out.
+## Add a machine
 
-## Add more machines
-
-On a machine that is in the network:
-
-```sh
-etd invite --machine   # prints: etd join <link>
-```
-
-Run the install script on the new machine, then run the printed `etd join <link>` there. All machines learn about the new member in seconds.
+1. On a machine that is already in the network, run `etd invite --machine`. It shows an `etd join <link>` command.
+2. On the new machine, run the install script, then run that `etd join <link>` command.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `etd install` / `etd uninstall` | Add or remove the user services and the `MM_SSH` line in your shell's startup file |
-| `etd invite [--machine]` | Invite a phone or tablet (QR code), or another machine. One use, 10 minutes |
-| `etd join <link> [--name N]` | Join the network of the machine that made the link |
-| `etd members` | List the machines and devices |
-| `etd revoke <name\|id>` | Remove a member from every machine |
-| `etd send <path>… <machine>[:<session>]` | Send files to `~/etd-downloads/` on another machine, and type their paths into a session |
-| `etd status [--json]` | Show the daemon's id, addresses and connected members |
-| `etd logbook` | Show which AI agent transcripts this machine sends to the Logbook archive (and keeps, on an archive) |
-| `etd logbook archive on\|off` | Make this machine keep the transcripts of the AI agents in every machine's manymux sessions |
-| `etd logbook report [--refresh]` | On an archive: show the last progress report of the Logbook; `--refresh` makes a new one with `claude -p` (1 to 3 min) |
-| `etd` | Run the daemon in the foreground, with no service |
+| `etd invite [--machine]` | Invite a phone or tablet (QR code), or a machine. One use, 10 minutes. |
+| `etd join <link>` | Join the network that made the link. |
+| `etd members` | List the machines and devices. |
+| `etd revoke <name>` | Remove a member from all machines. |
+| `etd send <path>… <machine>[:<session>]` | Send files to another machine. With a session, etd types the file paths into it. |
+| `etd status` | Show this machine's id, addresses, and connections. |
+| `etd uninstall` | Stop and remove the services. |
+
+`etd help` shows all commands, including the Logbook (an archive of your AI agent transcripts).
 
 ## Security
 
-A member of the network can do what you can do in a shell, on **every** machine of the network. Invite only your own devices. Use `etd revoke` for a lost one. Details: [docs/SECURITY.md](docs/SECURITY.md).
+A member of the network can do on **every** machine what you can do in a shell. Invite only your own devices. If you lose a device, use `etd revoke` immediately. See [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Other installs
 
 <details>
-<summary>Nix (Home Manager, Linux or macOS)</summary>
+<summary>Nix (Home Manager)</summary>
 
 ```nix
 # flake inputs
@@ -67,11 +63,7 @@ etd.url = "github:ericsharma/etd";
 # home-manager configuration
 imports = [ inputs.etd.homeManagerModules.default ];
 services.etd.enable = true;
-# Optional: send pushes from this machine.
-# services.etd.notifyCommand = "my-push-command";
 ```
-
-The module runs etd and the manymux node, and sets `MM_SSH` for your shells. A deploy never restarts the manymux node, because a restart ends every session on that machine.
 </details>
 
 <details>
@@ -84,17 +76,17 @@ etd install
 </details>
 
 <details>
-<summary>macOS: browser downloads</summary>
+<summary>macOS: the browser download is blocked</summary>
 
-The binaries are not signed. A browser download gets a quarantine flag, and Gatekeeper blocks it. Use the install script (it uses `curl`), or run `xattr -d com.apple.quarantine ~/.local/bin/etd ~/.local/bin/etd-ssh`.
+The binaries are not signed, so Gatekeeper blocks a browser download. Use the install script, or run `xattr -d com.apple.quarantine ~/.local/bin/etd ~/.local/bin/etd-ssh`.
 </details>
 
 ## More
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the machines work together, and what `etd install` changes
-- [docs/SECURITY.md](docs/SECURITY.md): the trust model
-- [docs/PROTOCOL.md](docs/PROTOCOL.md): the wire format
-- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): build, test, crates
+- [How it works](docs/ARCHITECTURE.md)
+- [Security](docs/SECURITY.md)
+- [Protocol](docs/PROTOCOL.md)
+- [Development](docs/DEVELOPMENT.md)
 
 ## License
 
