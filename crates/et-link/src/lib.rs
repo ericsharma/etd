@@ -16,8 +16,10 @@ use iroh::endpoint::{presets, ConnectionError, QuicTransportConfig, RecvStream, 
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use tokio::sync::Mutex;
 
+mod agents;
 mod logbook;
 mod mm;
+pub use agents::*;
 pub use logbook::*;
 pub use mm::*;
 

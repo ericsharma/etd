@@ -24,6 +24,8 @@ usage:
                                send files or folders to ~/etd-downloads/ on another machine
                                of the network; prints the paths there
   etd files                    list the files sent to every machine of the network
+  etd agents                   list the AI agent CLIs here (Claude Code, Codex, Gemini CLI, Grok
+                               Build): version, and what E.T. can do with each
   etd logbook                  show what the Logbook sends from here (and keeps, on an archive)
   etd logbook archive on|off   make this machine keep the AI agents' transcripts of the network
   etd logbook report [--refresh]
@@ -210,6 +212,31 @@ async fn logbook_report(paths: &Paths, refresh: bool) -> anyhow::Result<()> {
 
 /// `etd logbook`: what this machine sends, and what it keeps if it is an
 /// archive.
+/// `etd agents`: what E.T.'s Agents page shows for this machine.
+async fn agents() -> anyhow::Result<()> {
+    let info = etd::agents::look(&tmux::login_env().await).await;
+    let profiles = et_proto::agents::builtin();
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    println!("{:<12} {:<10} {:<11} {:<7} alerts", "agent", "version", "transcript", "state");
+    for agent in &info.agents {
+        let name = profiles.iter().find(|p| p.id == agent.id).map_or(agent.id.as_str(), |p| p.name.as_str());
+        let version = match agent.version.as_deref() {
+            None => "-",
+            Some("") => "?",
+            Some(v) => v,
+        };
+        if agent.version.is_none() {
+            println!("{name:<12} {version:<10} not installed");
+            continue;
+        }
+        println!("{name:<12} {version:<10} {:<11} {:<7} {}", yes(agent.transcript), agent.state, yes(agent.alerts));
+    }
+    for hint in info.agents.iter().filter(|a| a.version.is_some()).filter_map(|a| a.setup_hint.as_deref()) {
+        println!("  {hint}");
+    }
+    Ok(())
+}
+
 fn logbook_status(paths: &Paths) -> anyhow::Result<()> {
     use etd::logbook::{self, store::Store, Status};
     let archive = logbook::settings(paths).archive;
@@ -375,6 +402,7 @@ async fn main() -> anyhow::Result<()> {
         }
         ["send", rest @ ..] if rest.len() >= 2 => send(&paths, rest).await,
         ["files"] => files(&paths).await,
+        ["agents"] => agents().await,
         ["logbook"] => logbook_status(&paths),
         ["logbook", "report"] => logbook_report(&paths, false).await,
         ["logbook", "report", "--refresh"] => logbook_report(&paths, true).await,

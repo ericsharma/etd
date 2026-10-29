@@ -570,6 +570,10 @@ async fn serve_stream(
         Request::Report { refresh } => return logbook::watcher::serve(state, refresh, send).await,
         Request::Grouping { change_json } => logbook::watcher::grouping(state, &change_json).await,
         Request::LogSend { selection, to, session } => return log_send(state, selection, &to, session, send).await,
+        Request::Agents => match serde_json::to_string(&crate::agents::info(state.env()).await) {
+            Ok(json) => Response::Agents { json },
+            Err(e) => Response::Error(format!("{e:#}")),
+        },
     };
     write_frame(&mut send, &reply).await?;
     send.finish()?;

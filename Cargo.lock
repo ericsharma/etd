@@ -855,6 +855,7 @@ dependencies = [
  "manymux",
  "n0-future",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "uniffi",
@@ -870,6 +871,7 @@ dependencies = [
  "iroh-blobs",
  "postcard",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

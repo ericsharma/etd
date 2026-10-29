@@ -91,6 +91,7 @@ etd reads the peer's `EndpointId` from the connection and looks it up in the net
 | 30 | `Report { refresh }` | member (archive) | `ReportProgress` frames, then `Report { json }` | — |
 | 31 | `Grouping { change_json }` | member (archive) | `Pong` | — |
 | 32 | `LogSend { selection, to, session }` | member (archive) | `Progress` frames, then `Delivered` | — |
+| 33 | `Agents` | member | `Agents { json }` | — |
 
 Any request can get `Error(message)` instead.
 
@@ -165,6 +166,10 @@ Each etd sends the transcripts of the AI agents (Claude Code) that run in its ma
 - The watcher: `claude -p` with no tools, in `logbook/watcher/`, outside manymux (`ETD_WATCHER_COMMAND` replaces the `claude` program). First a digest of each transcript that grew (transcripts with lines in the last 7 days; at most 4 at a time; kept in `digests.json`), then one call that groups the sessions by goal. Reports are kept as `watcher/reports/<id>.json`; `id` is the time in Unix seconds.
 - `Grouping { change_json }`: the owner's choice, kept in `watcher/projects.json` for each next report and applied to the last report at once. `{"decision":"accept"|"reject","kind","detail","why"}` for a proposal; `{"decision":"edit","kind":"rename","project","name"}`; `{"decision":"edit","kind":"move","key":"machine/session id","to":"project id, or empty for none"}`.
 - `LogSend`: `Turns { machine, session_id, turn_ids }` (the `uuid` of each prompt) becomes a Markdown file (each prompt and Claude's text replies; no tool output) in `~/etd-downloads/` of the machine `to`, typed into `session` there (empty: not typed). `ReportSection { report_id, project_id }`: that project of the report (goal, status, progress, sessions with their roles, next steps) as Markdown, sent the same way.
+
+### Agents (`Agents`)
+
+- `Agents`: the AI agents of this machine (et-ios `docs/PLAN-multi-agent.md`), as JSON (`et_proto::agents::AgentsInfo`), so new fields do not break older peers. `agents`: one entry per built-in profile (`claude`, `codex`, `gemini`, `grok`): `id`, `version` (null: not installed), `path`, `transcript` (the Logbook reads it), `state` (`own`, `hooks`, `transcript` or `none`: where its live state comes from), `alerts` ("needs you" reaches etd), `setup_hint`. The machine finds each launch command in its login `PATH` and runs it with `--version` (at most 5 s); the answer is kept for 60 s.
 
 ## The local socket (`etd-ssh`)
 

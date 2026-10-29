@@ -15,6 +15,7 @@ use iroh::endpoint::{RecvStream, SendStream};
 use iroh::EndpointAddr;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+pub mod agents;
 pub mod files;
 pub mod logbook;
 pub mod network;
@@ -199,6 +200,9 @@ pub enum Request {
         to: String,
         session: String,
     },
+    /// Any member: the AI agents of this machine (et-ios PLAN-multi-agent
+    /// §4.1). `Agents`.
+    Agents,
 }
 
 /// A file or folder delivered to a machine (`Shared`).
@@ -316,6 +320,10 @@ pub enum Response {
     },
     /// The report as JSON (PLAN-logbook §4.4, with "id" and "taken").
     Report {
+        json: String,
+    },
+    /// `agents::AgentsInfo` as JSON.
+    Agents {
         json: String,
     },
 }
