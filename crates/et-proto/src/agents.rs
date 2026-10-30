@@ -67,10 +67,13 @@ fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
-/// The built-in profiles (D1). Codex, Gemini and Grok keys, mentions and
-/// headless commands are not checked yet (M0).
+/// The built-in profiles (D1). Grok and Antigravity are checked (M0 part 2);
+/// Codex and Gemini keys, mentions and headless commands are not yet.
 pub fn builtin() -> Vec<AgentProfile> {
     let claude_keys = ["esc", "⇧tab", "1", "2", "3", "↑", "↓", "enter", "^C"];
+    // Their permission menus have a fourth choice.
+    let grok_keys = ["esc", "⇧tab", "1", "2", "3", "4", "↑", "↓", "enter", "^C"];
+    let agy_keys = ["esc", "⇧tab", "1", "2", "3", "4", "↑", "↓", "tab", "enter", "^C"];
     vec![
         AgentProfile {
             id: "claude".into(),
@@ -123,11 +126,12 @@ pub fn builtin() -> Vec<AgentProfile> {
             launch: strings(&["grok"]),
             processes: strings(&["grok"]),
             version_args: strings(&["--version"]),
-            keys: strings(&claude_keys),
+            keys: strings(&grok_keys),
             multiline: "bracketed-paste".into(),
             mention: Some("@".into()),
             reply_marker: None,
-            headless: strings(&["grok", "-p"]),
+            // `-p` takes the prompt.
+            headless: strings(&["grok", "--output-format", "json", "-p"]),
         },
         // The owner's addition to D1 (2026-10-29): Google's Antigravity CLI.
         AgentProfile {
@@ -138,11 +142,13 @@ pub fn builtin() -> Vec<AgentProfile> {
             launch: strings(&["agy"]),
             processes: strings(&["agy"]),
             version_args: strings(&["--version"]),
-            keys: strings(&claude_keys),
+            // `tab` amends a command before it runs.
+            keys: strings(&agy_keys),
             multiline: "bracketed-paste".into(),
             mention: Some("@".into()),
             reply_marker: None,
-            headless: strings(&["agy", "-p"]),
+            // Slow (about 1 min a prompt): not for the watcher.
+            headless: strings(&["agy", "--output-format", "json", "-p"]),
         },
     ]
 }
