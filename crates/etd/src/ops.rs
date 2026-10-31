@@ -60,7 +60,14 @@ pub async fn exec(env: &Env, script: &str) -> Response {
         Ok(Err(e)) => Response::Error(format!("wait: {e}")),
         // Dropping the child kills it.
         Err(_) => {
-            output.extend_from_slice(format!("\netd: killed after {EXEC_TIMEOUT:?}\n").as_bytes());
+            let notice = format!("\netd: killed after {EXEC_TIMEOUT:?}\n");
+            // The notice counts toward the cap: cut the output to make room.
+            let keep = MAX_EXEC_OUTPUT - notice.len();
+            if output.len() > keep {
+                output.truncate(keep);
+                truncated = true;
+            }
+            output.extend_from_slice(notice.as_bytes());
             Response::ExecResult { output, exit_code: None, truncated }
         }
     }
@@ -99,40 +106,82 @@ async fn try_upload(env: &Env, path: &str, len: u64, recv: &mut RecvStream) -> a
     let home = home(env)?;
     let target = resolve(&home, path)?;
     let parent = target.parent().context("no parent directory")?;
-    tokio::fs::create_dir_all(parent).await.with_context(|| format!("create {}", parent.display()))?;
-    // A symlink in the path could point out of home.
-    let real_home = tokio::fs::canonicalize(&home).await?;
-    if !tokio::fs::canonicalize(parent).await?.starts_with(&real_home) {
+    let name = target.file_name().context("no file name")?.to_owned();
+    // From here on, the checked directory with no symlinks in its path
+    // (the answer keeps the path as asked).
+    let parent = make_parent(&home, parent).await?;
+    let real_target = parent.join(&name);
+    // A new file (O_EXCL never follows a symlink), with a name no other
+    // upload uses at the same time.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(".{}.{}-{n}.etd-upload", name.to_string_lossy(), std::process::id()));
+    let mut file =
+        tokio::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).await.with_context(|| format!("create {}", tmp.display()))?;
+    let written = async {
+        let mut left = len;
+        let mut buf = vec![0u8; 64 * 1024];
+        while left > 0 {
+            let want = buf.len().min(left as usize);
+            let n = match recv.read(&mut buf[..want]).await {
+                Ok(Some(n)) => n,
+                Ok(None) | Err(_) => bail!("stream ended after {} of {len} bytes", len - left),
+            };
+            file.write_all(&buf[..n]).await?;
+            left -= n as u64;
+        }
+        file.flush().await?;
+        drop(file);
+        // Replaces a symlink at `target` itself, never what it points to.
+        tokio::fs::rename(&tmp, &real_target).await?;
+        anyhow::Ok(())
+    }
+    .await;
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    written.map(|()| target)
+}
+
+/// Creates `parent` (a directory inside `home`) and returns it with symlinks
+/// resolved. A symlink in the path could point out of home: the part that
+/// exists is checked before anything is created (`create_dir_all` follows
+/// symlinks), and the whole path again after.
+async fn make_parent(home: &Path, parent: &Path) -> anyhow::Result<PathBuf> {
+    let real_home = tokio::fs::canonicalize(home).await?;
+    let mut existing = parent;
+    while tokio::fs::symlink_metadata(existing).await.is_err() {
+        existing = existing.parent().context("no existing parent directory")?;
+    }
+    if !tokio::fs::canonicalize(existing).await?.starts_with(&real_home) {
         bail!("{} is outside {}", parent.display(), home.display());
     }
-    let name = target.file_name().context("no file name")?.to_string_lossy();
-    let tmp = parent.join(format!(".{name}.etd-upload"));
-    let mut file = tokio::fs::File::create(&tmp).await.with_context(|| format!("create {}", tmp.display()))?;
-    let mut left = len;
-    let mut buf = vec![0u8; 64 * 1024];
-    while left > 0 {
-        let want = buf.len().min(left as usize);
-        let read = recv.read(&mut buf[..want]).await;
-        let n = match read {
-            Ok(Some(n)) => n,
-            Ok(None) | Err(_) => {
-                drop(file);
-                let _ = tokio::fs::remove_file(&tmp).await;
-                bail!("stream ended after {} of {len} bytes", len - left);
-            }
-        };
-        file.write_all(&buf[..n]).await?;
-        left -= n as u64;
+    tokio::fs::create_dir_all(parent).await.with_context(|| format!("create {}", parent.display()))?;
+    let real = tokio::fs::canonicalize(parent).await?;
+    if !real.starts_with(&real_home) {
+        bail!("{} is outside {}", parent.display(), home.display());
     }
-    file.flush().await?;
-    drop(file);
-    tokio::fs::rename(&tmp, &target).await?;
-    Ok(target)
+    Ok(real)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A symlink out of home is refused before any directory is made.
+    #[tokio::test]
+    async fn make_parent_creates_nothing_outside_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, outside) = (dir.path().join("home"), dir.path().join("outside"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("link")).unwrap();
+        assert!(make_parent(&home, &home.join("link/new")).await.is_err());
+        assert!(!outside.join("new").exists(), "a directory was made outside home");
+        let made = make_parent(&home, &home.join("a/b")).await.unwrap();
+        assert_eq!(made, home.canonicalize().unwrap().join("a/b"));
+        assert!(made.is_dir());
+    }
 
     #[test]
     fn resolve_keeps_paths_inside_home() {
