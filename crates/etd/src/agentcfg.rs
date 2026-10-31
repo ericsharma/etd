@@ -35,7 +35,8 @@ const SKILL_DEPTH: usize = 4;
 /// Other agents' global instruction files: (agent, path from home).
 const OTHER_AGENTS: [(&str, &str); 2] = [("codex", ".codex/AGENTS.md"), ("gemini", ".gemini/GEMINI.md")];
 /// Text that must never go into an instruction file.
-const SECRETS: [&str; 9] = ["-----BEGIN", "PRIVATE KEY", "ghp_", "github_pat_", "sk-ant-", "AKIA", "xoxb-", "xoxp-", "AGE-SECRET-KEY-"];
+pub(crate) const SECRETS: [&str; 9] =
+    ["-----BEGIN", "PRIVATE KEY", "ghp_", "github_pat_", "sk-ant-", "AKIA", "xoxb-", "xoxp-", "AGE-SECRET-KEY-"];
 
 /// One allow-listed file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,7 +410,7 @@ pub async fn everywhere(endpoint: &Endpoint, paths: &Paths, connections: &Connec
 }
 
 /// One file that is not the same on every machine that answered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drift {
     pub id: String,
     pub kind: String,

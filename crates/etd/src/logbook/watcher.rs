@@ -342,7 +342,7 @@ impl Model {
     }
 
     /// One answer, with no tools and no transcript of its own.
-    async fn ask(&self, prompt: &str, limit: Duration) -> anyhow::Result<String> {
+    pub(crate) async fn ask(&self, prompt: &str, limit: Duration) -> anyhow::Result<String> {
         let mut cmd = Command::new(&self.program);
         cmd.args(["-p", "--tools", "", "--no-session-persistence", "--strict-mcp-config", "--output-format", "json"])
             .env_clear()

@@ -1,5 +1,5 @@
-//! et-ios docs/PLAN-logbook-v2.md W0: the new requests are on the wire, and
-//! each answers a clear "not built yet" until its package is in.
+//! et-ios docs/PLAN-logbook-v2.md: the requests 34–39 over et/1 (the Logbook
+//! ones need an archive; AgentConfig and ConfigWrite work on any machine).
 use std::net::{Ipv4Addr, SocketAddr};
 
 use et_proto::network::Kind;
@@ -16,7 +16,7 @@ fn local_addr(endpoint: &Endpoint) -> EndpointAddr {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn new_requests_answer_not_built_yet() {
+async fn new_requests_on_the_wire() {
     let book = MemoryLookup::new();
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::at(dir.path().into());
@@ -40,7 +40,7 @@ async fn new_requests_answer_not_built_yet() {
         send.finish().unwrap();
         let answer: Option<Response> = read_frame(&mut recv).await.unwrap();
         let Some(Response::Error(message)) = answer else { panic!("{request:?}: an error, got {answer:?}") };
-        assert!(message.starts_with("not built yet") && message.contains(package), "{request:?}: {message}");
+        assert!(message.contains("not a Logbook archive"), "{request:?} ({package}): {message}");
     }
 
     // A3: read and write the agent instruction files.

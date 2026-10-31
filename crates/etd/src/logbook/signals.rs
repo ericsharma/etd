@@ -294,7 +294,7 @@ impl Scan {
 }
 
 /// Reads what is new in each transcript: its signals, by key.
-pub(super) fn scan(logbook: &Path, entries: &[(Entry, PathBuf)]) -> anyhow::Result<BTreeMap<String, Vec<Signal>>> {
+pub(crate) fn scan(logbook: &Path, entries: &[(Entry, PathBuf)]) -> anyhow::Result<BTreeMap<String, Vec<Signal>>> {
     static BUSY: OnceLock<Mutex<()>> = OnceLock::new();
     let _one = BUSY.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
     let path = cache_path(logbook);
@@ -330,7 +330,7 @@ pub(super) fn scan(logbook: &Path, entries: &[(Entry, PathBuf)]) -> anyhow::Resu
 }
 
 /// The signal counts by kind, for the overview's `friction`.
-pub(super) fn counts(signals: &[Signal]) -> BTreeMap<String, u32> {
+pub(crate) fn counts(signals: &[Signal]) -> BTreeMap<String, u32> {
     let mut counts = BTreeMap::new();
     for s in signals {
         *counts.entry(s.kind.clone()).or_insert(0) += 1;
