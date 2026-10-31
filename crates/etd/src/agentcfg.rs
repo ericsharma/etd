@@ -54,6 +54,10 @@ pub struct File {
     pub mtime: u64,
     /// Inside a git repository: change it through an agent (D8).
     pub git: bool,
+    /// A link (a file Home Manager makes): where it points. Listed, never
+    /// written: change its source (nixos-config) through an agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
     /// Absent when `too_big`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -120,7 +124,7 @@ fn imports(home: &Path, file: &Path, text: &str) -> Vec<PathBuf> {
                 Some(rest) => home.join(rest),
                 None => dir.join(target),
             };
-            if safe_in(home, &path) && path.is_file() {
+            if listable(home, &path) && path.is_file() {
                 found.push(path);
             }
         }
@@ -144,6 +148,23 @@ fn safe_in(home: &Path, path: &Path) -> bool {
         }
     }
     true
+}
+
+/// Where `path` links to, if it is a link that may be listed (not
+/// written): to the Nix store (a file Home Manager makes) or into `home`,
+/// in a folder with no links.
+fn listed_link(home: &Path, path: &Path) -> Option<PathBuf> {
+    if !path.symlink_metadata().ok()?.file_type().is_symlink() || !safe_in(home, path.parent()?) {
+        return None;
+    }
+    let target = path.canonicalize().ok()?;
+    let home = home.canonicalize().ok()?;
+    (target.starts_with("/nix/store/") || target.starts_with(&home)).then_some(target)
+}
+
+/// May be listed: a plain file in `home`, or a link `listed_link` takes.
+fn listable(home: &Path, path: &Path) -> bool {
+    safe_in(home, path) || listed_link(home, path).is_some()
 }
 
 /// Every allow-listed file that exists: (path, kind, agent).
@@ -204,7 +225,7 @@ fn allow_list(home: &Path) -> Vec<(PathBuf, &'static str, &'static str)> {
             list.push((path, "instructions", agent));
         }
     }
-    list.retain(|(p, ..)| safe_in(home, p));
+    list.retain(|(p, ..)| listable(home, p));
     list
 }
 
@@ -234,6 +255,7 @@ pub fn snapshot(home: &Path) -> Snapshot {
                 size: meta.len(),
                 mtime: meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs()),
                 git: in_git(home, &path),
+                link: listed_link(home, &path).map(|t| t.display().to_string()),
                 content: bytes.map(|b| String::from_utf8_lossy(&b).into_owned()),
                 too_big: meta.len() > MAX_CONTENT,
             })
@@ -571,6 +593,22 @@ mod tests {
     }
 
     #[test]
+    fn a_home_manager_link_is_listed_but_not_written() {
+        let home = home_dir();
+        let h = home.path();
+        put(&h.join(".claude/CLAUDE.md"), "@rules.md\n");
+        // As Home Manager does it, with a folder in the home for the test.
+        put(&h.join("store/rules.md"), "Be brief.");
+        std::os::unix::fs::symlink(h.join("store/rules.md"), h.join(".claude/rules.md")).unwrap();
+        let s = snapshot(h);
+        let rules = s.files.iter().find(|f| f.path == "~/.claude/rules.md").expect("the import is listed");
+        assert_eq!((rules.kind.as_str(), rules.content.as_deref()), ("import", Some("Be brief.")));
+        assert_eq!(rules.link.as_deref(), Some(&*h.canonicalize().unwrap().join("store/rules.md").display().to_string()));
+        let err = write_file(h, &h.join("backups"), "~/.claude/rules.md", &rules.sha256, "x", 1).unwrap_err().to_string();
+        assert!(err.contains("not a plain file"), "{err}");
+    }
+
+    #[test]
     fn drift_names_files_that_differ_or_are_missing() {
         let file = |id: &str, sha: &str| File {
             id: id.into(),
@@ -582,6 +620,7 @@ mod tests {
             mtime: 0,
             git: false,
             content: None,
+            link: None,
             too_big: false,
         };
         let snap = |machine: &str, files: Vec<File>| Snapshot { machine: machine.into(), files, error: None };
