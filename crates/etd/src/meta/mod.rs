@@ -46,13 +46,15 @@ const TOOL_ERRORS: usize = 40;
 const FILES_BUDGET: usize = 80_000;
 const FINDINGS: usize = 8;
 const PROPOSALS: usize = 3;
+/// Time limit for each machine when the app reads the last run.
+const FRESH_LIMIT: Duration = Duration::from_secs(5);
 
 /// The answer before the first run.
 const NO_RUN: &str = r#"{"id":null,"taken":0,"findings":[],"drift":[],"followup":[],"dropped":[]}"#;
 
 // ---- What a run keeps (the `Meta` JSON) ----
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetaRun {
     pub id: String,
     pub taken: u64,
@@ -99,11 +101,22 @@ pub struct Proposal {
     pub route: String,
     /// The file's `id` (agentcfg), empty for a note.
     pub file: String,
+    /// What is still to write, against the files as they were at the last
+    /// read (`fresh`): empty when every machine has it.
     pub targets: Vec<Target>,
     /// What changes, as a diff (or the note's text).
     pub patch: String,
     pub why: String,
     pub expect: String,
+    /// The change itself: `find` (empty: add at the end) → `replace`.
+    #[serde(default)]
+    pub find: String,
+    #[serde(default)]
+    pub replace: String,
+    /// The machines whose file has the change (written, or an `applied`
+    /// decision).
+    #[serde(default)]
+    pub applied: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -539,6 +552,9 @@ fn settle(answer: Answer, signals: &[Signal], snapshots: &[Snapshot], decided: &
                     patch: p.replace.trim().to_string(),
                     why: p.why,
                     expect: p.expect,
+                    find: String::new(),
+                    replace: String::new(),
+                    applied: Vec::new(),
                 });
                 continue;
             }
@@ -555,17 +571,7 @@ fn settle(answer: Answer, signals: &[Signal], snapshots: &[Snapshot], decided: &
                     continue;
                 };
                 let old = content.unwrap_or_default();
-                let new = if p.find.is_empty() {
-                    let mut new = old.clone();
-                    if !new.is_empty() && !new.ends_with('\n') {
-                        new.push('\n');
-                    }
-                    new.push_str(p.replace.trim_end());
-                    new.push('\n');
-                    new
-                } else if old.matches(&p.find).count() == 1 {
-                    old.replacen(&p.find, &p.replace, 1)
-                } else {
+                let Some(new) = change(&old, &p.find, &p.replace) else {
                     dropped.push(format!("{label}: the text to change is not in {} on {} once", p.file, s.machine));
                     continue;
                 };
@@ -590,6 +596,9 @@ fn settle(answer: Answer, signals: &[Signal], snapshots: &[Snapshot], decided: &
                 targets,
                 why: p.why,
                 expect: p.expect,
+                find: p.find,
+                replace: p.replace,
+                applied: Vec::new(),
             });
         }
         if proposals.is_empty() {
@@ -666,6 +675,104 @@ pub async fn build(
     progress("Findings", 1, 1);
     info!("meta: run {}: {} finding(s), {} left out", run.id, run.findings.len(), run.dropped.len());
     Ok(run)
+}
+
+/// `old` with `find` (exactly once) replaced, or with `replace` added at
+/// the end when `find` is empty.
+fn change(old: &str, find: &str, replace: &str) -> Option<String> {
+    if find.is_empty() {
+        let mut new = old.to_string();
+        if !new.is_empty() && !new.ends_with('\n') {
+            new.push('\n');
+        }
+        new.push_str(replace.trim_end());
+        new.push('\n');
+        Some(new)
+    } else if old.matches(find).count() == 1 {
+        Some(old.replacen(find, replace, 1))
+    } else {
+        None
+    }
+}
+
+/// `find` and `replace` of a proposal; from its diff for a run made before
+/// they were kept.
+fn find_replace(p: &Proposal) -> (String, String) {
+    if !p.find.is_empty() || !p.replace.is_empty() {
+        return (p.find.clone(), p.replace.clone());
+    }
+    let body = p.patch.lines().skip_while(|l| !l.starts_with("@@")).skip(1);
+    let (mut find, mut replace) = (Vec::new(), Vec::new());
+    for line in body {
+        if let Some(l) = line.strip_prefix('-') {
+            find.push(l);
+        } else if let Some(l) = line.strip_prefix('+') {
+            replace.push(l);
+        }
+    }
+    (find.join("\n"), replace.join("\n"))
+}
+
+/// The machines that still have a change to write: (machines to ask).
+pub fn pending_machines(run: &MetaRun) -> BTreeSet<String> {
+    run.findings
+        .iter()
+        .flat_map(|f| &f.proposals)
+        .filter(|p| p.route != "note")
+        .flat_map(|p| p.targets.iter().map(|t| t.machine.clone()))
+        .collect()
+}
+
+/// The run's proposals against the files as they are now: a machine whose
+/// file has the change goes to `applied`; the others get the file's sha256
+/// now and the new content made from it. A rejected finding and an undone
+/// machine get no targets. A machine that did not answer keeps its target.
+pub fn fresh(mut run: MetaRun, snapshots: &[Snapshot], decided: &[Decision]) -> MetaRun {
+    let run_id = run.id.clone();
+    for f in &mut run.findings {
+        let rejected = decided.iter().any(|d| d.decision == "reject" && d.finding == f.id);
+        for p in &mut f.proposals {
+            let about = |d: &&Decision| {
+                d.finding == f.id && d.proposal.as_deref() == Some(p.id.as_str()) && d.run.as_deref().is_none_or(|r| r == run_id)
+            };
+            let mut applied: BTreeSet<String> =
+                decided.iter().filter(about).filter(|d| d.decision == "applied").flat_map(|d| d.machines.clone()).collect();
+            let undone: BTreeSet<String> =
+                decided.iter().filter(about).filter(|d| d.decision == "undo").flat_map(|d| d.machines.clone()).collect();
+            let (find, replace) = find_replace(p);
+            let mut targets = Vec::new();
+            for t in &p.targets {
+                if rejected || undone.contains(&t.machine) || p.route == "note" {
+                    continue;
+                }
+                let Some(s) = snapshots.iter().find(|s| s.machine == t.machine && s.error.is_none()) else {
+                    if !applied.contains(&t.machine) {
+                        targets.push(t.clone());
+                    }
+                    continue;
+                };
+                let Some((path, base, content)) = locate(s, &p.file) else { continue };
+                let old = content.unwrap_or_default();
+                let has_it =
+                    !replace.trim().is_empty() && old.contains(replace.trim()) && (find.trim().is_empty() || !old.contains(find.trim()));
+                if has_it {
+                    applied.insert(t.machine.clone());
+                    continue;
+                }
+                applied.remove(&t.machine);
+                let Some(content) = change(&old, &find, &replace) else { continue };
+                let after = agentcfg::sha256_hex(content.as_bytes());
+                targets.push(Target { machine: t.machine.clone(), path, base, content, old, after });
+            }
+            for t in &undone {
+                applied.remove(t);
+            }
+            p.targets = targets;
+            p.applied = applied.into_iter().collect();
+            (p.find, p.replace) = (find, replace);
+        }
+    }
+    run
 }
 
 // ---- Follow-up (A5) ----
@@ -817,7 +924,16 @@ pub async fn serve(state: &State, refresh: bool, mut send: SendStream) -> anyhow
                     let store = store.lock().await;
                     store.entries().map(|e| (e.clone(), store.path(&e.machine, &e.session_id))).collect()
                 };
-                match with_followup(&logbook, entries, run).await {
+                // Against the files as they are now (the app reads this
+                // every minute and writes what is still to write).
+                let pending = pending_machines(&run);
+                let snapshots = if pending.is_empty() {
+                    Vec::new()
+                } else {
+                    agentcfg::everywhere_of(state.endpoint(), state.paths(), state.connections(), Some(&pending), FRESH_LIMIT).await
+                };
+                let run = decisions(&logbook).map(|decided| fresh(run, &snapshots, &decided));
+                match async { with_followup(&logbook, entries, run?).await }.await {
                     Ok(run) => Response::Meta { json: serde_json::to_string(&run)? },
                     Err(e) => Response::Error(format!("{e:#}")),
                 }
@@ -947,7 +1063,10 @@ pub async fn cli(paths: &Paths, refresh: bool) -> anyhow::Result<()> {
         build(&logbook, &model, entries, snapshots, &progress).await?
     } else {
         match latest(&logbook)? {
-            Some(run) => with_followup(&logbook, entries, run).await?,
+            Some(run) => {
+                let run = fresh(run, &snapshots_from_daemon(paths).await?, &decisions(&logbook)?);
+                with_followup(&logbook, entries, run).await?
+            }
             None => {
                 println!("No meta run yet: etd meta run --refresh");
                 return Ok(());
@@ -961,10 +1080,15 @@ pub async fn cli(paths: &Paths, refresh: bool) -> anyhow::Result<()> {
         for p in &f.proposals {
             let machines: Vec<&str> = p.targets.iter().map(|t| t.machine.as_str()).collect();
             println!(
-                "  {} {} {}",
+                "  {} {} {}{}",
                 p.id,
                 p.route,
-                if p.file.is_empty() { String::new() } else { format!("{} on {}", p.file, machines.join(", ")) }
+                match (p.file.is_empty(), machines.is_empty()) {
+                    (true, _) => String::new(),
+                    (false, true) => format!("{}: nothing to write", p.file),
+                    (false, false) => format!("{} to write on {}", p.file, machines.join(", ")),
+                },
+                if p.applied.is_empty() { String::new() } else { format!(" (has it: {})", p.applied.join(", ")) }
             );
             for line in p.patch.lines().filter(|l| l.starts_with(['+', '-']) && !l.starts_with("+++") && !l.starts_with("---")) {
                 println!("      {line}");
@@ -976,7 +1100,11 @@ pub async fn cli(paths: &Paths, refresh: bool) -> anyhow::Result<()> {
         for f in &run.followup {
             let on = if f.machines.is_empty() { "all machines".to_string() } else { f.machines.join(", ") };
             let undone = if f.undone { " (undone)" } else { "" };
-            println!("  {}: {} → {} in {:.1} days each, on {on}{undone}", f.title, f.before, f.after, f.span as f64 / 86_400.0);
+            if f.span < 86_400 {
+                println!("  {}: too early to tell (applied {} h ago), on {on}{undone}", f.title, f.span / 3600);
+            } else {
+                println!("  {}: {} → {} in {:.1} days each, on {on}{undone}", f.title, f.before, f.after, f.span as f64 / 86_400.0);
+            }
         }
     }
     if !run.dropped.is_empty() {

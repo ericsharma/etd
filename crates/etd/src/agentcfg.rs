@@ -378,10 +378,22 @@ pub async fn write(env: &Env, paths: &Paths, path: &str, base: &str, content: &s
 /// machine's (one that does not answer has an `error`), in the network's
 /// order.
 pub async fn everywhere(endpoint: &Endpoint, paths: &Paths, connections: &Connections) -> Vec<Snapshot> {
+    everywhere_of(endpoint, paths, connections, None, std::time::Duration::from_secs(15)).await
+}
+
+/// `everywhere`, for the machines in `only` (all: `None`), each with `limit`.
+pub async fn everywhere_of(
+    endpoint: &Endpoint,
+    paths: &Paths,
+    connections: &Connections,
+    only: Option<&BTreeSet<String>>,
+    limit: std::time::Duration,
+) -> Vec<Snapshot> {
     let me = endpoint.id();
     let Ok(Some(signed)) = network::load(paths) else { return Vec::new() };
-    let mut all = Vec::new();
-    for m in signed.network.machines() {
+    // All at once: a machine that is off costs its time limit once.
+    let wanted = |name: &str| only.is_none_or(|o| o.contains(name));
+    let asks = signed.network.machines().filter(|m| wanted(m.name)).map(|m| async move {
         let mut snapshot = if m.id == me {
             match home(&Env::new()) {
                 Ok(home) => tokio::task::spawn_blocking(move || snapshot(&home)).await.unwrap_or_default(),
@@ -395,14 +407,14 @@ pub async fn everywhere(endpoint: &Endpoint, paths: &Paths, connections: &Connec
                 up.finish()?;
                 read_frame::<Response>(&mut down).await?.context("no answer")
             };
-            match tokio::time::timeout(std::time::Duration::from_secs(15), asked).await {
+            match tokio::time::timeout(limit, asked).await {
                 Ok(Ok(Response::AgentConfig { json })) => serde_json::from_str(&json)
                     .unwrap_or_else(|e| Snapshot { error: Some(format!("bad answer: {e}")), ..Default::default() }),
                 Ok(Ok(Response::Error(e))) => Snapshot { error: Some(e), ..Default::default() },
                 other => {
                     debug!("no agent config from {}: {other:?}", m.name);
                     let why = match other {
-                        Err(_) => "no answer in 15 s".to_string(),
+                        Err(_) => format!("no answer in {} s", limit.as_secs()),
                         Ok(Err(e)) => format!("{e:#}"),
                         Ok(Ok(r)) => format!("unexpected answer {r:?}"),
                     };
@@ -411,9 +423,9 @@ pub async fn everywhere(endpoint: &Endpoint, paths: &Paths, connections: &Connec
             }
         };
         snapshot.machine = m.name.to_string();
-        all.push(snapshot);
-    }
-    all
+        snapshot
+    });
+    n0_future::join_all(asks).await
 }
 
 /// One file that is not the same on every machine that answered.

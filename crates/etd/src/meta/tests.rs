@@ -266,3 +266,58 @@ fn followup_counts_the_kinds_on_the_machines_before_and_after() {
     decided.push(decision("undo", &["trigkey"], applied + 600));
     assert!(followup(logbook, &decided, &signals, applied + 1_000)[0].undone);
 }
+
+#[test]
+fn fresh_targets_follow_the_files_as_they_are_now() {
+    let signals = vec![signal("interrupt", "trigkey/a", "p1")];
+    let a = answer(serde_json::json!({"findings": [{"id": "f", "title": "t", "evidence": [{"key": "trigkey/a", "turn": "p1"}],
+    "proposals": [
+        {"route": "change", "file": "~/.claude/CLAUDE.md", "machines": ["trigkey", "mac-mini"], "find": "", "replace": "\n## One\n- a"},
+        {"route": "change", "file": "~/.claude/CLAUDE.md", "machines": ["trigkey", "mac-mini"], "find": "", "replace": "\n## Two\n- b"}
+    ]}]}));
+    let run = settle(a, &signals, &snapshots(), &[], "9".into(), 9);
+    // p1 is written on trigkey: CLAUDE.md there changed.
+    let mut now = snapshots();
+    let one = run.findings[0].proposals[0].targets[0].content.clone();
+    now[0].files[0].content = Some(one.clone());
+    now[0].files[0].sha256 = agentcfg::sha256_hex(one.as_bytes());
+    let decided = vec![];
+    let f = &fresh(run.clone(), &now, &decided).findings[0];
+    let (p1, p2) = (&f.proposals[0], &f.proposals[1]);
+    assert_eq!(p1.applied, ["trigkey"]);
+    assert_eq!(p1.targets.iter().map(|t| t.machine.as_str()).collect::<Vec<_>>(), ["mac-mini"]);
+    // p2 on trigkey now starts from the changed file and its sha256.
+    let t = p2.targets.iter().find(|t| t.machine == "trigkey").unwrap();
+    assert_eq!((t.base.as_str(), t.old.as_str()), (now[0].files[0].sha256.as_str(), one.as_str()));
+    assert_eq!(t.content, format!("{one}\n## Two\n- b\n"));
+
+    // A run made before find/replace were kept: they come from the diff.
+    let mut old_run = run.clone();
+    for p in &mut old_run.findings[0].proposals {
+        (p.find, p.replace) = (String::new(), String::new());
+    }
+    assert_eq!(fresh(old_run, &now, &decided).findings[0].proposals[0].applied, ["trigkey"]);
+
+    // Undo on mac-mini: no target there any more; reject: no targets at all.
+    let d = |what: &str, machines: &[&str]| Decision {
+        decision: what.into(),
+        finding: "f".into(),
+        proposal: Some("p1".into()),
+        machines: machines.iter().map(|m| m.to_string()).collect(),
+        note: None,
+        run: Some("9".into()),
+        at: 1,
+    };
+    let f = &fresh(run.clone(), &now, &[d("undo", &["mac-mini"])]).findings[0];
+    assert!(f.proposals[0].targets.is_empty());
+    let f = &fresh(run.clone(), &now, &[d("reject", &[])]).findings[0];
+    assert!(f.proposals.iter().all(|p| p.targets.is_empty()));
+    // A machine that does not answer keeps the run's target.
+    let only_trigkey = vec![now[0].clone()];
+    let f = &fresh(run, &only_trigkey, &[]).findings[0];
+    assert_eq!(f.proposals[1].targets.len(), 2);
+    assert_eq!(
+        pending_machines(&MetaRun { findings: vec![f.clone()], ..Default::default() }),
+        ["mac-mini".to_string(), "trigkey".into()].into()
+    );
+}
