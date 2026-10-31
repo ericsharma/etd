@@ -31,6 +31,7 @@ usage:
   etd logbook report [--refresh]
                                show the last progress report of an archive; --refresh makes
                                a new one with claude -p (1 to 3 min)
+  etd logbook schedule [on|off] the nightly report of an archive (03:00 local; on by default)
   etd logbook overview [--json]
                                one line set per transcript of an archive: headline, last
                                prompt, last reply (et-ios PLAN-logbook-v2 A1)
@@ -200,7 +201,11 @@ async fn logbook_report(paths: &Paths, refresh: bool) -> anyhow::Result<()> {
     };
     println!("Report {}, {}: {} project(s)", r.id, ago(r.taken), r.projects.len());
     for p in &r.projects {
-        println!("\n{} [{}] ({})\n  goal: {}\n  {}", p.name, p.id, p.status, p.goal, p.progress);
+        println!("\n{} [{}] ({})\n  goal: {}", p.name, p.id, p.status, p.goal);
+        for line in &p.done {
+            println!("  done: {line}");
+        }
+        println!("  {}", if p.now.is_empty() { &p.progress } else { &p.now });
         for m in &p.sessions {
             println!("  - {}: {}", m.key, m.role);
         }
@@ -413,6 +418,8 @@ async fn main() -> anyhow::Result<()> {
         ["logbook"] => logbook_status(&paths),
         ["logbook", "report"] => logbook_report(&paths, false).await,
         ["logbook", "report", "--refresh"] => logbook_report(&paths, true).await,
+        ["logbook", "schedule"] => etd::logbook::watcher::schedule_cli(&paths, None),
+        ["logbook", "schedule", on @ ("on" | "off")] => etd::logbook::watcher::schedule_cli(&paths, Some(*on == "on")),
         ["logbook", "overview"] => etd::logbook::overview::cli(&paths, false).await,
         ["logbook", "overview", "--json"] => etd::logbook::overview::cli(&paths, true).await,
         ["meta", "signals"] => etd::logbook::signals::cli(&paths).await,
@@ -422,7 +429,7 @@ async fn main() -> anyhow::Result<()> {
         ["meta", "schedule", on @ ("on" | "off")] => etd::meta::schedule_cli(&paths, *on == "on").await,
         ["logbook", "archive", on @ ("on" | "off")] => {
             let archive = *on == "on";
-            etd::logbook::save_settings(&paths, &etd::logbook::Settings { archive })?;
+            etd::logbook::save_settings(&paths, &etd::logbook::Settings { archive, ..etd::logbook::settings(&paths) })?;
             if archive {
                 println!("This machine is now a Logbook archive: the machines of the network send it the");
                 println!("transcripts of the AI agents in their manymux sessions within a minute.");

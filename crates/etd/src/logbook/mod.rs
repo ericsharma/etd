@@ -37,11 +37,25 @@ const TICK: Duration = Duration::from_secs(2);
 /// Ask the machines which are archives every this many ticks (1 minute).
 const DISCOVER_EVERY: u32 = 30;
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Settings {
     /// This machine keeps the transcripts of the network.
     #[serde(default)]
     pub archive: bool,
+    /// An archive makes a report every night (watcher.rs; on unless
+    /// `etd logbook schedule off`).
+    #[serde(default = "on")]
+    pub nightly: bool,
+}
+
+fn on() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { archive: false, nightly: true }
+    }
 }
 
 pub fn settings(paths: &Paths) -> Settings {
@@ -174,6 +188,8 @@ pub struct Status {
 
 /// The capture, until etd stops.
 pub async fn run(state: Arc<State>) {
+    // On an archive: the nightly report (watcher.rs).
+    tokio::spawn(watcher::nightly(state.clone()));
     let Some(claude) = claude::Claude::from_env(state.env()) else {
         info!("logbook: no home directory; no capture");
         return;

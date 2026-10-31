@@ -86,7 +86,7 @@ async fn transcripts_go_to_the_archive() {
     // No archive yet: nothing to send to.
     let (none, _) = logbook::archives(&gmktec.paths, &Default::default(), &net).await;
     assert!(none.is_empty());
-    logbook::save_settings(&trigkey.paths, &Settings { archive: true }).unwrap();
+    logbook::save_settings(&trigkey.paths, &Settings { archive: true, ..Default::default() }).unwrap();
     let (archives, _) = logbook::archives(&gmktec.paths, &Default::default(), &net).await;
     assert_eq!(archives.iter().map(|a| a.name("gmktec")).collect::<Vec<_>>(), ["trigkey"]);
 
@@ -225,7 +225,7 @@ async fn the_apps_read_the_archive() {
     let gmktec = Machine::start("gmktec", &book).await;
     let url = pair::invite_url(&trigkey.paths, &local_addr(&trigkey.endpoint), "trigkey", Kind::Machine).unwrap();
     network::join(&gmktec.endpoint, &gmktec.paths, &url, "gmktec").await.unwrap();
-    logbook::save_settings(&trigkey.paths, &Settings { archive: true }).unwrap();
+    logbook::save_settings(&trigkey.paths, &Settings { archive: true, ..Default::default() }).unwrap();
     let env: etd::tmux::Env = std::env::vars().collect();
     let net = Net { endpoint: gmktec.endpoint.clone(), connections: Arc::default(), me: "gmktec".into() };
     let (archives, _) = logbook::archives(&gmktec.paths, &Default::default(), &net).await;
@@ -394,7 +394,7 @@ async fn a_resumed_session_brings_its_earlier_transcript() {
     let gmktec = Machine::start("gmktec", &book).await;
     let url = pair::invite_url(&trigkey.paths, &local_addr(&trigkey.endpoint), "trigkey", Kind::Machine).unwrap();
     network::join(&gmktec.endpoint, &gmktec.paths, &url, "gmktec").await.unwrap();
-    logbook::save_settings(&trigkey.paths, &Settings { archive: true }).unwrap();
+    logbook::save_settings(&trigkey.paths, &Settings { archive: true, ..Default::default() }).unwrap();
     let env: etd::tmux::Env = std::env::vars().collect();
     let net = Net { endpoint: gmktec.endpoint.clone(), connections: Arc::default(), me: "gmktec".into() };
     let (archives, _) = logbook::archives(&gmktec.paths, &Default::default(), &net).await;
