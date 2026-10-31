@@ -34,7 +34,6 @@ async fn new_requests_answer_not_built_yet() {
     let conn = other.connect(local_addr(&endpoint), ALPN).await.unwrap();
 
     let requests = [
-        (Request::LogOverview { since: 0 }, "A1"),
         (Request::LogSignals { since: 0 }, "A2"),
         (Request::AgentConfig, "A3"),
         (Request::ConfigWrite { path: "~/.claude/CLAUDE.md".into(), base: String::new(), content: "x".into() }, "A3"),

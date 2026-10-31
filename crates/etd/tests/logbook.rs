@@ -238,6 +238,18 @@ async fn the_apps_read_the_archive() {
         ("gmktec", "claude", Some("Fix the build"))
     );
     let stored = list[0].bytes;
+    // PLAN-logbook-v2 A1: the overview says what the session does.
+    let Response::Overview { json } = ask(&conn, Request::LogOverview { since: 0 }).await else { panic!("an overview") };
+    let overview: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let s = &overview["sessions"][0];
+    assert_eq!(
+        (s["key"].as_str(), s["headline"].as_str(), s["headline_from"].as_str()),
+        (Some(&*format!("gmktec/{id}")), Some("Fix the build"), Some("title"))
+    );
+    assert_eq!(
+        (s["asked"].as_str(), s["said"].as_str(), s["prompts"].as_u64(), s["state"].as_str()),
+        (Some("Why does CI fail?"), Some("nixfmt."), Some(1), Some("busy"))
+    );
     assert_eq!(ask(&conn, Request::Report { refresh: false }).await, Response::Report { json: et_proto::logbook::NO_REPORT.into() });
 
     // Follow from inside the first line: it starts at the second; the

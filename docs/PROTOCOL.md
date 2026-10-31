@@ -175,9 +175,9 @@ Each etd sends the transcripts of the AI agents (Claude Code) that run in its ma
 
 ### Logbook v2 and the meta agent (34–39)
 
-et-ios `docs/PLAN-logbook-v2.md`. All answers are JSON, so new fields do not break older peers. In etd 0.0.13 each request answers `Error("not built yet: … (PLAN-logbook-v2 <package>)")`; this section grows as each package is in.
+et-ios `docs/PLAN-logbook-v2.md`. All answers are JSON, so new fields do not break older peers. In etd 0.0.13 each request answers `Error("not built yet: … (PLAN-logbook-v2 <package>)")` until its package is in; this section grows with each.
 
-- `LogOverview { since }` (A1): per transcript, a headline, the last prompt, the first line of the last reply, and counts (PLAN-logbook-v2 §4.5).
+- `LogOverview { since }` (A1, built in 0.0.14): `{"sessions":[…]}`, one per transcript that changed at or after `since`, newest first. `key` (`machine/session id`), `agent`, `machine`, `mm`, `state` (`busy`, `idle`, `gone`), `prompts` (the owner's prompts: not slash commands, interrupts or background-task notes), `trivial` (`gone` with fewer than 2 prompts), `friction` (`{}` until A2), `first`, `last`. When known: `headline` and `headline_from` (`digest`: the "Goal:" line of the watcher's digest; else `title`: the agent's own title; else `prompt`: the first prompt), `asked` (the first line of the last prompt), `said` (the first line of the agent's last text). Lines are one line, at most 200 characters (headlines 100), cut at a word with "…". The archive reads each transcript once and keeps what it found in `logbook/overview.json`; the next ask reads only new lines.
 - `LogSignals { since }` (A2): friction signals (interrupt, denied, tool error, correction, …) with the transcript key and the turn.
 - `AgentConfig` (A3, any machine): the machine's allow-listed agent instruction files.
 - `ConfigWrite { path, base, content }` (A3, any machine): replaces an allow-listed file if its sha256 is still `base` (empty: it must not exist); the old file goes to a backup first.
