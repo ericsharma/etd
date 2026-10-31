@@ -92,6 +92,12 @@ etd reads the peer's `EndpointId` from the connection and looks it up in the net
 | 31 | `Grouping { change_json }` | member (archive) | `Pong` | — |
 | 32 | `LogSend { selection, to, session }` | member (archive) | `Progress` frames, then `Delivered` | — |
 | 33 | `Agents` | member | `Agents { json }` | — |
+| 34 | `LogOverview { since }` | member (archive) | `Overview { json }` | — |
+| 35 | `LogSignals { since }` | member (archive) | `Signals { json }` | — |
+| 36 | `AgentConfig` | member | `AgentConfig { json }` | — |
+| 37 | `Meta { refresh }` | member (archive) | `ReportProgress` frames, then `Meta { json }` | — |
+| 38 | `MetaDecision { json }` | member (archive) | `Pong` | — |
+| 39 | `ConfigWrite { path, base, content }` | member | `ConfigWritten { backup }` | — |
 
 Any request can get `Error(message)` instead.
 
@@ -166,6 +172,17 @@ Each etd sends the transcripts of the AI agents (Claude Code) that run in its ma
 - The watcher: `claude -p` with no tools, in `logbook/watcher/`, outside manymux (`ETD_WATCHER_COMMAND` replaces the `claude` program). First a digest of each transcript that grew (transcripts with lines in the last 7 days; at most 4 at a time; kept in `digests.json`), then one call that groups the sessions by goal. Reports are kept as `watcher/reports/<id>.json`; `id` is the time in Unix seconds.
 - `Grouping { change_json }`: the owner's choice, kept in `watcher/projects.json` for each next report and applied to the last report at once. `{"decision":"accept"|"reject","kind","detail","why"}` for a proposal; `{"decision":"edit","kind":"rename","project","name"}`; `{"decision":"edit","kind":"move","key":"machine/session id","to":"project id, or empty for none"}`.
 - `LogSend`: `Turns { machine, session_id, turn_ids }` (the `uuid` of each prompt) becomes a Markdown file (each prompt and Claude's text replies; no tool output) in `~/etd-downloads/` of the machine `to`, typed into `session` there (empty: not typed). `ReportSection { report_id, project_id }`: that project of the report (goal, status, progress, sessions with their roles, next steps) as Markdown, sent the same way.
+
+### Logbook v2 and the meta agent (34–39)
+
+et-ios `docs/PLAN-logbook-v2.md`. All answers are JSON, so new fields do not break older peers. In etd 0.0.13 each request answers `Error("not built yet: … (PLAN-logbook-v2 <package>)")`; this section grows as each package is in.
+
+- `LogOverview { since }` (A1): per transcript, a headline, the last prompt, the first line of the last reply, and counts (PLAN-logbook-v2 §4.5).
+- `LogSignals { since }` (A2): friction signals (interrupt, denied, tool error, correction, …) with the transcript key and the turn.
+- `AgentConfig` (A3, any machine): the machine's allow-listed agent instruction files.
+- `ConfigWrite { path, base, content }` (A3, any machine): replaces an allow-listed file if its sha256 is still `base` (empty: it must not exist); the old file goes to a backup first.
+- `Meta { refresh }`, `MetaDecision { json }` (A4): the meta agent's findings, a new run with progress frames, and the owner's decision on a proposal.
+- `LogSend` takes a third selection, `Finding { run_id, finding_id }` (A4).
 
 ### Agents (`Agents`)
 

@@ -203,6 +203,39 @@ pub enum Request {
     /// Any member: the AI agents of this machine (et-ios PLAN-multi-agent
     /// §4.1). `Agents`.
     Agents,
+    /// Logbook, to an archive (any member): one short line set per
+    /// transcript that changed at or after `since` (et-ios
+    /// PLAN-logbook-v2 §4.5). `Overview`.
+    LogOverview {
+        since: u64,
+    },
+    /// Logbook, to an archive (any member): the friction signals found in
+    /// the transcripts at or after `since` (PLAN-logbook-v2 §4.3). `Signals`.
+    LogSignals {
+        since: u64,
+    },
+    /// Any member: this machine's agent instruction files (the allow-list
+    /// of PLAN-logbook-v2 D9). `AgentConfig`.
+    AgentConfig,
+    /// Logbook, to an archive (any member): the meta agent's last findings
+    /// (`refresh` false), or a new run (`ReportProgress` frames first).
+    /// `Meta`.
+    Meta {
+        refresh: bool,
+    },
+    /// Logbook, to an archive (any member): the owner accepts, rejects or
+    /// edits a finding's proposal (JSON). `Pong`.
+    MetaDecision {
+        json: String,
+    },
+    /// Any member: replace an allow-listed agent instruction file with
+    /// `content`, if its sha256 is still `base` (empty: the file must not
+    /// exist). The old file goes to a backup first. `ConfigWritten`.
+    ConfigWrite {
+        path: String,
+        base: String,
+        content: String,
+    },
 }
 
 /// A file or folder delivered to a machine (`Shared`).
@@ -325,6 +358,27 @@ pub enum Response {
     /// `agents::AgentsInfo` as JSON.
     Agents {
         json: String,
+    },
+    /// The overview of the transcripts as JSON (PLAN-logbook-v2 §4.5).
+    Overview {
+        json: String,
+    },
+    /// The friction signals as JSON (PLAN-logbook-v2 §4.3).
+    Signals {
+        json: String,
+    },
+    /// The machine's agent instruction files as JSON (PLAN-logbook-v2 A3).
+    AgentConfig {
+        json: String,
+    },
+    /// The meta agent's findings as JSON (PLAN-logbook-v2 §4.3).
+    Meta {
+        json: String,
+    },
+    /// `ConfigWrite` is done; `backup`: where the old file is (empty: there
+    /// was none).
+    ConfigWritten {
+        backup: String,
     },
 }
 
@@ -456,5 +510,21 @@ mod tests {
         assert!(url.starts_with("et://pair?t="));
         assert_eq!(Ticket::from_url(&url).unwrap(), ticket);
         assert!(Ticket::from_url("et://pair?t=zz1").is_err());
+    }
+
+    /// postcard writes the variant index first: the numbers in PROTOCOL.md
+    /// (and in et-ios PLAN-logbook-v2 §4.4) must not move.
+    #[test]
+    fn logbook_v2_request_numbers() {
+        let index = |r: &Request| postcard::to_allocvec(r).unwrap()[0];
+        assert_eq!(index(&Request::Agents), 33);
+        assert_eq!(index(&Request::LogOverview { since: 0 }), 34);
+        assert_eq!(index(&Request::LogSignals { since: 0 }), 35);
+        assert_eq!(index(&Request::AgentConfig), 36);
+        assert_eq!(index(&Request::Meta { refresh: false }), 37);
+        assert_eq!(index(&Request::MetaDecision { json: String::new() }), 38);
+        assert_eq!(index(&Request::ConfigWrite { path: String::new(), base: String::new(), content: String::new() }), 39);
+        let finding = logbook::LogSelection::Finding { run_id: String::new(), finding_id: String::new() };
+        assert_eq!(postcard::to_allocvec(&finding).unwrap()[0], 2);
     }
 }

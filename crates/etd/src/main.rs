@@ -31,7 +31,14 @@ usage:
   etd logbook report [--refresh]
                                show the last progress report of an archive; --refresh makes
                                a new one with claude -p (1 to 3 min)
-  etd status [--json]          show the daemon's id, addresses, and connected members
+  etd logbook overview [--json]
+                               one line set per transcript of an archive: headline, last
+                               prompt, last reply (et-ios PLAN-logbook-v2 A1)
+  etd meta signals             the friction signals found in an archive's transcripts (A2)
+  etd meta drift               the agent instruction files that differ between machines (A3)
+  etd meta run [--refresh]     the meta agent's last findings; --refresh makes new ones (A4)
+  etd meta schedule on|off     a nightly meta agent run on this archive (A5)
+  etd status [--json]         show the daemon's id, addresses, and connected members
   etd id                       print this machine's endpoint id
   etd pair [--url]             the same as `etd invite` (a device)
   etd allow <id> [name]        add a device without a QR code (for tests)
@@ -406,6 +413,13 @@ async fn main() -> anyhow::Result<()> {
         ["logbook"] => logbook_status(&paths),
         ["logbook", "report"] => logbook_report(&paths, false).await,
         ["logbook", "report", "--refresh"] => logbook_report(&paths, true).await,
+        ["logbook", "overview"] => etd::logbook::overview::cli(&paths, false).await,
+        ["logbook", "overview", "--json"] => etd::logbook::overview::cli(&paths, true).await,
+        ["meta", "signals"] => etd::logbook::signals::cli(&paths).await,
+        ["meta", "drift"] => etd::agentcfg::drift_cli(&paths).await,
+        ["meta", "run"] => etd::meta::cli(&paths, false).await,
+        ["meta", "run", "--refresh"] => etd::meta::cli(&paths, true).await,
+        ["meta", "schedule", on @ ("on" | "off")] => etd::meta::schedule_cli(&paths, *on == "on").await,
         ["logbook", "archive", on @ ("on" | "off")] => {
             let archive = *on == "on";
             etd::logbook::save_settings(&paths, &etd::logbook::Settings { archive })?;

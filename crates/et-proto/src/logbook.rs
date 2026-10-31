@@ -52,6 +52,9 @@ pub enum LogSelection {
     Turns { machine: String, session_id: String, turn_ids: Vec<String> },
     /// One project of a report (L3).
     ReportSection { report_id: String, project_id: String },
+    /// One finding of a meta agent run, with its proposals
+    /// (PLAN-logbook-v2 A4).
+    Finding { run_id: String, finding_id: String },
 }
 
 /// The answer to `Report { refresh: false }` before the first report.

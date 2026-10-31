@@ -64,6 +64,11 @@ pub enum LogSelection {
         report_id: String,
         project_id: String,
     },
+    /// One finding of a meta agent run (PLAN-logbook-v2 A4).
+    Finding {
+        run_id: String,
+        finding_id: String,
+    },
 }
 
 /// Progress of `report(refresh: true)`.
@@ -178,6 +183,51 @@ impl RemoteHost {
         }
     }
 
+    /// PLAN-logbook-v2 §4.5: one headline, last prompt and last reply per
+    /// transcript that changed at or after `since` (JSON).
+    pub async fn logbook_overview(&self, since: u64) -> Result<String, LinkError> {
+        match self.call(Request::LogOverview { since }).await? {
+            Response::Overview { json } => Ok(json),
+            Response::Error(message) => Err(LinkError::Remote { message }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// PLAN-logbook-v2 §4.3: the friction signals at or after `since` (JSON).
+    pub async fn logbook_signals(&self, since: u64) -> Result<String, LinkError> {
+        match self.call(Request::LogSignals { since }).await? {
+            Response::Signals { json } => Ok(json),
+            Response::Error(message) => Err(LinkError::Remote { message }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// PLAN-logbook-v2 §4.3: the meta agent's last findings, or with
+    /// `refresh` a new run (JSON).
+    pub async fn meta(&self, refresh: bool, progress: Arc<dyn ReportProgress>) -> Result<String, LinkError> {
+        let (mut send, mut recv) = self.conn.open_bi().await.map_err(|e| closed(&e))?;
+        write_frame(&mut send, &Request::Meta { refresh }).await.map_err(stream_error)?;
+        send.finish().map_err(|e| LinkError::Closed { message: e.to_string() })?;
+        loop {
+            match read_frame::<Response>(&mut recv).await.map_err(stream_error)? {
+                Some(Response::ReportProgress { stage, done, total }) => progress.on_progress(stage, done, total),
+                Some(Response::Meta { json }) => return Ok(json),
+                Some(Response::Error(message)) => return Err(LinkError::Remote { message }),
+                Some(other) => return Err(unexpected(other)),
+                None => return Err(no_answer()),
+            }
+        }
+    }
+
+    /// The owner's decision on a finding's proposal (JSON).
+    pub async fn meta_decision(&self, decision_json: String) -> Result<(), LinkError> {
+        match self.call(Request::MetaDecision { json: decision_json }).await? {
+            Response::Pong => Ok(()),
+            Response::Error(message) => Err(LinkError::Remote { message }),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// One §4.4 proposal, accepted or edited (JSON).
     pub async fn grouping(&self, change_json: String) -> Result<(), LinkError> {
         match self.call(Request::Grouping { change_json }).await? {
@@ -203,6 +253,7 @@ impl RemoteHost {
             LogSelection::ReportSection { report_id, project_id } => {
                 et_proto::logbook::LogSelection::ReportSection { report_id, project_id }
             }
+            LogSelection::Finding { run_id, finding_id } => et_proto::logbook::LogSelection::Finding { run_id, finding_id },
         };
         let (mut up, mut down) = self.conn.open_bi().await.map_err(|e| closed(&e))?;
         write_frame(&mut up, &Request::LogSend { selection, to, session }).await.map_err(stream_error)?;

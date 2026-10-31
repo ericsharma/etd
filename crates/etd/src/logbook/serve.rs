@@ -152,5 +152,6 @@ pub async fn markdown(state: &State, selection: &LogSelection) -> anyhow::Result
             let entries: Vec<store::Entry> = state.logbook().get(state.paths()).await?.lock().await.entries().cloned().collect();
             super::watcher::section(&state.paths().logbook(), &entries, report_id, project_id)
         }
+        LogSelection::Finding { run_id, finding_id } => crate::meta::finding(state.paths(), run_id, finding_id),
     }
 }

@@ -8,8 +8,10 @@
 //! and nothing is sent.
 pub mod capture;
 pub mod claude;
+pub mod overview;
 pub mod send;
 pub mod serve;
+pub mod signals;
 pub mod store;
 pub mod watcher;
 

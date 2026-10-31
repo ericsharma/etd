@@ -574,6 +574,15 @@ async fn serve_stream(
             Ok(json) => Response::Agents { json },
             Err(e) => Response::Error(format!("{e:#}")),
         },
+        Request::LogOverview { since } => logbook::overview::serve(state, since).await,
+        Request::LogSignals { since } => logbook::signals::serve(state, since).await,
+        Request::AgentConfig => crate::agentcfg::info(state.env()).await,
+        Request::Meta { refresh } => return crate::meta::serve(state, refresh, send).await,
+        Request::MetaDecision { json } => crate::meta::decision(state, &json).await,
+        Request::ConfigWrite { path, base, content } => {
+            info!("{} writes {path}", member_name(state, peer));
+            crate::agentcfg::write(state.env(), &state.paths, &path, &base, &content).await
+        }
     };
     write_frame(&mut send, &reply).await?;
     send.finish()?;
