@@ -60,13 +60,7 @@ pub async fn deliver<W: AsyncWrite + Unpin>(
         .await
         .context("ask the sender for the sizes")?;
     let total: u64 = sizes.iter().sum();
-    for dir in [files.dir(), downloads] {
-        if let Some(free) = available(dir) {
-            if free < total.saturating_add(FREE_MARGIN) {
-                bail!("not enough space on {}: {} free, {} needed + 2 GB", dir.display(), mb(free), mb(total));
-            }
-        }
-    }
+    enough_space(files.dir(), downloads, total)?;
     let tag = format!("{RECV_TAG}{hash}");
     files.store().tags().set(&tag, content).await?;
     let result = fetch_and_export(files, conn, content, total, downloads, out).await;
@@ -104,17 +98,39 @@ async fn fetch_and_export<W: AsyncWrite + Unpin>(
     let collection = Collection::load(content.hash, store.as_ref()).await?;
     let names: Vec<String> = collection.iter().map(|(name, _)| name.clone()).collect();
     let (targets, tops) = plan(&names, downloads)?;
-    for ((_, hash), target) in collection.iter().zip(targets) {
-        std::fs::create_dir_all(target.parent().context("no parent")?)?;
-        // Copy, never reference: the user may change or delete the file.
-        store
-            .export_with_opts(ExportOptions { hash: *hash, target: target.clone(), mode: ExportMode::Copy })
-            .await
-            .with_context(|| format!("write {}", target.display()))?;
-        debug!("wrote {}", target.display());
+    let written = async {
+        for ((_, hash), target) in collection.iter().zip(targets) {
+            std::fs::create_dir_all(target.parent().context("no parent")?)?;
+            // A file left by an earlier try (or a symlink) is not written through.
+            if tops.iter().any(|t| t.part.as_ref() == Some(&target)) {
+                let _ = std::fs::remove_file(&target);
+            }
+            // Copy, never reference: the user may change or delete the file.
+            store
+                .export_with_opts(ExportOptions { hash: *hash, target: target.clone(), mode: ExportMode::Copy })
+                .await
+                .with_context(|| format!("write {}", target.display()))?;
+            debug!("wrote {}", target.display());
+        }
+        for top in &tops {
+            if let Some(part) = &top.part {
+                // Over this delivery's own placeholder.
+                std::fs::rename(part, &top.path).with_context(|| format!("write {}", top.path.display()))?;
+            }
+        }
+        anyhow::Ok(())
     }
-    Ok(tops)
+    .await;
+    if let Err(e) = written {
+        tops.iter().for_each(Top::release);
+        return Err(e);
+    }
+    Ok(tops.into_iter().map(|t| t.path).collect())
 }
+
+/// Held while `deliveries.jsonl` is appended to or rewritten (one etd
+/// process writes it, from tasks that run at the same time).
+static DELIVERIES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// One line of `deliveries.jsonl`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,6 +154,7 @@ pub fn log_delivery(paths: &Paths, tops: &[PathBuf], from: &str, session: Option
         lines.push_str(&serde_json::to_string(&line)?);
         lines.push('\n');
     }
+    let _log = DELIVERIES.lock().unwrap_or_else(|e| e.into_inner());
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(paths.deliveries())?;
     std::io::Write::write_all(&mut file, lines.as_bytes())?;
     Ok(())
@@ -195,6 +212,8 @@ pub fn unshare(paths: &Paths, downloads: &Path, path: &str) -> anyhow::Result<()
     } else {
         std::fs::remove_file(&full)?;
     }
+    // Held across the read and the rename, so no delivery logged meanwhile is lost.
+    let _log = DELIVERIES.lock().unwrap_or_else(|e| e.into_inner());
     let keep: Vec<Logged> = logged(paths).into_iter().filter(|l| l.path != path && Path::new(&l.path) != full).collect();
     let mut text = String::new();
     for l in keep {
@@ -229,51 +248,144 @@ fn checked(part: &str) -> anyhow::Result<&str> {
     Ok(part)
 }
 
-/// Where each item goes under `dir`, and the top-level paths. A top-level
-/// name that is taken gets ` (2)`, ` (3)`… (`a (2).txt`, `out (2)`).
-fn plan(names: &[String], dir: &Path) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-    let mut tops: BTreeMap<String, PathBuf> = BTreeMap::new();
-    let mut order = Vec::new();
-    let mut targets = Vec::new();
-    for name in names {
-        let parts: Vec<&str> = name.split('/').map(checked).collect::<anyhow::Result<_>>()?;
-        let is_file = parts.len() == 1;
-        let top = tops.entry(parts[0].to_string()).or_insert_with(|| {
-            let free = free_name(dir, parts[0], is_file);
-            order.push(free.clone());
-            free
-        });
-        targets.push(parts[1..].iter().fold(top.clone(), |p, part| p.join(part)));
-    }
-    Ok((targets, order))
+/// A top-level path a delivery has claimed under the downloads folder.
+#[derive(Debug, PartialEq)]
+struct Top {
+    path: PathBuf,
+    /// A file: its bytes go to this hidden name first, then are renamed
+    /// over the empty placeholder at `path`. None: a folder.
+    part: Option<PathBuf>,
 }
 
-fn free_name(dir: &Path, name: &str, is_file: bool) -> PathBuf {
-    let taken = |p: &Path| std::fs::symlink_metadata(p).is_ok();
-    let first = dir.join(name);
-    if !taken(&first) {
-        return first;
+impl Top {
+    /// Removes what the delivery claimed (after a failure).
+    fn release(&self) {
+        match &self.part {
+            Some(part) => {
+                let _ = std::fs::remove_file(part);
+                let _ = std::fs::remove_file(&self.path);
+            }
+            None => {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
     }
+}
+
+/// Where each item is written under `dir`, and the top-level paths. A
+/// top-level name that is taken gets ` (2)`, ` (3)`… (`a (2).txt`, `out
+/// (2)`). Each top-level path is claimed on disk here (a new folder, or an
+/// empty file), so two deliveries at the same time never pick the same one.
+/// Names are checked before anything is created.
+fn plan(names: &[String], dir: &Path) -> anyhow::Result<(Vec<PathBuf>, Vec<Top>)> {
+    let split: Vec<Vec<&str>> =
+        names.iter().map(|name| name.split('/').map(checked).collect::<anyhow::Result<_>>()).collect::<anyhow::Result<_>>()?;
+    // A name that is both a file and a folder (`notes`, `notes/a.txt`) would
+    // fail half way through writing.
+    let files: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+    if files.len() != names.len() {
+        bail!("the sender's collection has a name twice");
+    }
+    for name in names {
+        for (i, _) in name.match_indices('/') {
+            if files.contains(&name[..i]) {
+                bail!("the sender's collection has {:?} as a file and as a folder", &name[..i]);
+            }
+        }
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let mut claimed: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut tops: Vec<Top> = Vec::new();
+    let mut targets = Vec::new();
+    for parts in &split {
+        let index = match claimed.get(parts[0]) {
+            Some(&i) => i,
+            None => match claim(dir, parts[0], parts.len() == 1) {
+                Ok(top) => {
+                    tops.push(top);
+                    claimed.insert(parts[0], tops.len() - 1);
+                    tops.len() - 1
+                }
+                Err(e) => {
+                    tops.iter().for_each(Top::release);
+                    return Err(e);
+                }
+            },
+        };
+        let top = &tops[index];
+        targets.push(match &top.part {
+            Some(part) => part.clone(),
+            None => parts[1..].iter().fold(top.path.clone(), |p, part| p.join(part)),
+        });
+    }
+    Ok((targets, tops))
+}
+
+/// Claims the first free name of `name`, `name (2)`… in `dir`: creates the
+/// folder or an empty file, which fails if another delivery (or anything
+/// else) made it first; then the next name is tried.
+fn claim(dir: &Path, name: &str, is_file: bool) -> anyhow::Result<Top> {
     let (stem, ext) = match name.rsplit_once('.') {
         Some((stem, ext)) if is_file && !stem.is_empty() => (stem, format!(".{ext}")),
         _ => (name, String::new()),
     };
-    (2..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| !taken(p)).expect("some name is free")
+    let candidates = std::iter::once(name.to_string()).chain((2..).map(|n| format!("{stem} ({n}){ext}")));
+    for candidate in candidates.take(10_000) {
+        let path = dir.join(&candidate);
+        let made = if is_file {
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map(drop)
+        } else {
+            std::fs::create_dir(&path)
+        };
+        match made {
+            Ok(()) => {
+                let part = is_file.then(|| dir.join(format!(".{candidate}.etd-part")));
+                return Ok(Top { path, part });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+        }
+    }
+    bail!("no free name for {name} in {}", dir.display())
 }
 
-/// Free bytes for this user on the disk of `path` (or its nearest parent).
-fn available(path: &Path) -> Option<u64> {
-    let mut p = path;
-    while !p.exists() {
-        p = p.parent()?;
+/// Refuses a delivery of `total` bytes that would leave less than
+/// `FREE_MARGIN` free. The bytes are written twice, into the store and then
+/// copied to downloads (until garbage collection), so one disk that holds
+/// both needs room for both. A disk whose free space cannot be read counts
+/// as full.
+fn enough_space(store: &Path, downloads: &Path, total: u64) -> anyhow::Result<()> {
+    let (store_disk, store_free) = disk(store).with_context(|| format!("free space on {}", store.display()))?;
+    let (downloads_disk, downloads_free) = disk(downloads).with_context(|| format!("free space on {}", downloads.display()))?;
+    let checks: &[(&Path, u64, u64)] = if store_disk == downloads_disk {
+        &[(downloads, downloads_free, total.saturating_mul(2))]
+    } else {
+        &[(store, store_free, total), (downloads, downloads_free, total)]
+    };
+    for &(dir, free, need) in checks {
+        if free < need.saturating_add(FREE_MARGIN) {
+            bail!("not enough space on {}: {} free, {} needed + 2 GB", dir.display(), mb(free), mb(need));
+        }
     }
-    let c = CString::new(p.as_os_str().as_bytes()).ok()?;
+    Ok(())
+}
+
+/// The disk (device id) of `path` (or its nearest parent), and the bytes
+/// free on it for this user.
+fn disk(path: &Path) -> anyhow::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut p = path;
+    while std::fs::symlink_metadata(p).is_err() {
+        p = p.parent().context("no existing parent")?;
+    }
+    let dev = std::fs::metadata(p)?.dev();
+    let c = CString::new(p.as_os_str().as_bytes())?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: a valid C string and a statvfs to write into.
     if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        return None;
+        return Err(std::io::Error::last_os_error().into());
     }
-    Some(s.f_bavail as u64 * s.f_frsize as u64)
+    Ok((dev, s.f_bavail as u64 * s.f_frsize as u64))
 }
 
 fn mb(bytes: u64) -> String {
@@ -292,11 +404,47 @@ mod tests {
         let names = ["a.txt", "out/x/y.bin", "out/z", "Makefile"].map(String::from);
         let (targets, tops) = plan(&names, dir.path()).unwrap();
         let d = dir.path();
-        assert_eq!(targets, [d.join("a (2).txt"), d.join("out (2)/x/y.bin"), d.join("out (2)/z"), d.join("Makefile")]);
-        assert_eq!(tops, [d.join("a (2).txt"), d.join("out (2)"), d.join("Makefile")]);
+        assert_eq!(targets, [d.join(".a (2).txt.etd-part"), d.join("out (2)/x/y.bin"), d.join("out (2)/z"), d.join(".Makefile.etd-part")]);
+        let paths: Vec<_> = tops.iter().map(|t| t.path.clone()).collect();
+        assert_eq!(paths, [d.join("a (2).txt"), d.join("out (2)"), d.join("Makefile")]);
+        // Claimed on disk: a second delivery at the same time picks other names.
+        assert!(d.join("a (2).txt").is_file() && d.join("out (2)").is_dir() && d.join("Makefile").is_file());
+        let (_, again) = plan(&names, dir.path()).unwrap();
+        let paths: Vec<_> = again.iter().map(|t| t.path.clone()).collect();
+        assert_eq!(paths, [d.join("a (3).txt"), d.join("out (3)"), d.join("Makefile (2)")]);
+        again.iter().for_each(Top::release);
+        assert!(!d.join("out (3)").exists() && !d.join("Makefile (2)").exists());
+    }
+
+    /// Bad names, and a name that is both a file and a folder, are refused
+    /// before anything is created.
+    #[test]
+    fn plan_refuses_bad_collections_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
         for bad in ["../x", "a//b", "/abs", "a/./b", "a\\b"] {
-            assert!(plan(&[bad.to_string()], d).is_err(), "{bad} was allowed");
+            assert!(plan(&["ok.txt".to_string(), bad.to_string()], d).is_err(), "{bad} was allowed");
         }
+        for names in [&["notes", "notes/a.txt"][..], &["x/notes/a.txt", "x/notes", "first.txt"], &["a", "a"]] {
+            let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+            assert!(plan(&names, d).is_err(), "{names:?} was allowed");
+        }
+        assert_eq!(std::fs::read_dir(d).unwrap().count(), 0, "something was created");
+    }
+
+    /// One disk holding the store and downloads needs room for two copies.
+    #[test]
+    fn space_counts_both_copies_on_one_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, downloads) = (dir.path().join("blobs"), dir.path().join("etd-downloads"));
+        let (_, free) = disk(dir.path()).unwrap();
+        assert!(enough_space(&store, &downloads, 1).is_ok() || free < FREE_MARGIN + 2);
+        // Fits once, not twice (with room for the free space to move a little).
+        if free > FREE_MARGIN + 300_000_000 {
+            let total = (free - FREE_MARGIN) * 2 / 3;
+            assert!(enough_space(&store, &downloads, total).is_err());
+        }
+        assert!(enough_space(&store, &downloads, u64::MAX / 2).is_err());
     }
 
     /// Deliver between two stores, then let both collect garbage: the
@@ -330,9 +478,16 @@ mod tests {
         let paths = deliver(&receiver, &incoming, outgoing.hash(), &downloads, &mut tokio::io::sink()).await.unwrap();
         assert_eq!(paths, [downloads.join("report.bin")]);
 
-        // Not offered any more: a second fetch is refused.
+        // A second send of the same bytes is still served after the first ends.
         let hash = outgoing.hash();
+        let again = sender.import(std::slice::from_ref(&original)).await.unwrap();
+        assert_eq!(again.hash(), hash);
         drop(outgoing);
+        let paths = deliver(&receiver, &incoming, hash, &downloads, &mut tokio::io::sink()).await.unwrap();
+        assert_eq!(paths, [downloads.join("report (2).bin")]);
+
+        // Not offered any more: a later fetch is refused.
+        drop(again);
         let other = tempfile::tempdir().unwrap();
         assert!(deliver(&receiver, &incoming, hash, other.path(), &mut tokio::io::sink()).await.is_err());
 

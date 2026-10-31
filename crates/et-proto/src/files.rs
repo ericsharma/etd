@@ -10,7 +10,7 @@
 //! Blobs are kept only while a send or a delivery runs (tags); the store's
 //! garbage collection removes the rest. The sender imports by reference, so
 //! its files are not copied; the store never deletes a file it references.
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -37,8 +37,10 @@ pub const RECV_TAG: &str = "recv/";
 pub struct Files {
     store: FsStore,
     dir: PathBuf,
-    /// Root hashes being sent: the only ones served.
-    offered: Arc<Mutex<HashSet<Hash>>>,
+    /// Root hashes being sent: the only ones served. Counted per send: two
+    /// sends of the same bytes share one root, and the first to end must
+    /// not stop serving it to the other.
+    offered: Arc<Mutex<HashMap<Hash, usize>>>,
     /// Connections served on (stable ids).
     serving: Arc<Mutex<HashSet<usize>>>,
 }
@@ -64,7 +66,14 @@ impl Outgoing {
 
 impl Drop for Outgoing {
     fn drop(&mut self) {
-        self.files.offered.lock().unwrap().remove(&self.root.hash());
+        let hash = self.root.hash();
+        let mut offered = self.files.offered.lock().unwrap();
+        if let Some(n) = offered.get_mut(&hash) {
+            *n -= 1;
+            if *n == 0 {
+                offered.remove(&hash);
+            }
+        }
     }
 }
 
@@ -134,7 +143,7 @@ impl Files {
         let collection: Collection = items.iter().map(|(name, tag)| (name.clone(), tag.hash())).collect();
         // The collection's tag keeps the items.
         let root = collection.store(&self.store).await?;
-        self.offered.lock().unwrap().insert(root.hash());
+        *self.offered.lock().unwrap().entry(root.hash()).or_insert(0) += 1;
         Ok(Outgoing { files: self.clone(), root, total })
     }
 
@@ -177,7 +186,7 @@ impl Files {
 }
 
 /// Serves only offered roots (whole collections, with their children).
-fn only_offered(offered: Arc<Mutex<HashSet<Hash>>>) -> EventSender {
+fn only_offered(offered: Arc<Mutex<HashMap<Hash, usize>>>) -> EventSender {
     let mask = EventMask {
         connected: ConnectMode::None,
         get: RequestMode::Intercept,
@@ -189,7 +198,7 @@ fn only_offered(offered: Arc<Mutex<HashSet<Hash>>>) -> EventSender {
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if let ProviderMessage::GetRequestReceived(msg) = msg {
-                let ok = offered.lock().unwrap().contains(&msg.request.hash);
+                let ok = offered.lock().unwrap().contains_key(&msg.request.hash);
                 msg.tx.send(if ok { Ok(()) } else { Err(AbortReason::Permission) }).await.ok();
             } else if let ProviderMessage::ObserveRequestReceived(msg) = msg {
                 msg.tx.send(Err(AbortReason::Permission)).await.ok();
