@@ -135,6 +135,16 @@ async fn handle(mut stream: UnixStream, endpoint: &Endpoint, paths: &Paths, conn
         send(&mut stream, &reply).await?;
         return Ok(stream.shutdown().await?);
     }
+    // Every machine's agent instruction files (`etd meta drift`).
+    if let Request::AgentConfig = request {
+        let machines = crate::agentcfg::everywhere(endpoint, paths, connections).await;
+        let reply = match serde_json::to_string(&crate::agentcfg::Everywhere { machines }) {
+            Ok(json) => Response::AgentConfig { json },
+            Err(e) => Response::Error(format!("{e:#}")),
+        };
+        send(&mut stream, &reply).await?;
+        return Ok(stream.shutdown().await?);
+    }
     let (rx, tx) = stream.into_split();
     forward(request, rx, tx, endpoint, paths, connections).await
 }
