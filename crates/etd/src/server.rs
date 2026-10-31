@@ -443,12 +443,34 @@ async fn serve_stream(
             return Ok(());
         }
     };
+    // A revoke between the connection's start and this stream: `kind` was
+    // read at the start. Read the network again so a revoked member (or a
+    // machine made a device) gets nothing, not even a stream already open.
+    let now = match network::load(&state.paths) {
+        Ok(Some(signed)) => signed.network.member(&peer).map(|m| m.kind),
+        Ok(None) => None,
+        Err(e) => {
+            warn!("{e:#}");
+            let _ = write_frame(&mut send, &Response::Error("this machine cannot read its network document".into())).await;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+    if now != Some(kind) {
+        info!("{} is no longer a {} of the network: closing", peer.fmt_short(), kind_word(kind));
+        conn.close(2u32.into(), b"revoked");
+        return Ok(());
+    }
+    // Never a secret in the log: no `Debug` of a request that carries one.
     match &request {
         Request::Upload { path, len } => debug!("request: Upload {path} ({len} bytes)"),
         Request::LogAppend { session_id, offset, bytes, .. } => {
             debug!("request: LogAppend {session_id} at {offset} ({} bytes)", bytes.len())
         }
         Request::Pair { device_name, .. } => debug!("request: Pair from {device_name}"),
+        Request::Join { name, kind, .. } => debug!("request: Join from {name} ({})", kind_word(*kind)),
+        Request::NetworkRotate { chain, .. } => debug!("request: NetworkRotate ({} key change(s))", chain.len()),
+        Request::ConfigWrite { path, content, .. } => debug!("request: ConfigWrite {path} ({} bytes)", content.len()),
         other => debug!("request: {other:?}"),
     }
     let reply = match request {

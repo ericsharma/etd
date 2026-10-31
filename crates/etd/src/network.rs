@@ -357,12 +357,24 @@ async fn push_one(endpoint: &Endpoint, paths: &Paths, id: EndpointId, signed: Si
     // first; for one that has, they change nothing.
     let chain = load_rotations(paths)?;
     if chain.last().is_some_and(|r| r.new.network.key == signed.network.key) {
-        let key = load_key(paths)?.context("no network key")?.to_bytes();
+        let key = key_for(paths, id)?.with_context(|| format!("{} is not a machine of the network now", id.fmt_short()))?;
         call(&conn, Request::NetworkRotate { chain, key }).await?;
     }
     call(&conn, Request::NetworkUpdate { network: signed }).await?;
     conn.close(0u32.into(), b"sent");
     Ok(())
+}
+
+/// The network key's secret, for machine `id`: only if `id` is a machine of
+/// the document on disk now, and the key on disk is that document's key.
+/// A revoke writes the new key, then the new document, so a read between
+/// the two sees keys that differ and sends nothing; the caller's copy of the
+/// document (read earlier) is never trusted for this.
+fn key_for(paths: &Paths, id: EndpointId) -> anyhow::Result<Option<[u8; 32]>> {
+    let Some(current) = load(paths)? else { return Ok(None) };
+    let Some(key) = load_key(paths)? else { return Ok(None) };
+    let machine = current.network.member(&id).is_some_and(|m| m.kind == Kind::Machine);
+    Ok((machine && key.public() == current.network.key).then(|| key.to_bytes()))
 }
 
 async fn call(conn: &iroh::endpoint::Connection, request: Request) -> anyhow::Result<()> {
@@ -457,6 +469,33 @@ mod tests {
         assert!(revoke(&paths, me, "trigkey").is_err(), "not this machine");
         assert_eq!(revoke(&paths, me, "iPhone 2").unwrap().len(), 1);
         assert!(load(&paths).unwrap().unwrap().network.member(&p2).is_none());
+    }
+
+    /// The network key goes only to a machine of the network as it is on
+    /// disk now: not to a revoked one, not to a device, and not while the key
+    /// and the document disagree (half way through a revoke).
+    #[test]
+    fn key_only_for_current_machines() {
+        let (_dir, paths) = paths();
+        let me = SecretKey::generate().public();
+        ensure(&paths, me, "trigkey").unwrap();
+        let (gone, kept, phone) = (SecretKey::generate().public(), SecretKey::generate().public(), SecretKey::generate().public());
+        admit(&paths, me, gone, "gmktec", Kind::Machine).unwrap();
+        admit(&paths, me, kept, "mac-mini", Kind::Machine).unwrap();
+        admit(&paths, me, phone, "iPhone", Kind::Device).unwrap();
+        let old = load_key(&paths).unwrap().unwrap().to_bytes();
+        assert_eq!(key_for(&paths, gone).unwrap(), Some(old));
+        assert_eq!(key_for(&paths, phone).unwrap(), None, "a device never gets the key");
+
+        revoke(&paths, me, "gmktec").unwrap();
+        let new = load_key(&paths).unwrap().unwrap().to_bytes();
+        assert_ne!(new, old, "revoking a machine changes the key");
+        assert_eq!(key_for(&paths, gone).unwrap(), None, "the revoked machine gets nothing");
+        assert_eq!(key_for(&paths, kept).unwrap(), Some(new));
+
+        // A key on disk that is not the document's (a revoke between its two writes).
+        save_key(&paths, &SecretKey::generate()).unwrap();
+        assert_eq!(key_for(&paths, kept).unwrap(), None);
     }
 
     #[test]
