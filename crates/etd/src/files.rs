@@ -499,8 +499,13 @@ mod tests {
                 .count()
         };
         assert_eq!(big_in_store("b"), 1, "the receiver's store holds its copy");
-        tokio::time::sleep(gc * 5).await;
-        assert_eq!(big_in_store("b"), 0, "garbage collection did not run");
+        // Look until a collection ran: a busy machine (the whole suite at
+        // once) can take much longer than a few intervals.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while big_in_store("b") > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(gc).await;
+        }
+        assert_eq!(big_in_store("b"), 0, "garbage collection did not run in 30 s");
         assert_eq!(std::fs::read(&original).unwrap(), data, "the sender's original changed");
         assert_eq!(std::fs::read(downloads.join("report.bin")).unwrap(), data, "the delivered copy changed");
     }
