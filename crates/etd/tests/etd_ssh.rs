@@ -124,16 +124,18 @@ async fn manymux_over_etd_ssh() {
         eprintln!("skipped: no `mm` on PATH");
         return;
     };
-    // gmktec's node, with one session.
+    // The other machine's node, with one session. Not named after any real
+    // machine: manymux treats its own host name as "here" (`mm ls gmktec` on
+    // gmktec lists the local node), so a real name fails on that machine.
     let remote = Node::start(&real, &[]);
     let new = remote.mm().args(["new", "-d", "-n", "t1", "sh", "-c", "sleep 60"]).output().unwrap();
     assert!(new.status.success(), "mm new: {}", String::from_utf8_lossy(&new.stderr));
 
     let book = MemoryLookup::new();
     let hub = Machine::start("trigkey", &book, vec![]).await;
-    let gmktec = Machine::start("gmktec", &book, remote.env()).await;
+    let remote_box = Machine::start("test-remote", &book, remote.env()).await;
     let url = pair::invite_url(&hub.paths, &local_addr(&hub.endpoint), "trigkey", Kind::Machine).unwrap();
-    network::join(&gmktec.endpoint, &gmktec.paths, &url, "gmktec").await.unwrap();
+    network::join(&remote_box.endpoint, &remote_box.paths, &url, "test-remote").await.unwrap();
 
     let socket = local::socket_path(&hub.paths);
     let _local = local::spawn(hub.endpoint.clone(), hub.paths.clone(), Default::default());
@@ -145,10 +147,10 @@ async fn manymux_over_etd_ssh() {
     }
 
     // Commands: output and exit code come back, as with ssh.
-    let out = etd_ssh(&socket, &["-T", "-o", "BatchMode=yes", "gmktec", "--", "echo", "$((40+2))"]);
+    let out = etd_ssh(&socket, &["-T", "-o", "BatchMode=yes", "test-remote", "--", "echo", "$((40+2))"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n", "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(etd_ssh(&socket, &["gmktec", "--", "exit 3"]).status.code(), Some(3));
+    assert_eq!(etd_ssh(&socket, &["test-remote", "--", "exit 3"]).status.code(), Some(3));
     let unknown = etd_ssh(&socket, &["laptop", "--", "true"]);
     assert_eq!(unknown.status.code(), Some(255));
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("not a machine"), "{}", String::from_utf8_lossy(&unknown.stderr));
@@ -156,8 +158,8 @@ async fn manymux_over_etd_ssh() {
     // manymux's CLI, on a node of its own, with MM_SSH=etd-ssh.
     let client = Node::start(&real, &[("MM_SSH", ETD_SSH.into()), ("ETD_SOCKET", socket.display().to_string())]);
     std::fs::create_dir_all(client.dir.path().join("config")).unwrap();
-    std::fs::write(client.dir.path().join("config/hosts.toml"), "hosts = [\"gmktec\"]\n").unwrap();
-    let ls = client.mm().args(["ls", "gmktec"]).env("MM_SSH", ETD_SSH).env("ETD_SOCKET", &socket).output().unwrap();
+    std::fs::write(client.dir.path().join("config/hosts.toml"), "hosts = [\"test-remote\"]\n").unwrap();
+    let ls = client.mm().args(["ls", "test-remote"]).env("MM_SSH", ETD_SSH).env("ETD_SOCKET", &socket).output().unwrap();
     let text = String::from_utf8_lossy(&ls.stdout);
-    assert!(text.contains("gmktec/t1"), "mm ls: {text}\nstderr: {}", String::from_utf8_lossy(&ls.stderr));
+    assert!(text.contains("test-remote/t1"), "mm ls: {text}\nstderr: {}", String::from_utf8_lossy(&ls.stderr));
 }
