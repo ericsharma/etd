@@ -86,7 +86,7 @@ fn project_slug(dir: &Path) -> String {
     dir.display().to_string().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect()
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -239,8 +239,8 @@ pub fn snapshot(home: &Path) -> Snapshot {
             let meta = std::fs::metadata(&path).ok()?;
             let bytes = if meta.len() <= MAX_CONTENT { Some(std::fs::read(&path).ok()?) } else { None };
             let sha = match &bytes {
-                Some(b) => sha256(b),
-                None => sha256(&std::fs::read(&path).ok()?),
+                Some(b) => sha256_hex(b),
+                None => sha256_hex(&std::fs::read(&path).ok()?),
             };
             let shown = tilde(home, &path);
             let id = match shown.strip_prefix(&own_project) {
@@ -304,8 +304,9 @@ fn writable(home: &Path, path: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Replaces `path` with `content` if its sha256 is still `base` (empty: it
-/// must not exist). The old file goes to `backups/<time>/` first: returns
-/// that copy's path, or an empty string for a new file.
+/// must not exist; empty `content`: remove it). The old file goes to
+/// `backups/<time>/` first: returns that copy's path, or an empty string
+/// for a new file.
 fn write_file(home: &Path, backups: &Path, path: &str, base: &str, content: &str, now: u64) -> anyhow::Result<String> {
     if content.len() > MAX_WRITE {
         bail!("{} bytes is too large for an instruction file (at most {MAX_WRITE})", content.len());
@@ -320,10 +321,11 @@ fn write_file(home: &Path, backups: &Path, path: &str, base: &str, content: &str
         Err(e) => return Err(e).with_context(|| format!("read {path}")),
     };
     match (&old, base) {
+        (None, "") if content.is_empty() => bail!("{path} does not exist: nothing to remove"),
         (None, "") => {}
         (None, _) => bail!("{path} does not exist any more"),
         (Some(_), "") => bail!("{path} exists now: read it again"),
-        (Some(old), base) if sha256(old) != base => bail!("{path} changed since it was read: read it again"),
+        (Some(old), base) if sha256_hex(old) != base => bail!("{path} changed since it was read: read it again"),
         _ => {}
     }
     let mode = std::fs::metadata(&full).map(|m| m.permissions().mode() & 0o777).unwrap_or(0o644);
@@ -341,6 +343,11 @@ fn write_file(home: &Path, backups: &Path, path: &str, base: &str, content: &str
         std::fs::write(&copy, old)?;
         std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600))?;
         backup = copy.display().to_string();
+    }
+    // Empty content removes the file (the undo of a new file).
+    if content.is_empty() {
+        std::fs::remove_file(&full)?;
+        return Ok(backup);
     }
     let parent = full.parent().context("no folder")?;
     std::fs::create_dir_all(parent)?;
@@ -540,7 +547,7 @@ mod tests {
         sort(&mut want);
         assert_eq!(got, want);
         let main = s.files.iter().find(|f| f.kind == "instructions" && f.agent == "claude").unwrap();
-        assert_eq!(main.sha256, sha256(main.content.as_ref().unwrap().as_bytes()));
+        assert_eq!(main.sha256, sha256_hex(main.content.as_ref().unwrap().as_bytes()));
     }
 
     #[test]
@@ -548,7 +555,7 @@ mod tests {
         let home = home_dir();
         let h = home.path();
         let backups = h.join("backups");
-        let base = sha256(&std::fs::read(h.join(".claude/CLAUDE.md")).unwrap());
+        let base = sha256_hex(&std::fs::read(h.join(".claude/CLAUDE.md")).unwrap());
         let backup = write_file(h, &backups, "~/.claude/CLAUDE.md", &base, "New rules.\n", 1000).unwrap();
         assert_eq!(std::fs::read_to_string(h.join(".claude/CLAUDE.md")).unwrap(), "New rules.\n");
         assert!(std::fs::read_to_string(&backup).unwrap().starts_with("Rules."));
@@ -561,6 +568,13 @@ mod tests {
         assert_eq!(write_file(h, &backups, &new, "", "a fact\n", 1002).unwrap(), "");
         let err = write_file(h, &backups, &new, "", "again", 1003).unwrap_err();
         assert!(err.to_string().contains("exists now"), "{err}");
+        // Undo of the new file: empty content removes it, with a backup.
+        let full = h.join(new.strip_prefix("~/").unwrap());
+        let backup = write_file(h, &backups, &new, &sha256_hex(b"a fact\n"), "", 1004).unwrap();
+        assert!(!full.exists());
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), "a fact\n");
+        let err = write_file(h, &backups, &new, "", "", 1005).unwrap_err();
+        assert!(err.to_string().contains("nothing to remove"), "{err}");
     }
 
     #[test]
@@ -568,7 +582,7 @@ mod tests {
         let home = home_dir();
         let h = home.path();
         let b = h.join("backups");
-        let sha = |rel: &str| sha256(&std::fs::read(h.join(rel)).unwrap());
+        let sha = |rel: &str| sha256_hex(&std::fs::read(h.join(rel)).unwrap());
         for (path, base, why) in [
             ("~/.claude/settings.json", sha(".claude/settings.json"), "not an agent instruction file"),
             ("~/.bashrc", String::new(), "not an agent instruction file"),

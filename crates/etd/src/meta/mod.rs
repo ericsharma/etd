@@ -9,6 +9,8 @@
 //! Files in `logbook/meta/`: `runs/<id>.json` (`id` = the time), and
 //! `decisions.json` (the owner's answers; a rejected finding is not
 //! proposed again).
+mod schedule;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -59,7 +61,7 @@ pub struct MetaRun {
     pub drift: Vec<agentcfg::Drift>,
     /// Applied proposals, before and after (A5).
     #[serde(default)]
-    pub followup: Vec<serde_json::Value>,
+    pub followup: Vec<Followup>,
     /// Machines that did not answer `AgentConfig`, and proposals etd left
     /// out, with why.
     #[serde(default)]
@@ -112,6 +114,34 @@ pub struct Target {
     pub base: String,
     /// The whole new file.
     pub content: String,
+    /// The file before the change (empty: a new file), and the new file's
+    /// sha256: Undo is `ConfigWrite { path, base: after, content: old }`.
+    #[serde(default)]
+    pub old: String,
+    #[serde(default)]
+    pub after: String,
+}
+
+/// An applied proposal: its finding's signal kinds on its machines, in
+/// the same time before and after.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Followup {
+    pub finding: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<String>,
+    pub title: String,
+    /// Unix seconds: the first `applied` decision.
+    pub applied: u64,
+    /// Empty: all machines.
+    pub machines: Vec<String>,
+    pub kinds: Vec<String>,
+    /// Seconds in each window: `[applied - span, applied)` and
+    /// `[applied, applied + span)`; at most 30 days.
+    pub span: u64,
+    pub before: u32,
+    pub after: u32,
+    /// An `undo` came after it.
+    pub undone: bool,
 }
 
 // ---- The model's answer ----
@@ -545,7 +575,8 @@ fn settle(answer: Answer, signals: &[Signal], snapshots: &[Snapshot], decided: &
                 if let Some(f) = s.files.iter().find(|f| f.id == p.file) {
                     agent |= f.git || f.link.is_some();
                 }
-                targets.push(Target { machine: s.machine.clone(), path, base, content: new });
+                let after = agentcfg::sha256_hex(new.as_bytes());
+                targets.push(Target { machine: s.machine.clone(), path, base, content: new, old, after });
             }
             if targets.is_empty() {
                 dropped.push(format!("{label}: applies on no machine"));
@@ -629,10 +660,88 @@ pub async fn build(
     };
     let decided = decisions(logbook)?;
     let taken = config::now_secs().max(latest(logbook)?.map_or(0, |r| r.taken + 1));
-    let run = settle(answer, &all, &snapshots, &decided, taken.to_string(), taken);
+    let mut run = settle(answer, &all, &snapshots, &decided, taken.to_string(), taken);
+    run.followup = followup(logbook, &decided, &all, config::now_secs());
     config::write_json(&runs(logbook).join(format!("{}.json", run.id)), &run)?;
     progress("Findings", 1, 1);
     info!("meta: run {}: {} finding(s), {} left out", run.id, run.findings.len(), run.dropped.len());
+    Ok(run)
+}
+
+// ---- Follow-up (A5) ----
+
+/// The finding a decision is about: in its run, else the newest run that
+/// has it.
+fn finding_of(logbook: &Path, run: Option<&str>, id: &str) -> Option<Finding> {
+    let in_run = |run: &MetaRun| run.findings.iter().find(|f| f.id == id).cloned();
+    if let Some(found) = run.and_then(|r| load(logbook, r).ok()).and_then(|r| in_run(&r)) {
+        return Some(found);
+    }
+    let mut ids: Vec<u64> =
+        std::fs::read_dir(runs(logbook)).ok()?.filter_map(|f| f.ok()?.file_name().to_str()?.strip_suffix(".json")?.parse().ok()).collect();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids.into_iter().find_map(|id| in_run(&load(logbook, &id.to_string()).ok()?))
+}
+
+/// Each applied proposal: its finding's signal kinds on its machines, in
+/// the same time before and after it was applied.
+pub fn followup(logbook: &Path, decided: &[Decision], signals: &[Signal], now: u64) -> Vec<Followup> {
+    let mut out: Vec<Followup> = Vec::new();
+    for d in decided.iter().filter(|d| d.decision == "applied") {
+        if let Some(f) = out.iter_mut().find(|f| f.finding == d.finding && f.proposal == d.proposal) {
+            // Applied on more machines later: one row.
+            f.machines.extend(d.machines.iter().cloned());
+            f.machines.sort();
+            f.machines.dedup();
+            continue;
+        }
+        let Some(finding) = finding_of(logbook, d.run.as_deref(), &d.finding) else { continue };
+        let kinds: BTreeSet<String> = finding.evidence.iter().map(|e| e.kind.clone()).collect();
+        let mut machines = d.machines.clone();
+        machines.sort();
+        out.push(Followup {
+            finding: d.finding.clone(),
+            proposal: d.proposal.clone(),
+            title: finding.title,
+            applied: d.at,
+            machines,
+            kinds: kinds.into_iter().collect(),
+            span: 0,
+            before: 0,
+            after: 0,
+            undone: false,
+        });
+    }
+    for f in &mut out {
+        f.undone = decided.iter().any(|d| d.decision == "undo" && d.finding == f.finding && d.proposal == f.proposal && d.at >= f.applied);
+        f.span = now.saturating_sub(f.applied).min(WINDOW);
+        let counted = signals.iter().filter(|s| {
+            let machine = s.key.split('/').next().unwrap_or_default();
+            s.time > 0 && f.kinds.contains(&s.kind) && (f.machines.is_empty() || f.machines.iter().any(|m| m == machine))
+        });
+        for s in counted {
+            if s.time < f.applied && s.time >= f.applied - f.span.min(f.applied) {
+                f.before += 1;
+            } else if s.time >= f.applied && s.time < f.applied + f.span.max(1) {
+                f.after += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The run with its follow-up counted now.
+async fn with_followup(logbook: &Path, entries: Vec<(Entry, PathBuf)>, mut run: MetaRun) -> anyhow::Result<MetaRun> {
+    let decided = decisions(logbook)?;
+    if !decided.iter().any(|d| d.decision == "applied") {
+        return Ok(run);
+    }
+    let dir = logbook.to_path_buf();
+    run.followup = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Followup>> {
+        let signals: Vec<Signal> = signals::scan(&dir, &entries)?.into_values().flatten().collect();
+        Ok(followup(&dir, &decided, &signals, config::now_secs()))
+    })
+    .await??;
     Ok(run)
 }
 
@@ -702,7 +811,17 @@ pub async fn serve(state: &State, refresh: bool, mut send: SendStream) -> anyhow
         not_archive()
     } else if !refresh {
         match latest(&logbook) {
-            Ok(Some(run)) => Response::Meta { json: serde_json::to_string(&run)? },
+            Ok(Some(run)) => {
+                let entries: Vec<(Entry, PathBuf)> = {
+                    let store = state.logbook().get(state.paths()).await?;
+                    let store = store.lock().await;
+                    store.entries().map(|e| (e.clone(), store.path(&e.machine, &e.session_id))).collect()
+                };
+                match with_followup(&logbook, entries, run).await {
+                    Ok(run) => Response::Meta { json: serde_json::to_string(&run)? },
+                    Err(e) => Response::Error(format!("{e:#}")),
+                }
+            }
             Ok(None) => Response::Meta { json: NO_RUN.into() },
             Err(e) => Response::Error(format!("{e:#}")),
         }
@@ -813,22 +932,22 @@ pub async fn cli(paths: &Paths, refresh: bool) -> anyhow::Result<()> {
         bail!("not a Logbook archive (etd logbook archive on)");
     }
     let logbook = paths.logbook();
+    let entries: Vec<(Entry, PathBuf)> = Store::read_entries(&logbook)?
+        .into_iter()
+        .map(|e| {
+            let file = logbook.join(&e.machine).join(format!("{}.jsonl", e.session_id));
+            (e, file)
+        })
+        .collect();
     let run = if refresh {
         let env: Env = crate::tmux::login_env().await;
-        let entries = Store::read_entries(&logbook)?
-            .into_iter()
-            .map(|e| {
-                let file = logbook.join(&e.machine).join(format!("{}.jsonl", e.session_id));
-                (e, file)
-            })
-            .collect();
         let snapshots = snapshots_from_daemon(paths).await?;
         let model = Model { dir: dir(&logbook).join("model"), ..Model::new(&env, &logbook) };
         let progress = |stage: &str, done: u32, total: u32| eprintln!("{stage} {done}/{total}");
         build(&logbook, &model, entries, snapshots, &progress).await?
     } else {
         match latest(&logbook)? {
-            Some(run) => run,
+            Some(run) => with_followup(&logbook, entries, run).await?,
             None => {
                 println!("No meta run yet: etd meta run --refresh");
                 return Ok(());
@@ -852,6 +971,14 @@ pub async fn cli(paths: &Paths, refresh: bool) -> anyhow::Result<()> {
             }
         }
     }
+    if !run.followup.is_empty() {
+        println!("\nApplied (signals of the finding's kinds, before → after, same length of time):");
+        for f in &run.followup {
+            let on = if f.machines.is_empty() { "all machines".to_string() } else { f.machines.join(", ") };
+            let undone = if f.undone { " (undone)" } else { "" };
+            println!("  {}: {} → {} in {:.1} days each, on {on}{undone}", f.title, f.before, f.after, f.span as f64 / 86_400.0);
+        }
+    }
     if !run.dropped.is_empty() {
         println!("\nLeft out:");
         for d in &run.dropped {
@@ -862,8 +989,8 @@ pub async fn cli(paths: &Paths, refresh: bool) -> anyhow::Result<()> {
 }
 
 /// `etd meta schedule on|off` (A5).
-pub async fn schedule_cli(_paths: &Paths, _on: bool) -> anyhow::Result<()> {
-    anyhow::bail!("not built yet: etd meta schedule (PLAN-logbook-v2 A5)")
+pub async fn schedule_cli(paths: &Paths, on: bool) -> anyhow::Result<()> {
+    schedule::cli(paths, on).await
 }
 
 #[cfg(test)]

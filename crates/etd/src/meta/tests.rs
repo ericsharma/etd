@@ -198,3 +198,71 @@ async fn a_run_reads_signals_asks_the_model_and_keeps_the_findings() {
     assert!(finding(&paths, &run.id, "nope").is_err());
     assert!(finding(&paths, "../x", "stop-deleting").is_err());
 }
+
+#[test]
+fn targets_carry_what_undo_needs() {
+    let signals = vec![signal("interrupt", "trigkey/a", "p1")];
+    let a = answer(serde_json::json!({"findings": [{"id": "f", "title": "t", "evidence": [{"key": "trigkey/a", "turn": "p1"}],
+        "proposals": [{"route": "change", "file": "~/.claude/CLAUDE.md", "machines": ["trigkey"], "find": "Rules.", "replace": "Rules!"}]}]}));
+    let run = settle(a, &signals, &snapshots(), &[], "1".into(), 1);
+    let t = &run.findings[0].proposals[0].targets[0];
+    assert_eq!((t.old.as_str(), t.content.as_str()), ("Rules.\n", "Rules!\n"));
+    assert_eq!(t.after, agentcfg::sha256_hex(b"Rules!\n"));
+}
+
+#[test]
+fn followup_counts_the_kinds_on_the_machines_before_and_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let logbook = dir.path();
+    let run = MetaRun {
+        id: "50".into(),
+        taken: 50,
+        findings: vec![Finding {
+            id: "stop-deleting".into(),
+            title: "Deletes without asking".into(),
+            kind: "interrupt".into(),
+            why: String::new(),
+            count: 1,
+            sessions: 1,
+            evidence: vec![Evidence { key: "trigkey/a".into(), turn: "p1".into(), kind: "interrupt".into(), excerpt: String::new() }],
+            proposals: vec![],
+        }],
+        drift: vec![],
+        followup: vec![],
+        dropped: vec![],
+    };
+    config::write_json(&runs(logbook).join("50.json"), &run).unwrap();
+    let applied = 10_000;
+    let decision = |what: &str, machines: &[&str], at: u64| Decision {
+        decision: what.into(),
+        finding: "stop-deleting".into(),
+        proposal: Some("p1".into()),
+        machines: machines.iter().map(|m| m.to_string()).collect(),
+        note: None,
+        run: Some("50".into()),
+        at,
+    };
+    let at = |kind: &str, key: &str, time: u64| Signal { time, ..signal(kind, key, "x") };
+    let signals = vec![
+        at("interrupt", "trigkey/a", applied - 900),
+        at("interrupt", "gmktec/b", applied - 800),
+        at("interrupt", "trigkey/a", applied - 5_000), // before the window
+        at("interrupt", "trigkey/c", applied + 300),
+        at("interrupt", "mac-mini/d", applied + 400), // not applied there
+        at("tool-error", "trigkey/a", applied + 500), // another kind
+        at("interrupt", "trigkey/a", 0),              // no time
+    ];
+    let decided = vec![decision("applied", &["trigkey"], applied), decision("applied", &["gmktec"], applied + 50)];
+    let rows = followup(logbook, &decided, &signals, applied + 1_000);
+    assert_eq!(rows.len(), 1, "one row for both machines");
+    let f = &rows[0];
+    assert_eq!(
+        (f.title.as_str(), f.machines.clone(), f.kinds.clone()),
+        ("Deletes without asking", vec!["gmktec".to_string(), "trigkey".into()], vec!["interrupt".to_string()])
+    );
+    assert_eq!((f.span, f.before, f.after, f.undone), (1_000, 2, 1, false));
+
+    let mut decided = decided;
+    decided.push(decision("undo", &["trigkey"], applied + 600));
+    assert!(followup(logbook, &decided, &signals, applied + 1_000)[0].undone);
+}
