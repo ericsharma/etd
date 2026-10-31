@@ -64,7 +64,7 @@ pub struct Session {
     pub prompts: u32,
     /// Ended with fewer than 2 prompts: the apps hide it.
     pub trivial: bool,
-    /// Signal kind → count (A2); empty until then.
+    /// Signal kind → count (signals.rs); `{}` when there is none.
     pub friction: BTreeMap<String, u32>,
     pub first: u64,
     pub last: u64,
@@ -165,6 +165,7 @@ fn build(logbook: &Path, entries: &[(Entry, PathBuf)]) -> anyhow::Result<Overvie
         })
         .unwrap_or_default();
     let goals = goals(logbook);
+    let signals = super::signals::scan(logbook, entries)?;
     let mut changed = false;
     let mut sessions = Vec::with_capacity(entries.len());
     for (e, file) in entries {
@@ -189,6 +190,7 @@ fn build(logbook: &Path, entries: &[(Entry, PathBuf)]) -> anyhow::Result<Overvie
             (None, None, Some(prompt)) => (Some(prompt.clone()), Some("prompt")),
             _ => (None, None),
         };
+        let friction = signals.get(&key).map(|s| super::signals::counts(s)).unwrap_or_default();
         sessions.push(Session {
             key,
             agent: if e.meta.agent.is_empty() { "claude".into() } else { e.meta.agent.clone() },
@@ -201,7 +203,7 @@ fn build(logbook: &Path, entries: &[(Entry, PathBuf)]) -> anyhow::Result<Overvie
             state: e.meta.status.clone(),
             prompts: seen.prompts,
             trivial: e.meta.status == "gone" && seen.prompts < 2,
-            friction: BTreeMap::new(),
+            friction,
             first: e.first,
             last: e.last,
         });
@@ -408,6 +410,6 @@ mod tests {
         let o = build(dir.path(), &[(entry("b", "gone", bytes, None), file)]).unwrap();
         assert!(o.sessions[0].trivial);
         let json = serde_json::to_value(&o).unwrap();
-        assert_eq!(json["sessions"][0]["friction"], serde_json::json!({}), "friction is an empty object until A2");
+        assert_eq!(json["sessions"][0]["friction"], serde_json::json!({}), "no signals: an empty object");
     }
 }

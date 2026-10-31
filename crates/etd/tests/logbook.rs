@@ -250,6 +250,8 @@ async fn the_apps_read_the_archive() {
         (s["asked"].as_str(), s["said"].as_str(), s["prompts"].as_u64(), s["state"].as_str()),
         (Some("Why does CI fail?"), Some("nixfmt."), Some(1), Some("busy"))
     );
+    // A2: no friction in this transcript.
+    assert_eq!(ask(&conn, Request::LogSignals { since: 0 }).await, Response::Signals { json: r#"{"signals":[]}"#.into() });
     assert_eq!(ask(&conn, Request::Report { refresh: false }).await, Response::Report { json: et_proto::logbook::NO_REPORT.into() });
 
     // Follow from inside the first line: it starts at the second; the
