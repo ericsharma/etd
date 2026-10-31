@@ -168,14 +168,57 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> anyhow::Result<Option<T>> 
 }
 
 /// Writes through a temporary file, so a reader never sees half a file.
+/// The temporary name is this write's own: two writers (the daemon and a
+/// CLI run) never share one.
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{n}.tmp", std::process::id()));
+    let written = fs::write(&tmp, serde_json::to_vec_pretty(value)?).and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    Ok(written?)
+}
+
+/// An exclusive `flock` on `<path>.lock`, held until dropped: for files
+/// that the daemon and a CLI command both read, change and write.
+#[derive(Debug)]
+pub struct FileLock {
+    _file: fs::File,
+}
+
+impl FileLock {
+    /// Waits for the lock.
+    pub fn take(path: &Path) -> anyhow::Result<Self> {
+        Self::flock(path, libc::LOCK_EX)?.context("flock")
+    }
+
+    /// The lock, or None if someone holds it.
+    pub fn try_take(path: &Path) -> anyhow::Result<Option<Self>> {
+        Self::flock(path, libc::LOCK_EX | libc::LOCK_NB)
+    }
+
+    fn flock(path: &Path, how: libc::c_int) -> anyhow::Result<Option<Self>> {
+        use std::os::unix::io::AsRawFd;
+        let lock = path.with_extension("lock");
+        if let Some(dir) = lock.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock)?;
+        // SAFETY: flock on a descriptor we own; released when it closes.
+        if unsafe { libc::flock(file.as_raw_fd(), how) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(e).with_context(|| format!("lock {}", lock.display()));
+        }
+        Ok(Some(Self { _file: file }))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

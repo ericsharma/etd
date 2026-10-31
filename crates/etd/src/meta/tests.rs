@@ -321,3 +321,55 @@ fn fresh_targets_follow_the_files_as_they_are_now() {
         ["mac-mini".to_string(), "trigkey".into()].into()
     );
 }
+
+/// A file that has the change is not changed again, even when `replace`
+/// contains `find`; the applied machine keeps what Undo needs.
+#[test]
+fn an_applied_change_is_not_applied_again() {
+    assert_eq!(has_change("a\nRun tests.\nb\n", "Run tests.", "Run tests without asking."), None);
+    let done = "a\nRun tests without asking.\nb\n";
+    assert_eq!(has_change(done, "Run tests.", "Run tests without asking."), Some(Some("a\nRun tests.\nb\n".into())));
+    // Added at the end: only whole lines count, and the file without it is known.
+    let appended = change("Rules.\n", "", "\n## Tests\n- Run them.").unwrap();
+    assert_eq!(has_change(&appended, "", "\n## Tests\n- Run them."), Some(Some("Rules.\n".into())));
+    assert_eq!(has_change("Rules.\n- Run them. Always.\n", "", "- Run them."), None);
+    // A removal is done when the text is gone.
+    assert_eq!(has_change("a\n", "b\n", ""), Some(None));
+
+    let signals = vec![signal("interrupt", "trigkey/a", "p1")];
+    let a = answer(serde_json::json!({"findings": [{"id": "f", "title": "t", "evidence": [{"key": "trigkey/a", "turn": "p1"}],
+    "proposals": [{"route": "change", "file": "~/.claude/CLAUDE.md", "machines": ["trigkey"], "find": "Rules.", "replace": "Rules. Run tests without asking."}]}]}));
+    let run = settle(a, &signals, &snapshots(), &[], "9".into(), 9);
+    let written = run.findings[0].proposals[0].targets[0].content.clone();
+    assert_eq!(written, "Rules. Run tests without asking.\n");
+    let mut now = snapshots();
+    now[0].files[0].content = Some(written.clone());
+    now[0].files[0].sha256 = agentcfg::sha256_hex(written.as_bytes());
+    for _ in 0..3 {
+        let p = &fresh(run.clone(), &now, &[]).findings[0].proposals[0];
+        assert!(p.targets.is_empty(), "written again: {:?}", p.targets);
+        assert_eq!(p.applied, ["trigkey"]);
+        assert_eq!(p.undo.len(), 1);
+        assert_eq!((p.undo[0].base.as_str(), p.undo[0].content.as_str()), (now[0].files[0].sha256.as_str(), "Rules.\n"));
+    }
+    // The text to change is gone from the file: said in `dropped`, not lost.
+    now[0].files[0].content = Some("Other.\n".into());
+    let r = fresh(run, &now, &[]);
+    assert!(r.findings[0].proposals[0].targets.is_empty());
+    assert!(r.dropped.iter().any(|d| d.contains("not in ~/.claude/CLAUDE.md on trigkey")), "{:?}", r.dropped);
+}
+
+/// A link or git copy on one machine makes only that target `agent`.
+#[test]
+fn route_is_per_machine() {
+    let signals = vec![signal("interrupt", "trigkey/a", "p1")];
+    let a = answer(serde_json::json!({"findings": [{"id": "f", "title": "t", "evidence": [{"key": "trigkey/a", "turn": "p1"}],
+    "proposals": [{"route": "change", "file": "~/.claude/CLAUDE.md", "machines": ["all"], "find": "", "replace": "- x"}]}]}));
+    let mut snaps = snapshots();
+    snaps[0].files[0].link = Some("/nix/store/abc-CLAUDE.md".into());
+    let run = settle(a, &signals, &snaps, &[], "9".into(), 9);
+    let p = &run.findings[0].proposals[0];
+    assert_eq!(p.route, "write", "mac-mini's copy is a plain file");
+    let routes: Vec<(&str, &str)> = p.targets.iter().map(|t| (t.machine.as_str(), t.route.as_str())).collect();
+    assert_eq!(routes, [("trigkey", "agent"), ("mac-mini", "write")]);
+}

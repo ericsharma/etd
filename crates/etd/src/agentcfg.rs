@@ -133,6 +133,23 @@ fn imports(home: &Path, file: &Path, text: &str) -> Vec<PathBuf> {
     found
 }
 
+/// An `@` import that may be listed (and so written): a Markdown file in
+/// home, not in a hidden folder other than an agent's own, not settings,
+/// not in a hooks folder. Anything else a `CLAUDE.md` names
+/// (`@~/.claude/settings.json`, `@~/.ssh/id_ed25519`) stays off the list,
+/// so `ConfigWrite` can never reach it through an import.
+fn instruction_shaped(home: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(home) else { return false };
+    let md = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("md"));
+    let settings = path.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().starts_with("settings"));
+    let folders: Vec<String> =
+        rel.parent().into_iter().flat_map(|p| p.components()).map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    let hidden =
+        folders.iter().enumerate().any(|(i, f)| f.starts_with('.') && !(i == 0 && [".claude", ".codex", ".gemini"].contains(&f.as_str())));
+    let hooks = folders.iter().any(|f| f == "hooks");
+    md && !settings && !hidden && !hooks
+}
+
 /// `path` has no `..` and is a regular file or folder in `home`, not a
 /// link.
 fn safe_in(home: &Path, path: &Path) -> bool {
@@ -181,6 +198,10 @@ fn allow_list(home: &Path) -> Vec<(PathBuf, &'static str, &'static str)> {
         while let Some((file, depth)) = todo.pop() {
             let Ok(text) = std::fs::read_to_string(&file) else { continue };
             for import in imports(home, &file, &text) {
+                if !instruction_shaped(home, &import) {
+                    debug!("agent instructions: {} imports {}: not listed", file.display(), import.display());
+                    continue;
+                }
                 if depth < IMPORT_DEPTH && seen.insert(import.clone()) {
                     list.push((import.clone(), "import", "claude"));
                     todo.push((import, depth + 1));
@@ -315,6 +336,15 @@ fn write_file(home: &Path, backups: &Path, path: &str, base: &str, content: &str
         bail!("the new content looks like it holds a secret ({secret}…): not written");
     }
     let full = writable(home, path)?;
+    // An instruction file that would import a file no agent should read
+    // (a key, settings): Claude Code would load it into every session.
+    if let Some(bad) = imports(home, &full, content).into_iter().find(|p| !instruction_shaped(home, p)) {
+        bail!("the new content imports {}, which is not an agent instruction file: not written", tilde(home, &bad));
+    }
+    // One write at a time: the hash check, the backup and the rename of two
+    // writes of one file must not interleave.
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let old = match std::fs::read(&full) {
         Ok(old) => Some(old),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -351,10 +381,18 @@ fn write_file(home: &Path, backups: &Path, path: &str, base: &str, content: &str
     }
     let parent = full.parent().context("no folder")?;
     std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(".{}.etd-tmp", full.file_name().context("no file name")?.to_string_lossy()));
-    std::fs::write(&tmp, content)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
-    std::fs::rename(&tmp, &full)?;
+    // A new file of its own (never through a link, never another write's).
+    let tmp = parent.join(format!(".{}.{}-{now}.etd-tmp", full.file_name().context("no file name")?.to_string_lossy(), std::process::id()));
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        std::io::Write::write_all(&mut file, content.as_bytes())?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&tmp, &full)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("write {path}"));
+    }
     Ok(backup)
 }
 
@@ -617,6 +655,31 @@ mod tests {
         let err = write_file(h, &b, "~/.codex/AGENTS.md", "", "x", 1).unwrap_err().to_string();
         assert!(err.contains("not a plain file"), "{err}");
         assert_eq!(std::fs::read_to_string(outside.path().join("target.md")).unwrap(), "x");
+    }
+
+    /// An `@` import of settings, a key or a hook is not listed, so it can
+    /// not be written; new content that imports one is refused.
+    #[test]
+    fn imports_of_settings_or_keys_are_not_listed_or_written() {
+        let home = home_dir();
+        let h = home.path();
+        put(&h.join(".ssh/id_ed25519"), "key");
+        put(&h.join(".claude/hooks/pre.md"), "hook");
+        let main = "@~/.claude/settings.json @~/.ssh/id_ed25519 @hooks/pre.md @adhd-rules.md\n";
+        put(&h.join(".claude/CLAUDE.md"), main);
+        let s = snapshot(h);
+        let paths: Vec<&str> = s.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"~/.claude/adhd-rules.md"), "{paths:?}");
+        for never in ["~/.claude/settings.json", "~/.ssh/id_ed25519", "~/.claude/hooks/pre.md"] {
+            assert!(!paths.contains(&never), "{never} listed: {paths:?}");
+            let err = write_file(h, &h.join("backups"), never, &sha256_hex(b"{}"), "x", 1).unwrap_err().to_string();
+            assert!(err.contains("may change") || err.contains("changed"), "{never}: {err}");
+        }
+        assert_eq!(std::fs::read_to_string(h.join(".claude/settings.json")).unwrap(), "{}");
+        let base = sha256_hex(main.as_bytes());
+        let err = write_file(h, &h.join("backups"), "~/.claude/CLAUDE.md", &base, "@~/.ssh/id_ed25519\n", 1).unwrap_err().to_string();
+        assert!(err.contains("imports ~/.ssh/id_ed25519"), "{err}");
+        write_file(h, &h.join("backups"), "~/.claude/CLAUDE.md", &base, "@adhd-rules.md\nBe brief.\n", 1).unwrap();
     }
 
     #[test]

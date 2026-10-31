@@ -117,6 +117,20 @@ pub struct Proposal {
     /// decision).
     #[serde(default)]
     pub applied: Vec<String>,
+    /// For each machine in `applied` whose file is known: how to undo it,
+    /// `ConfigWrite { path, base, content }`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undo: Vec<Undo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Undo {
+    pub machine: String,
+    pub path: String,
+    /// The file's sha256 now (with the change).
+    pub base: String,
+    /// The file without the change.
+    pub content: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +147,10 @@ pub struct Target {
     pub old: String,
     #[serde(default)]
     pub after: String,
+    /// `write`, or `agent` when this machine's copy is in git or a link
+    /// (other machines may still be `write`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub route: String,
 }
 
 /// An applied proposal: its finding's signal kinds on its machines, in
@@ -488,6 +506,15 @@ fn prompt(
 
 /// The machine's path for a file id, its sha256 and content; for a new
 /// memory file, the path and no content.
+/// `agent` when this machine's copy of `id` is in git or a link (changed
+/// through an agent), else `write`.
+fn route_of(snapshot: &Snapshot, id: &str) -> &'static str {
+    match snapshot.files.iter().find(|f| f.id == id) {
+        Some(f) if f.git || f.link.is_some() => "agent",
+        _ => "write",
+    }
+}
+
 fn locate(snapshot: &Snapshot, id: &str) -> Option<(String, String, Option<String>)> {
     if let Some(f) = snapshot.files.iter().find(|f| f.id == id) {
         if f.too_big {
@@ -555,6 +582,7 @@ fn settle(answer: Answer, signals: &[Signal], snapshots: &[Snapshot], decided: &
                     find: String::new(),
                     replace: String::new(),
                     applied: Vec::new(),
+                    undo: Vec::new(),
                 });
                 continue;
             }
@@ -564,7 +592,7 @@ fn settle(answer: Answer, signals: &[Signal], snapshots: &[Snapshot], decided: &
             }
             let all = p.machines.is_empty() || p.machines.iter().any(|m| m == "all");
             let mut targets = Vec::new();
-            let mut agent = false;
+            let mut agent = true;
             for s in answered.iter().filter(|s| all || p.machines.contains(&s.machine)) {
                 let Some((path, base, content)) = locate(s, &p.file) else {
                     dropped.push(format!("{label}: {} has no {}", s.machine, p.file));
@@ -578,11 +606,10 @@ fn settle(answer: Answer, signals: &[Signal], snapshots: &[Snapshot], decided: &
                 if new == old {
                     continue;
                 }
-                if let Some(f) = s.files.iter().find(|f| f.id == p.file) {
-                    agent |= f.git || f.link.is_some();
-                }
+                let route = route_of(s, &p.file);
+                agent &= route == "agent";
                 let after = agentcfg::sha256_hex(new.as_bytes());
-                targets.push(Target { machine: s.machine.clone(), path, base, content: new, old, after });
+                targets.push(Target { machine: s.machine.clone(), path, base, content: new, old, after, route: route.into() });
             }
             if targets.is_empty() {
                 dropped.push(format!("{label}: applies on no machine"));
@@ -599,6 +626,7 @@ fn settle(answer: Answer, signals: &[Signal], snapshots: &[Snapshot], decided: &
                 find: p.find,
                 replace: p.replace,
                 applied: Vec::new(),
+                undo: Vec::new(),
             });
         }
         if proposals.is_empty() {
@@ -640,6 +668,11 @@ pub async fn build(
     snapshots: Vec<Snapshot>,
     progress: &(dyn Fn(&str, u32, u32) + Send + Sync),
 ) -> anyhow::Result<MetaRun> {
+    // One run at a time, the daemon's (the app, the nightly timer) or a
+    // CLI's: two would pay the model twice and race for the run's id.
+    let Some(_running) = config::FileLock::try_take(&runs(logbook).join("run"))? else {
+        bail!("a meta run is going on already; try again when it is done");
+    };
     let now = config::now_secs();
     std::fs::create_dir_all(&model.dir).with_context(|| format!("make {}", model.dir.display()))?;
     progress("Signals", 0, 1);
@@ -695,6 +728,45 @@ fn change(old: &str, find: &str, replace: &str) -> Option<String> {
     }
 }
 
+/// Whether `now` already has the change `find` → `replace`: Some(the file
+/// without it, for Undo; None when that is not known), else None.
+///
+/// Not "has `replace` and not `find`": `replace` often contains `find`
+/// (`Run tests.` → `Run tests without asking.`), and taking such a file
+/// for unchanged would apply the change again on every read.
+fn has_change(now: &str, find: &str, replace: &str) -> Option<Option<String>> {
+    if find.is_empty() {
+        // Added at the end: its lines are in the file, as whole lines.
+        let block: Vec<&str> = replace.trim().lines().collect();
+        let lines: Vec<&str> = now.lines().collect();
+        if block.is_empty() || block.len() > lines.len() {
+            return None;
+        }
+        let at = lines.windows(block.len()).position(|w| w == block.as_slice())?;
+        let mut kept: Vec<&str> = lines[..at].to_vec();
+        // `change` put a blank line before a block that starts with one.
+        if replace.trim_start_matches([' ', '\t']).starts_with('\n') && kept.last().is_some_and(|l| l.trim().is_empty()) {
+            kept.pop();
+        }
+        kept.extend(&lines[at + block.len()..]);
+        let mut without = kept.join("\n");
+        if !without.is_empty() {
+            without.push('\n');
+        }
+        return Some(Some(without));
+    }
+    if replace.is_empty() {
+        // A removal: done when the text is gone (what was removed is known,
+        // where it was is not).
+        return (!now.contains(find)).then_some(None);
+    }
+    if now.matches(replace).count() != 1 {
+        return None;
+    }
+    let without = now.replacen(replace, find, 1);
+    (change(&without, find, replace).as_deref() == Some(now)).then_some(Some(without))
+}
+
 /// `find` and `replace` of a proposal; from its diff for a run made before
 /// they were kept.
 fn find_replace(p: &Proposal) -> (String, String) {
@@ -729,6 +801,7 @@ pub fn pending_machines(run: &MetaRun) -> BTreeSet<String> {
 /// machine get no targets. A machine that did not answer keeps its target.
 pub fn fresh(mut run: MetaRun, snapshots: &[Snapshot], decided: &[Decision]) -> MetaRun {
     let run_id = run.id.clone();
+    let mut dropped = Vec::new();
     for f in &mut run.findings {
         let rejected = decided.iter().any(|d| d.decision == "reject" && d.finding == f.id);
         for p in &mut f.proposals {
@@ -741,6 +814,7 @@ pub fn fresh(mut run: MetaRun, snapshots: &[Snapshot], decided: &[Decision]) -> 
                 decided.iter().filter(about).filter(|d| d.decision == "undo").flat_map(|d| d.machines.clone()).collect();
             let (find, replace) = find_replace(p);
             let mut targets = Vec::new();
+            let mut undo = Vec::new();
             for t in &p.targets {
                 if rejected || undone.contains(&t.machine) || p.route == "note" {
                     continue;
@@ -753,25 +827,32 @@ pub fn fresh(mut run: MetaRun, snapshots: &[Snapshot], decided: &[Decision]) -> 
                 };
                 let Some((path, base, content)) = locate(s, &p.file) else { continue };
                 let old = content.unwrap_or_default();
-                let has_it =
-                    !replace.trim().is_empty() && old.contains(replace.trim()) && (find.trim().is_empty() || !old.contains(find.trim()));
-                if has_it {
+                if let Some(without) = has_change(&old, &find, &replace) {
                     applied.insert(t.machine.clone());
+                    if let Some(content) = without {
+                        undo.push(Undo { machine: t.machine.clone(), path, base, content });
+                    }
                     continue;
                 }
                 applied.remove(&t.machine);
-                let Some(content) = change(&old, &find, &replace) else { continue };
+                let Some(content) = change(&old, &find, &replace) else {
+                    dropped.push(format!("finding {} {}: the text to change is not in {} on {} once", f.id, p.id, p.file, t.machine));
+                    continue;
+                };
                 let after = agentcfg::sha256_hex(content.as_bytes());
-                targets.push(Target { machine: t.machine.clone(), path, base, content, old, after });
+                targets.push(Target { machine: t.machine.clone(), path, base, content, old, after, route: route_of(s, &p.file).into() });
             }
             for t in &undone {
                 applied.remove(t);
             }
+            undo.retain(|u| applied.contains(&u.machine));
             p.targets = targets;
             p.applied = applied.into_iter().collect();
+            p.undo = undo;
             (p.find, p.replace) = (find, replace);
         }
     }
+    run.dropped.extend(dropped);
     run
 }
 

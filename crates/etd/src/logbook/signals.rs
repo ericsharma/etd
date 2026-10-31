@@ -298,6 +298,8 @@ pub(crate) fn scan(logbook: &Path, entries: &[(Entry, PathBuf)]) -> anyhow::Resu
     static BUSY: OnceLock<Mutex<()>> = OnceLock::new();
     let _one = BUSY.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
     let path = cache_path(logbook);
+    // `etd meta run` (a CLI process) scans too.
+    let _file = config::FileLock::take(&path)?;
     let mut cache: BTreeMap<String, Scan> = config::read_json(&path)
         .unwrap_or_else(|e| {
             warn!("logbook signals: {e:#}; reading all transcripts again");

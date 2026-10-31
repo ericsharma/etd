@@ -471,6 +471,9 @@ async fn serve_stream(
         Request::Join { name, kind, .. } => debug!("request: Join from {name} ({})", kind_word(*kind)),
         Request::NetworkRotate { chain, .. } => debug!("request: NetworkRotate ({} key change(s))", chain.len()),
         Request::ConfigWrite { path, content, .. } => debug!("request: ConfigWrite {path} ({} bytes)", content.len()),
+        // Scripts often hold tokens.
+        Request::Exec { script } => debug!("request: Exec ({} bytes)", script.len()),
+        Request::ExecOn { host, script } => debug!("request: ExecOn {host} ({} bytes)", script.len()),
         other => debug!("request: {other:?}"),
     }
     let reply = match request {

@@ -158,6 +158,8 @@ fn goals(logbook: &Path) -> BTreeMap<String, String> {
 /// Reads what is new in each transcript, then makes the overview.
 fn build(logbook: &Path, entries: &[(Entry, PathBuf)]) -> anyhow::Result<Overview> {
     let path = cache_path(logbook);
+    // The cache is also read and written by `etd` CLI commands.
+    let _file = config::FileLock::take(&path)?;
     let mut cache: BTreeMap<String, Seen> = config::read_json(&path)
         .unwrap_or_else(|e| {
             warn!("logbook overview: {e:#}; reading all transcripts again");
