@@ -178,7 +178,7 @@ pub async fn run(state: Arc<State>) {
         info!("logbook: no home directory; no capture");
         return;
     };
-    let mut capture = Capture::new(vec![Box::new(claude)], state.env().clone());
+    let mut capture = Capture::new(vec![Box::new(claude)], state.env().clone()).remember_in(state.paths().logbook_rekeyed());
     let (mut archives, mut here_paused) = (Vec::new(), HashSet::new());
     let mut names: Vec<String> = Vec::new();
     let mut ticks = 0u32;

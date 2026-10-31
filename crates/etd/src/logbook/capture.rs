@@ -153,11 +153,19 @@ struct Sent {
     /// None until the archive said where it is.
     offset: Option<u64>,
     meta: Option<LogMeta>,
+    /// The archive was told the key before a replacement (`Tracked::retired`) ended.
+    retired: bool,
 }
 
 #[derive(Debug)]
 struct Tracked {
     path: PathBuf,
+    /// The session id the archives know this transcript by: the agent's,
+    /// or `<id>-r2`, `-r3`… after the file was replaced by a shorter one.
+    key: String,
+    /// The key before the last replacement: each archive hears once that
+    /// it ended.
+    retired: Option<String>,
     meta: LogMeta,
     /// By archive name.
     sent: HashMap<String, Sent>,
@@ -189,6 +197,10 @@ pub struct Capture {
     resting: HashMap<String, Instant>,
     /// Git facts per directory: (repo, branch).
     git: HashMap<String, (Option<String>, Option<String>)>,
+    /// Session id → the key it goes to the archives as, for transcripts
+    /// that were replaced; kept in `rekeyed_file` across restarts.
+    rekeyed: BTreeMap<String, String>,
+    rekeyed_file: Option<PathBuf>,
 }
 
 impl Capture {
@@ -201,7 +213,26 @@ impl Capture {
             owners: HashMap::new(),
             resting: HashMap::new(),
             git: HashMap::new(),
+            rekeyed: BTreeMap::new(),
+            rekeyed_file: None,
         }
+    }
+
+    /// Keeps the keys of replaced transcripts in `file` (and reads them
+    /// now), so a restart sends on under the same key.
+    pub fn remember_in(mut self, file: PathBuf) -> Self {
+        self.rekeyed = config::read_json(&file)
+            .unwrap_or_else(|e| {
+                warn!("logbook: {e:#}");
+                None
+            })
+            .unwrap_or_default();
+        self.rekeyed_file = Some(file);
+        self
+    }
+
+    fn key_of(&self, id: &str) -> String {
+        self.rekeyed.get(id).cloned().unwrap_or_else(|| id.to_string())
     }
 
     /// One round. `sessions`: this machine's manymux sessions (name, leader
@@ -307,12 +338,18 @@ impl Capture {
             if !self.tracked.contains_key(&earlier) {
                 info!("logbook: {} goes on from {earlier}: sending that too", agent.session_id);
                 let meta = LogMeta { status: "gone".into(), ..meta.clone() };
-                self.tracked.insert(earlier.clone(), Tracked { path, meta, sent: HashMap::new(), gone_since: Some(Instant::now()) });
+                let key = self.key_of(&earlier);
+                self.tracked.insert(
+                    earlier.clone(),
+                    Tracked { path, key, retired: None, meta, sent: HashMap::new(), gone_since: Some(Instant::now()) },
+                );
             }
             previous = Some(earlier);
         }
         let meta = LogMeta { previous, ..meta };
-        self.tracked.insert(agent.session_id, Tracked { path: agent.transcript, meta, sent: HashMap::new(), gone_since: None });
+        let key = self.key_of(&agent.session_id);
+        self.tracked
+            .insert(agent.session_id, Tracked { path: agent.transcript, key, retired: None, meta, sent: HashMap::new(), gone_since: None });
     }
 
     /// The transcript `agent` goes on from, from its command line.
@@ -339,9 +376,13 @@ impl Capture {
         }
         let tracked = self.tracked.get_mut(id).expect("a tracked id");
         let paused = archive.paused(&tracked.meta.mm_session, here_paused);
-        let result = sync_one(id, tracked, &name, archive, net, paused).await;
+        let result = sync_one(tracked, &name, archive, net, paused).await;
         match result {
-            Ok(done) => done,
+            Ok(Some(done)) => done,
+            Ok(None) => {
+                self.rekey(id);
+                false
+            }
             Err(e) => {
                 warn!("logbook: {name}: {e:#}; again in {BACKOFF:?}");
                 self.resting.insert(name.clone(), Instant::now() + BACKOFF);
@@ -353,15 +394,51 @@ impl Capture {
             }
         }
     }
+
+    /// Transcript `id` is shorter than what an archive has of it: the file
+    /// was replaced (or cut). The archive only appends, so the new file goes
+    /// to every archive as a new transcript, `<id>-r2` (then `-r3`…), from
+    /// its first byte, linked to the old one by `previous`. Sending it on at
+    /// the old offset would lose its start and glue its end onto the old one.
+    fn rekey(&mut self, id: &str) {
+        let tracked = self.tracked.get_mut(id).expect("a tracked id");
+        let n = tracked.key.strip_prefix(id).and_then(|r| r.strip_prefix("-r")).and_then(|n| n.parse::<u32>().ok()).unwrap_or(1);
+        let key = format!("{id}-r{}", n + 1);
+        if !et_proto::logbook::valid_session_id(&key) {
+            debug!("logbook: {id} was replaced, and {key} is not a session id: not sent again");
+            return;
+        }
+        info!("logbook: {id} was replaced by a shorter file: sending it as {key}");
+        let old = std::mem::replace(&mut tracked.key, key.clone());
+        tracked.meta.previous = Some(old.clone());
+        tracked.retired = Some(old);
+        tracked.sent.clear();
+        self.rekeyed.insert(id.to_string(), key);
+        if let Some(file) = &self.rekeyed_file {
+            if let Err(e) = config::write_json(file, &self.rekeyed) {
+                warn!("logbook: {e:#}");
+            }
+        }
+    }
 }
 
-async fn sync_one(id: &str, tracked: &mut Tracked, name: &str, archive: &Archive, net: &Net, paused: bool) -> anyhow::Result<bool> {
+/// Sends what `archive` lacks of `tracked`. Some(true) when it has all of
+/// it; None when the archive has more than the file (it was replaced).
+async fn sync_one(tracked: &mut Tracked, name: &str, archive: &Archive, net: &Net, paused: bool) -> anyhow::Result<Option<bool>> {
     let size = match fs::metadata(&tracked.path) {
         Ok(m) => m.len(),
         // Deleted: nothing more to send.
-        Err(_) => return Ok(true),
+        Err(_) => return Ok(Some(true)),
     };
+    let id = tracked.key.as_str();
     let sent = tracked.sent.entry(name.to_string()).or_default();
+    if let Some(old) = tracked.retired.as_deref().filter(|_| !sent.retired) {
+        // Only the status: offset 0 is behind the archive, so nothing is
+        // written; `previous: None` keeps the old one's link.
+        let gone = LogMeta { status: "gone".into(), previous: None, ..tracked.meta.clone() };
+        append(archive, net, old, &gone, 0, Vec::new()).await?;
+        sent.retired = true;
+    }
     let mut offset = match sent.offset {
         Some(offset) => offset,
         None => {
@@ -370,6 +447,10 @@ async fn sync_one(id: &str, tracked: &mut Tracked, name: &str, archive: &Archive
             reached
         }
     };
+    if offset > size {
+        debug!("logbook: {id}: archive {name} has {offset} bytes, the file {size}");
+        return Ok(None);
+    }
     if paused {
         // Skip to the end of the last whole line: those bytes never leave.
         if offset < size && ends_with_newline(&tracked.path, size) {
@@ -390,16 +471,12 @@ async fn sync_one(id: &str, tracked: &mut Tracked, name: &str, archive: &Archive
             offset = reached;
         }
     }
-    if offset > size {
-        // The file is shorter than what the archive has: it was replaced.
-        debug!("logbook: {id}: archive {name} has {offset} bytes, the file {size}");
-    }
     if sent.meta.as_ref() != Some(&tracked.meta) {
         offset = append(archive, net, id, &tracked.meta, offset, Vec::new()).await?;
         sent.meta = Some(tracked.meta.clone());
     }
     sent.offset = Some(offset);
-    Ok(offset >= size)
+    Ok(Some(offset >= size))
 }
 
 fn ends_with_newline(path: &Path, size: u64) -> bool {

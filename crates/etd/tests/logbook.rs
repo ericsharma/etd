@@ -157,6 +157,30 @@ async fn transcripts_go_to_the_archive() {
     capture.tick(&sessions, &archives, &net, &none_paused).await;
     assert!(archived(&trigkey, id).ends_with("\"skipped\":21}\n{\"n\":5}\n"));
 
+    // The file is replaced by a shorter one: it goes as a new transcript
+    // `<id>-r2` from its first byte, linked to the old one, which is kept
+    // as it was and marked ended. A restart sends on under the new key.
+    let state = tempfile::tempdir().unwrap();
+    let rekeyed = state.path().join("logbook-rekeyed.json");
+    let mut capture = Capture::new(vec![Box::new(Claude::at(claude.path().into()))], env.clone()).remember_in(rekeyed.clone());
+    let before = archived(&trigkey, id);
+    std::fs::write(&transcript, "{\"new\":1}\n").unwrap();
+    let r2 = format!("{id}-r2");
+    for _ in 0..3 {
+        capture.tick(&sessions, &archives, &net, &none_paused).await;
+    }
+    assert_eq!(archived(&trigkey, id), before, "the old transcript is kept");
+    assert_eq!(archived(&trigkey, &r2), "{\"new\":1}\n", "the new file, from its start");
+    let entries = Store::read_entries(&trigkey.paths.logbook()).unwrap();
+    let get = |key: &str| entries.iter().find(|e| e.session_id == key).unwrap().clone();
+    assert_eq!(get(&r2).meta.previous.as_deref(), Some(id));
+    assert_eq!(get(id).meta.status, "gone");
+    let mut capture = Capture::new(vec![Box::new(Claude::at(claude.path().into()))], env.clone()).remember_in(rekeyed);
+    append(&transcript, "{\"new\":2}\n");
+    capture.tick(&sessions, &archives, &net, &none_paused).await;
+    assert_eq!(archived(&trigkey, &r2), "{\"new\":1}\n{\"new\":2}\n");
+    assert_eq!(archived(&trigkey, id), before);
+
     // The agent ends: the archive hears "gone", gmktec stops following it.
     assert!(Command::new("kill").arg(agent_pid.to_string()).status().unwrap().success());
     let mut statuses = Vec::new();
@@ -169,8 +193,8 @@ async fn transcripts_go_to_the_archive() {
     }
     assert!(statuses.is_empty(), "{statuses:?}");
     let entries = Store::read_entries(&trigkey.paths.logbook()).unwrap();
-    assert_eq!(entries.len(), 1);
-    let entry = &entries[0];
+    assert_eq!(entries.len(), 2, "the replaced transcript and the new one");
+    let entry = entries.iter().find(|e| e.session_id == r2).unwrap();
     assert_eq!((entry.machine.as_str(), entry.meta.status.as_str(), entry.meta.agent.as_str()), ("gmktec", "gone", "claude"));
     assert_eq!(entry.meta.cwd, cwd);
     assert_eq!(entry.offset, std::fs::metadata(&transcript).unwrap().len());

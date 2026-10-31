@@ -48,6 +48,12 @@ impl Paths {
         self.state.join("logbook-status.json")
     }
 
+    /// Transcripts replaced under the Logbook capture, and the session id
+    /// each now goes to the archives as (`<id>-r2`, …).
+    pub fn logbook_rekeyed(&self) -> PathBuf {
+        self.state.join("logbook-rekeyed.json")
+    }
+
     /// An archive's transcripts, one folder per machine, and `index.json`.
     pub fn logbook(&self) -> PathBuf {
         self.data.join("logbook")
