@@ -109,11 +109,11 @@ async fn forward(state: &State, note: &Note) {
         return;
     };
     let mut tasks = tokio::task::JoinSet::new();
-    for id in signed.network.machines().map(|m| m.id).filter(|id| *id != me) {
-        let (endpoint, note) = (endpoint.clone(), note.clone());
+    for addr in signed.network.machines().filter(|m| m.id != me).map(|m| m.addr()) {
+        let (endpoint, note, id) = (endpoint.clone(), note.clone(), addr.id);
         tasks.spawn(async move {
             let sent = async {
-                let conn = tokio::time::timeout(Duration::from_secs(15), endpoint.connect(id, ALPN)).await.context("timed out")??;
+                let conn = tokio::time::timeout(Duration::from_secs(15), endpoint.connect(addr, ALPN)).await.context("timed out")??;
                 let (mut send, mut recv) = conn.open_bi().await?;
                 write_frame(&mut send, &Request::Notify { note }).await?;
                 send.finish()?;

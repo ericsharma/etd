@@ -19,6 +19,8 @@ pub mod agents;
 pub mod files;
 pub mod logbook;
 pub mod network;
+/// Own relays (`ETD_RELAYS`) or n0's: the endpoint builder for both.
+pub mod relays;
 
 pub const ALPN: &[u8] = b"et/1";
 

@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use et_proto::network::{Kind, Network, Signed};
 use et_proto::{read_frame, write_frame, ControlFrame, HostInfo, Request, Response, Target, TmuxStatus, ALPN};
-use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
+use iroh::endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -57,6 +57,8 @@ pub struct State {
     connections: Arc<local::Connections>,
     /// This machine's Logbook archive, if it is one.
     logbook: logbook::Local,
+    /// This machine's own relays (`$ETD_RELAYS`). Unset or empty: n0's.
+    relays: OnceLock<Vec<RelayUrl>>,
 }
 
 /// The longest a single `Foreground` holds pushes back.
@@ -64,6 +66,8 @@ const FOREGROUND_MAX: u64 = 120;
 
 impl State {
     pub fn new(paths: Paths, env: Env) -> Arc<Self> {
+        let connections = Arc::new(local::Connections::default());
+        connections.set_paths(paths.clone());
         Arc::new(Self {
             paths,
             env,
@@ -72,9 +76,35 @@ impl State {
             tries: Mutex::default(),
             notify: OnceLock::new(),
             foreground: Mutex::default(),
-            connections: Arc::default(),
+            connections,
             logbook: logbook::Local::default(),
+            relays: OnceLock::new(),
         })
+    }
+
+    /// This machine uses its own relays (the endpoint is built with
+    /// `et_proto::relays::builder(&relays)`). Its record in the network
+    /// lists them, so the others reach it without an address lookup.
+    pub fn set_relays(&self, relays: Vec<RelayUrl>) {
+        let _ = self.relays.set(relays);
+    }
+
+    /// Empty: n0's relays.
+    pub fn relays(&self) -> &[RelayUrl] {
+        self.relays.get().map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// This machine's address for invites and `status.json`: the
+    /// endpoint's, plus every relay of its own (a relay that is down when
+    /// the invite is made may be up when it is used).
+    pub fn public_addr(&self, endpoint: &Endpoint) -> EndpointAddr {
+        let mut addr = endpoint.addr();
+        for url in self.relays() {
+            if !addr.relay_urls().any(|u| u == url) {
+                addr = addr.with_relay_url(url.clone());
+            }
+        }
+        addr
     }
 
     /// This machine sends pushes with `command`.
@@ -172,14 +202,22 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
     };
     info!("tmux: {tmux_text}");
     let transport = QuicTransportConfig::builder().keep_alive_interval(KEEP_ALIVE).max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?)).build();
-    let endpoint = Endpoint::builder(presets::N0).secret_key(key).alpns(vec![ALPN.to_vec()]).transport_config(transport).bind().await?;
+    let relays = config::relays_from_env()?;
+    let endpoint = et_proto::relays::builder(&relays).secret_key(key).alpns(vec![ALPN.to_vec()]).transport_config(transport).bind().await?;
     info!("endpoint id: {}", endpoint.id());
+    if relays.is_empty() {
+        info!("relays: n0's (set ETD_RELAYS to use your own)");
+    } else {
+        let list: Vec<String> = relays.iter().map(|u| u.to_string()).collect();
+        info!("relays: {} (no n0 relays, no address lookup)", list.join(", "));
+    }
     // The first start makes the network (and moves paired devices into it).
     let signed = network::ensure(&paths, endpoint.id(), &tmux::host_name())?;
     info!("network {}: {} member(s)", signed.network.name, signed.network.members().count());
     let state_paths = paths.clone();
     let has_mm = mm::available(&env);
     let state = State::new(paths, env);
+    state.set_relays(relays);
     if let Some(command) = std::env::var("ETD_NOTIFY_COMMAND").ok().filter(|c| !c.trim().is_empty()) {
         state.set_notify_command(command);
     }
@@ -194,6 +232,7 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
     }
     let status_path = state.paths.status();
     let connections = state.connections.clone();
+    let state_for_pairing = state.clone();
     let watcher = tokio::spawn(watch(endpoint.clone(), state, tmux_text));
     // etd-ssh (manymux's MM_SSH) reaches the other machines through this.
     let local = local::spawn(endpoint.clone(), state_paths.clone(), connections);
@@ -202,7 +241,7 @@ pub async fn run(paths: Paths, key: SecretKey, show_pairing: bool) -> anyhow::Re
     }
     info!("online; run `etd invite` to add a device, `etd invite --machine` to add a machine");
     if show_pairing {
-        if let Err(e) = pair::print(&state_paths, &endpoint.addr(), &tmux::host_name(), Kind::Device, false) {
+        if let Err(e) = pair::print(&state_paths, &state_for_pairing.public_addr(&endpoint), &tmux::host_name(), Kind::Device, false) {
             warn!("pairing code: {e:#}");
         }
     }
@@ -250,6 +289,14 @@ pub async fn watch(endpoint: Endpoint, state: Arc<State>, tmux: String) {
             retry_at = Some(ticks.wrapping_add(backoff));
             backoff = (backoff * 2).min(RESEND_EVERY);
         }
+        // This machine's record lists its relays (none on n0's): after a
+        // join, and when ETD_RELAYS changed. The others and the devices
+        // learn the new ones from the document; nobody pairs again.
+        match network::set_own_relays(&state.paths, endpoint.id(), state.relays()) {
+            Ok(true) => info!("network: this machine's relays are now {:?}", state.relays().iter().map(|u| u.as_str()).collect::<Vec<_>>()),
+            Ok(false) => {}
+            Err(e) => debug!("network: relays not recorded: {e:#}"),
+        }
         match network::load(&state.paths) {
             Ok(Some(signed)) => {
                 state.apply_revokes(&signed.network);
@@ -286,7 +333,8 @@ pub async fn watch(endpoint: Endpoint, state: Arc<State>, tmux: String) {
             pid: std::process::id(),
             version: env!("CARGO_PKG_VERSION").into(),
             host_name: tmux::host_name(),
-            addr: endpoint.addr(),
+            addr: state.public_addr(&endpoint),
+            relays: state.relays().to_vec(),
             tmux: tmux.clone(),
             connected: state.connected_names(),
             updated: config::now_secs(),
@@ -557,7 +605,7 @@ async fn serve_stream(
             state.foreground.lock().unwrap().insert(peer, until);
             Response::Pong
         }
-        Request::Invite { kind } => match pair::invite_url(&state.paths, &state.endpoint().addr(), &tmux::host_name(), kind) {
+        Request::Invite { kind } => match pair::invite_url(&state.paths, &state.public_addr(state.endpoint()), &tmux::host_name(), kind) {
             Ok(url) => Response::Invitation { url },
             Err(e) => Response::Error(format!("{e:#}")),
         },

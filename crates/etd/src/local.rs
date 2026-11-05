@@ -62,18 +62,32 @@ pub async fn receive<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> an
 pub struct Connections {
     open: Mutex<HashMap<EndpointId, Connection>>,
     pub files: files::Lazy,
+    paths: std::sync::OnceLock<Paths>,
 }
 
 /// A machine that is off must not hold `etd-ssh` up for long.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl Connections {
+    /// Set by `server::State`: where the network document is, for each
+    /// machine's relays. Unset: dial by id (an address lookup).
+    pub fn set_paths(&self, paths: Paths) {
+        let _ = self.paths.set(paths);
+    }
+
+    fn addr_of(&self, id: EndpointId) -> iroh::EndpointAddr {
+        match self.paths.get() {
+            Some(paths) => network::addr_of(paths, id),
+            None => iroh::EndpointAddr::new(id),
+        }
+    }
+
     pub(crate) async fn to(&self, endpoint: &Endpoint, id: EndpointId) -> anyhow::Result<Connection> {
         if let Some(conn) = self.open.lock().await.get(&id).filter(|c| c.close_reason().is_none()) {
             return Ok(conn.clone());
         }
         // Not under the lock: a machine that is off would hold up the others.
-        let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(id, ALPN))
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(self.addr_of(id), ALPN))
             .await
             .context("reach the machine: timed out")?
             .context("reach the machine")?;

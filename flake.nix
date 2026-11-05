@@ -108,7 +108,8 @@
           logs = "${config.home.homeDirectory}/Library/Logs";
           etdEnv =
             lib.optionalAttrs (cfg.manymux.enable && cfg.manymux.manageHosts) { ETD_MANYMUX_HOSTS = "1"; }
-            // lib.optionalAttrs (cfg.notifyCommand != null) { ETD_NOTIFY_COMMAND = cfg.notifyCommand; };
+            // lib.optionalAttrs (cfg.notifyCommand != null) { ETD_NOTIFY_COMMAND = cfg.notifyCommand; }
+            // lib.optionalAttrs (cfg.relays != [ ]) { ETD_RELAYS = lib.concatStringsSep "," cfg.relays; };
           # systemd splits Environment= on spaces unless each assignment is quoted.
           systemdEnv = lib.mapAttrsToList (k: v: ''"${k}=${v}"'') etdEnv;
         in
@@ -124,6 +125,16 @@
               type = lib.types.nullOr lib.types.str;
               default = null;
               description = "Run for a bell in a manymux session nobody saw (ETD_NOTIFY_COMMAND; see docs/PROTOCOL.md).";
+            };
+            relays = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ ];
+              example = [ "https://relay.example.org" ];
+              description = ''
+                Your own iroh relays (ETD_RELAYS). Empty: n0's public relays and n0's
+                address lookup. Set: only these relays, and nothing contacts n0. Give
+                every machine of the network the same list; see README.md.
+              '';
             };
             manymux = {
               enable = lib.mkOption {
@@ -147,6 +158,8 @@
           config = lib.mkIf cfg.enable (
             lib.mkMerge [
               { home.packages = [ cfg.package ]; }
+              # Your shell's etd commands (`etd join`, etd-probe) use the same relays.
+              (lib.mkIf (cfg.relays != [ ]) { home.sessionVariables.ETD_RELAYS = lib.concatStringsSep "," cfg.relays; })
               (lib.mkIf pkgs.stdenv.hostPlatform.isLinux {
                 systemd.user.services.etd = {
                   Unit.Description = "etd: reach this machine from E.T. over iroh";

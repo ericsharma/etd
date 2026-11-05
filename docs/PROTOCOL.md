@@ -14,6 +14,7 @@ The source of truth is `crates/et-proto/src/lib.rs` (requests) and `crates/et-pr
 postcard is positional: an enum is a bare index, and a struct is its fields in order.
 
 - A new request or response goes **at the end** of its enum. An older peer still decodes everything it knows, and it never sends what it does not know.
+- The same holds for a new record state (`MemberAt`, 0.0.26): it is the last variant, and it is written only with own relays, so an older peer never sees one unless the owner turns them on.
 - Any other change (reorder, remove, a new field in a struct) is a new ALPN.
 - There are no users yet, so there is no compatibility code.
 
@@ -23,7 +24,10 @@ Each etd keeps one network: `network.json` (the signed document) in its config d
 
 ```
 Network { key: PublicKey, name, records: { EndpointId → Record } }
-Record  { state: Member { name, kind: Machine | Device } | Removed, stamp: Stamp }
+Record  { state: Member { name, kind: Machine | Device }
+               | Removed
+               | MemberAt { name, kind, relays: [RelayUrl] },    // since 0.0.26, see Relays
+          stamp: Stamp }
 Stamp   { counter: u64, author: EndpointId }        // compared counter first, then author
 Signed  { network: Network, signature }              // signed by the network key
 ```
@@ -35,6 +39,22 @@ Signed  { network: Network, signature }              // signed by the network ke
 - **The first start** makes a network with this machine as the only member (and moves devices paired before networks existed, from `clients.json`, into it).
 - **New key after a machine is revoked.** A revoked machine still has the network key, so the machine that revokes it makes a new one. Each key change is a pair: `old` (the document with the machine removed, signed by the old key) and `new` (the same document with the new key, signed by it). Every machine keeps all key changes, oldest first, in `rotations.json`. Before each `NetworkUpdate`, a machine sends `NetworkRotate { chain, key }`: all key changes, and the secret half of the last new key. The receiver checks each step and that the steps follow each other. It moves to the last key if its own key is in the chain and it is still a member; a chain that ends at a key it already left changes nothing; a chain without its key is refused (a fork: two machines revoked at once with different results; fix by hand). Records changed only on the receiver under the old key stay, except records about or written by a removed member (a machine about to be revoked could have added a helper, or itself again with a high counter). A document signed by an old key is then refused as "another network".
 - **Catching up.** At its start, a machine asks every other machine for the document (`Network`). A machine that is asked by a machine answers and also sends it its document and the last key change, so a machine that was off during a key change gets it. There is no pkarr record: a pkarr record is last-writer-wins, and a revoked machine has the old key, so it could replace the record.
+
+## Relays
+
+Each endpoint (etd, its commands, `etd-probe`, the app's `Link`) is built by `et_proto::relays::builder`:
+
+- **No relays set** (the default): iroh's `presets::N0`. That is n0's public relays (`*.relay.n0.iroh.link`), a pkarr publisher and resolver at `https://dns.iroh.link/pkarr`, and DNS lookups of `_iroh.<id>.dns.iroh.link`. Members are dialed by id, and the lookup finds them.
+- **Own relays** (`ETD_RELAYS`: URLs separated by commas or spaces; `services.etd.relays`): `presets::Minimal` (the crypto provider only) and `RelayMode::Custom` with those relays only. No address lookup at all: nothing is published, nothing is looked up by id. iroh's other probes (QUIC address discovery, the captive portal check) go to the relays of the map only, so nothing contacts n0 (`iroh.link`). An n0 relay URL in `ETD_RELAYS` is refused.
+
+Every dial then carries the relay URLs it needs:
+
+- **The ticket** carries the machine's relays (all of them, with own relays).
+- **The network document:** a machine with own relays writes its record as `MemberAt { name, kind, relays }` (its `ETD_RELAYS`, in order). Its watch loop checks this every 2 s: after a join, and after the setting changed, it writes a new record (a higher stamp) and the document goes to the other machines as any change does. Back on n0's relays it writes `Member` again. Devices have no relays.
+- **Machine to machine** (`NetworkUpdate`, `Network` at start, `Notify`, `Agent`/`ExecOn` forwarding, `etd-ssh`, `etd send`): dialed at the relays of the member's record. A record with none (a machine on n0's relays) is dialed by id. iroh dials a relay URL that is not in its relay map, so machines on different relays still reach each other, as long as each one's record lists where it is.
+- **The app** (et-link): `Link::start(secret_key, relays)` takes the relays the app saved (`Link::relays()`); empty: n0 mode. `pair` with a ticket whose relays are not n0's moves the link to them at once: it stops the address lookup and swaps the relay map, with no new bind. `RemoteHost::network` records each member's relays (`NetworkMember.relay_urls`) and moves the link to the network's relays (every machine's, once each). `Link::connect(id, relay_url)` dials `relay_url` and the member's relays from the last document; with own relays it never dials an n0 URL. Back to n0 takes a new `Link::start` with no relays.
+
+**Moving a machine to other relays.** Change `ETD_RELAYS` and restart it. Its record changes, the other machines get the document, and a paired phone learns the new relays from the next document it reads from any machine it can still reach, with no new pairing. Change one machine at a time: a phone that missed the change and can reach no machine of the network must pair again. A document with `MemberAt` does not decode in etd 0.0.25 or older, or in an app built before it: update etd everywhere and the app before setting relays. With no relays set, no `MemberAt` is written, so the default stays readable by older peers.
 
 ## Access
 
@@ -49,7 +69,7 @@ etd reads the peer's `EndpointId` from the connection and looks it up in the net
 
 | Field | Meaning |
 |---|---|
-| `addr` | The inviting etd's `EndpointAddr`: id and relay URL only (direct addresses make the QR code too large) |
+| `addr` | The inviting etd's `EndpointAddr`: id and relay URLs only (direct addresses make the QR code too large). With own relays: all of them |
 | `secret` | 32 random bytes; the inviting machine stores only its SHA-256 and the kind it admits (machine or device); it works one time |
 | `expires` | Unix seconds; 10 minutes after the invite |
 | `host_name` | For the app's confirm sheet |

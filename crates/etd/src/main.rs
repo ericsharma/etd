@@ -4,8 +4,7 @@ use anyhow::{bail, Context};
 use et_proto::network::Kind;
 use etd::config::{self, Paths};
 use etd::{network, pair, server, service, tmux};
-use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointId};
+use iroh::EndpointId;
 use tracing_subscriber::EnvFilter;
 
 const USAGE: &str = "\
@@ -340,13 +339,28 @@ async fn main() -> anyhow::Result<()> {
                 _ => bail!("{USAGE}"),
             };
             let key = config::load_or_create_key(&paths.key())?;
-            let endpoint = Endpoint::builder(presets::N0).secret_key(key).bind().await?;
+            // This machine's relays ($ETD_RELAYS, or the running etd's); a
+            // ticket with its own relays carries them, so it is reached either way.
+            let mut relays = config::relays_for_command(&paths)?;
+            if relays.is_empty() {
+                let ticket = et_proto::Ticket::from_url(url)?;
+                relays = ticket.addr.relay_urls().filter(|u| !et_proto::relays::is_n0(u)).cloned().collect();
+            }
+            let endpoint = et_proto::relays::builder(&relays).secret_key(key).bind().await?;
             let joined = network::join(&endpoint, &paths, url, &name).await;
             endpoint.close().await;
             let signed = joined?;
             println!("joined the network {} as {name}", signed.network.name);
             for m in signed.network.members() {
                 println!("  {:<20} {}", m.name, kind_word(m.kind));
+            }
+            let own = signed.network.relays();
+            if !own.is_empty() && config::relays_from_env()?.is_empty() {
+                let list: Vec<&str> = own.iter().map(|u| u.as_str()).collect();
+                println!(
+                    "\nThe network's machines use their own relays. Give this machine's etd the same setting:\n  ETD_RELAYS={}",
+                    list.join(",")
+                );
             }
             if config::running_status(&paths)?.is_none() {
                 println!("\netd is not running here. Start its service (it reads the new network when it starts),\nor install one with `etd install`, or run `etd` in a terminal.");
@@ -387,6 +401,10 @@ async fn main() -> anyhow::Result<()> {
             for url in s.addr.relay_urls() {
                 println!("relay       {url}");
             }
+            println!(
+                "relays      {}",
+                if s.relays.is_empty() { "n0's (ETD_RELAYS not set)".into() } else { format!("own only, no n0 ({})", s.relays.len()) }
+            );
             for ip in s.addr.ip_addrs() {
                 println!("direct      {ip}");
             }

@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use et_proto::{read_frame, write_frame, ControlFrame, Request, Response, Target, Ticket, ALPN};
 use etd::config::{self, Paths};
-use iroh::endpoint::{presets, Connection, QuicTransportConfig, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream};
+use iroh::EndpointId;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const USAGE: &str = "\
@@ -43,7 +43,10 @@ async fn main() -> anyhow::Result<()> {
             let ticket = Ticket::from_url(url)?;
             ("pair", ticket.addr.clone(), Some(ticket), rest)
         }
-        [command, id, rest @ ..] => (*command, EndpointAddr::new(id.parse::<EndpointId>().context("not an endpoint id")?), None, rest),
+        // The machine's relays from the network document, if they are listed.
+        [command, id, rest @ ..] => {
+            (*command, etd::network::addr_of(&paths, id.parse::<EndpointId>().context("not an endpoint id")?), None, rest)
+        }
         _ => bail!("{USAGE}"),
     };
 
@@ -52,7 +55,11 @@ async fn main() -> anyhow::Result<()> {
         .keep_alive_interval(Duration::from_secs(5))
         .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
         .build();
-    let builder = Endpoint::builder(presets::N0).secret_key(key).transport_config(transport);
+    // Own relays: a ticket's (when they are not n0's), else $ETD_RELAYS or
+    // the running etd's. None: n0's, as etd.
+    let from_ticket: Vec<_> = addr.relay_urls().filter(|u| !et_proto::relays::is_n0(u)).cloned().collect();
+    let relays = if from_ticket.is_empty() { config::relays_for_command(&paths)? } else { from_ticket };
+    let builder = et_proto::relays::builder(&relays).secret_key(key).transport_config(transport);
     let builder = if relay_only { builder.clear_ip_transports() } else { builder };
     let endpoint = builder.bind().await?;
     let bound = start.elapsed();

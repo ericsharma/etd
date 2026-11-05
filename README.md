@@ -47,6 +47,23 @@ On Linux without a desktop login, run `loginctl enable-linger $USER`. If you do 
 
 `etd help` shows all commands, including the Logbook (an archive of your AI agent transcripts).
 
+## Your own relays
+
+By default etd uses [n0](https://n0.computer)'s public iroh relays, and publishes each machine's address to n0's DNS so others find it by its key. To run every part yourself, run your own [iroh relays](https://github.com/n0-computer/iroh/tree/main/iroh-relay) and give each machine the list:
+
+| Install | Setting |
+|---|---|
+| Home Manager | `services.etd.relays = [ "https://relay.example.org" ];` |
+| `etd install` | `ETD_RELAYS=https://relay.example.org etd install` |
+| By hand | `ETD_RELAYS` in etd's environment: URLs, separated by commas or spaces |
+
+With relays set, etd uses only those relays and no address lookup. Nothing contacts n0. Each machine writes its relays into its record in the network document, and every connection is dialed with them. The app follows the network's relays by itself.
+
+- **Before you set it,** update etd on every machine and the E.T. app. Older versions cannot read a document with relays in it.
+- **Change machines one at a time,** and wait a minute between them. A phone that was away learns a machine's new relays from any machine it can still reach. If all machines move at once while the phone is away, pair it again.
+- **Use the same list on every machine.** A machine on its own relays does not look up a machine on n0's.
+- `etd status` shows which relays are in use. To go back to n0, remove the setting.
+
 ## Security
 
 A member of the network can do on **every** machine what you can do in a shell. Invite only your own devices. If you lose a device, use `etd revoke` immediately. See [docs/SECURITY.md](docs/SECURITY.md).

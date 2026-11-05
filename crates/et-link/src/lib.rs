@@ -7,13 +7,15 @@
 //!   open_control (openControlChannel).
 //! - [`ControlStream`]: `tmux -C` bytes; it backs the app's `ControlChannel`.
 //! - [`RemoteHost::send_files`]: files to a machine's `~/etd-downloads/`.
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use et_proto::files::{Files, GC_EVERY};
+use et_proto::relays;
 use et_proto::{read_frame, write_frame, ControlFrame, Request, Response, Ticket, ALPN};
-use iroh::endpoint::{presets, ConnectionError, QuicTransportConfig, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
+use iroh::endpoint::{ConnectionError, QuicTransportConfig, RecvStream, SendStream};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayUrl, SecretKey};
 use tokio::sync::Mutex;
 
 mod agentcfg;
@@ -134,25 +136,116 @@ pub struct Paired {
 #[derive(uniffi::Object)]
 pub struct Link {
     endpoint: Endpoint,
+    shared: Arc<Shared>,
+}
+
+/// What the link learned of the network's relays. A `RemoteHost` holds it
+/// too, so a network document it reads updates the link.
+#[derive(Debug)]
+struct Shared {
+    endpoint: Endpoint,
+    /// The relays the endpoint uses. Empty: n0's, with n0's address lookup.
+    relays: tokio::sync::Mutex<Vec<RelayUrl>>,
+    /// Each member's relays, from the last network document.
+    members: std::sync::Mutex<HashMap<EndpointId, Vec<RelayUrl>>>,
+}
+
+impl Shared {
+    fn new(endpoint: Endpoint, relays: Vec<RelayUrl>) -> Arc<Self> {
+        Arc::new(Self { endpoint, relays: tokio::sync::Mutex::new(relays), members: Default::default() })
+    }
+
+    /// Moves the endpoint to `wanted`, the relays of the paired network (a
+    /// ticket's, or a network document's). From n0's: the address lookup
+    /// stops (no more pkarr publishing or lookups) and n0's relays leave the
+    /// relay map. Back to n0's takes a new `Link::start` with no relays.
+    async fn adopt(&self, wanted: Vec<RelayUrl>) {
+        if wanted.is_empty() {
+            return;
+        }
+        let mut current = self.relays.lock().await;
+        if *current == wanted {
+            return;
+        }
+        if current.is_empty() {
+            if let Ok(lookup) = self.endpoint.address_lookup() {
+                lookup.clear();
+            }
+            let n0 = [iroh::defaults::prod::default_relay_map(), iroh::defaults::staging::default_relay_map()];
+            for url in n0.iter().flat_map(|m| m.urls::<Vec<RelayUrl>>()) {
+                self.endpoint.remove_relay(&url).await;
+            }
+        }
+        for url in &wanted {
+            if !current.contains(url) {
+                self.endpoint.insert_relay(url.clone(), Arc::new(RelayConfig::from(url.clone()))).await;
+            }
+        }
+        for url in current.iter().filter(|u| !wanted.contains(u)) {
+            self.endpoint.remove_relay(url).await;
+        }
+        *current = wanted;
+    }
+
+    /// Learns every member's relays, and the network's.
+    async fn learn(&self, network: &et_proto::network::Network) {
+        let members = network.members().filter(|m| !m.relays.is_empty()).map(|m| (m.id, m.relays.to_vec())).collect();
+        *self.members.lock().unwrap() = members;
+        self.adopt(network.relays()).await;
+    }
+
+    /// The address to dial `id` at: `given` (the app's saved relay) and the
+    /// relays the network lists for it. With own relays, never one of n0's.
+    async fn addr(&self, id: EndpointId, given: Option<RelayUrl>) -> EndpointAddr {
+        let own = !self.relays.lock().await.is_empty();
+        let listed = self.members.lock().unwrap().get(&id).cloned().unwrap_or_default();
+        let mut addr = EndpointAddr::new(id);
+        for url in listed.into_iter().chain(given) {
+            if !(own && relays::is_n0(&url)) && !addr.relay_urls().any(|u| *u == url) {
+                addr = addr.with_relay_url(url);
+            }
+        }
+        addr
+    }
+}
+
+/// A ticket's own relays: none if they are n0's.
+fn own_relays(addr: &EndpointAddr) -> Vec<RelayUrl> {
+    addr.relay_urls().filter(|u| !relays::is_n0(u)).cloned().collect()
+}
+
+fn parse_relays(relays: Vec<String>) -> Result<Vec<RelayUrl>, LinkError> {
+    relays::parse(&relays.join(",")).map_err(invalid)
 }
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Link {
     /// Binds the endpoint with the device key from `generate_secret_key`.
+    /// `relays`: what `relays()` said last time (saved by the app); empty
+    /// on the first start, or for a network on n0's relays. With relays,
+    /// the link uses only those and never contacts n0.
     #[uniffi::constructor]
-    pub async fn start(secret_key: Vec<u8>) -> Result<Arc<Self>, LinkError> {
+    pub async fn start(secret_key: Vec<u8>, relays: Vec<String>) -> Result<Arc<Self>, LinkError> {
         let bytes: [u8; 32] = secret_key.try_into().map_err(|_| invalid("the device key must be 32 bytes"))?;
+        let relays = parse_relays(relays)?;
         let transport = QuicTransportConfig::builder()
             .keep_alive_interval(KEEP_ALIVE)
             .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().map_err(invalid)?))
             .build();
-        let endpoint = Endpoint::builder(presets::N0)
+        let endpoint = relays::builder(&relays)
             .secret_key(SecretKey::from_bytes(&bytes))
             .transport_config(transport)
             .bind()
             .await
             .map_err(|e| LinkError::Unreachable { message: format!("start iroh: {e:#}") })?;
-        Ok(Arc::new(Self { endpoint }))
+        Ok(Arc::new(Self { shared: Shared::new(endpoint.clone(), relays), endpoint }))
+    }
+
+    /// The relays the link uses now; empty: n0's. They follow the paired
+    /// network (a ticket's relays, then each network document's). Save them
+    /// after `pair` and `RemoteHost::network`, and pass them to `start`.
+    pub async fn relays(&self) -> Vec<String> {
+        self.shared.relays.lock().await.iter().map(|u| u.to_string()).collect()
     }
 
     /// This device's id, as etd lists it in `etd clients`.
@@ -165,6 +258,8 @@ impl Link {
     pub async fn pair(&self, url: String, device_name: String) -> Result<Paired, LinkError> {
         let ticket = Ticket::from_url(&url).map_err(invalid)?;
         let relay_url = ticket.addr.relay_urls().next().map(|u| u.to_string());
+        // A machine on its own relays: use them, and stop using n0's.
+        self.shared.adopt(own_relays(&ticket.addr)).await;
         let host = self.dial(ticket.addr.clone()).await?;
         match host.call(Request::Pair { secret: ticket.secret, device_name }).await? {
             Response::Paired { host_name } => Ok(Paired { host_name, endpoint_id: ticket.addr.id.to_string(), relay_url }),
@@ -173,14 +268,14 @@ impl Link {
         }
     }
 
-    /// Connects to a paired machine. `relay_url` from `Paired` makes the
-    /// first connect quicker; without it the id is looked up.
+    /// Connects to a paired machine. `relay_url`: from `Paired`, or the
+    /// first of `NetworkMember::relay_urls`. The relays of the last network
+    /// document are added, so a saved URL that changed still works. On n0's
+    /// relays an id alone is looked up.
     pub async fn connect(&self, endpoint_id: String, relay_url: Option<String>) -> Result<Arc<RemoteHost>, LinkError> {
         let id: EndpointId = endpoint_id.parse().map_err(invalid)?;
-        let mut addr = EndpointAddr::new(id);
-        if let Some(url) = relay_url {
-            addr = addr.with_relay_url(url.parse::<RelayUrl>().map_err(invalid)?);
-        }
+        let given = relay_url.map(|u| u.parse::<RelayUrl>()).transpose().map_err(invalid)?;
+        let addr = self.shared.addr(id, given).await;
         Ok(Arc::new(self.dial(addr).await?))
     }
 
@@ -193,13 +288,20 @@ impl Link {
 impl Link {
     async fn dial(&self, addr: EndpointAddr) -> Result<RemoteHost, LinkError> {
         let conn = self.endpoint.connect(addr, ALPN).await.map_err(|e| LinkError::Unreachable { message: format!("{e:#}") })?;
-        Ok(RemoteHost { conn })
+        Ok(RemoteHost { conn, shared: self.shared.clone() })
     }
 
-    /// For tests: a link on an endpoint made by the caller.
+    /// For tests: a link on an endpoint made by the caller (n0 mode until
+    /// a ticket or document says otherwise).
     #[doc(hidden)]
     pub fn from_endpoint(endpoint: Endpoint) -> Arc<Self> {
-        Arc::new(Self { endpoint })
+        Arc::new(Self { shared: Shared::new(endpoint.clone(), Vec::new()), endpoint })
+    }
+
+    /// For tests: a link on an endpoint the caller built for `relays`.
+    #[doc(hidden)]
+    pub fn from_endpoint_with(endpoint: Endpoint, relays: Vec<RelayUrl>) -> Arc<Self> {
+        Arc::new(Self { shared: Shared::new(endpoint.clone(), relays), endpoint })
     }
 }
 
@@ -252,11 +354,13 @@ pub struct ExecResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct NetworkMember {
-    /// Connect to a machine with `Link::connect(endpoint_id, nil)`.
+    /// Connect to a machine with `Link::connect(endpoint_id, relay_urls.first)`.
     pub endpoint_id: String,
     pub name: String,
     /// A machine runs etd (and has sessions); otherwise a phone or tablet.
     pub is_machine: bool,
+    /// The machine's own relays. Empty: it is on n0's (found by its id).
+    pub relay_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -396,6 +500,7 @@ async fn files() -> Result<Arc<Files>, LinkError> {
 #[derive(uniffi::Object)]
 pub struct RemoteHost {
     conn: iroh::endpoint::Connection,
+    shared: Arc<Shared>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -487,6 +592,8 @@ impl RemoteHost {
         match self.call(Request::Network).await? {
             Response::NetworkDoc(signed) => {
                 signed.verify().map_err(|e| LinkError::Protocol { message: format!("{e:#}") })?;
+                // Machines that moved to other relays are reached there now.
+                self.shared.learn(&signed.network).await;
                 let members = signed
                     .network
                     .members()
@@ -494,6 +601,7 @@ impl RemoteHost {
                         endpoint_id: m.id.to_string(),
                         name: m.name.to_string(),
                         is_machine: m.kind == et_proto::network::Kind::Machine,
+                        relay_urls: m.relays.iter().map(|u| u.to_string()).collect(),
                     })
                     .collect();
                 let archive = self.archive_names().await;

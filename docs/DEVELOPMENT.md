@@ -7,6 +7,8 @@ env -u TMUX cargo test
 
 The tests start their own etds, tmux servers and manymux nodes (`mm --socket <temp>`, with private config and log directories). They never touch your running sessions. Remove `$TMUX` anyway: inside a tmux pane, a tmux command without `-S` goes to that pane's server.
 
+The relay tests (`crates/etd/tests/relays.rs`, `crates/et-link/tests/relays.rs`) run an iroh relay in the test process (plain HTTP on localhost) and give every endpoint a DNS resolver that records each name it is asked (`tests/support/relay.rs`). They fail if anything looks up a name in n0's domain (`iroh.link`); the default-mode test checks that the recorder does see those names when no relays are set.
+
 ## Crates
 
 | Crate | What |

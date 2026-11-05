@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
-use iroh::{EndpointAddr, EndpointId, SecretKey};
+use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// Where etd keeps its files.
@@ -274,6 +274,25 @@ pub struct Status {
     /// The running program, to tell who manages it (`etd status --json`).
     #[serde(default)]
     pub exe: Option<String>,
+    /// The daemon's own relays (`$ETD_RELAYS`); empty: n0's.
+    #[serde(default)]
+    pub relays: Vec<RelayUrl>,
+}
+
+/// This machine's own relays, from `$ETD_RELAYS` (URLs separated by commas
+/// or spaces). Unset or empty: n0's relays and n0's address lookup.
+pub fn relays_from_env() -> anyhow::Result<Vec<RelayUrl>> {
+    et_proto::relays::parse(&std::env::var("ETD_RELAYS").unwrap_or_default()).context("ETD_RELAYS")
+}
+
+/// The relays for a command that binds its own endpoint (`etd join`):
+/// `$ETD_RELAYS` if it is set, else those of the running daemon (a service
+/// may have the setting when the shell does not).
+pub fn relays_for_command(paths: &Paths) -> anyhow::Result<Vec<RelayUrl>> {
+    if std::env::var_os("ETD_RELAYS").is_some() {
+        return relays_from_env();
+    }
+    Ok(running_status(paths)?.map(|s| s.relays).unwrap_or_default())
 }
 
 /// The status of a running daemon. `None`: no daemon runs for these paths.

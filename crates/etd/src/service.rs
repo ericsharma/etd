@@ -245,6 +245,12 @@ pub fn install(paths: &Paths, with_service: bool) -> anyhow::Result<()> {
         }
         Some(_) => {}
     }
+    // Own relays: `ETD_RELAYS=… etd install` keeps the setting in the service.
+    let relays = config::relays_from_env()?;
+    if !relays.is_empty() {
+        let list: Vec<&str> = relays.iter().map(|u| u.as_str()).collect();
+        etd_env.push(("ETD_RELAYS".to_string(), list.join(",")));
+    }
     let etd = Service {
         description: "etd: reach this machine from E.T. over iroh".into(),
         args: vec![exe.display().to_string()],

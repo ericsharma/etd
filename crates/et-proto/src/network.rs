@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Context};
-use iroh::{EndpointId, PublicKey, SecretKey, Signature};
+use iroh::{EndpointAddr, EndpointId, PublicKey, RelayUrl, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -23,8 +23,31 @@ pub enum Kind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum State {
-    Member { name: String, kind: Kind },
+    Member {
+        name: String,
+        kind: Kind,
+    },
     Removed,
+    /// A member and the relays it is reached on (since 0.0.26): a machine
+    /// with its own relays (`ETD_RELAYS`) writes its record this way, so
+    /// the others dial it without an address lookup. A machine on n0's
+    /// relays keeps `Member`.
+    MemberAt {
+        name: String,
+        kind: Kind,
+        relays: Vec<RelayUrl>,
+    },
+}
+
+impl State {
+    /// A member record, with `relays` (`Member` when there are none).
+    pub fn member(name: String, kind: Kind, relays: Vec<RelayUrl>) -> Self {
+        if relays.is_empty() {
+            Self::Member { name, kind }
+        } else {
+            Self::MemberAt { name, kind, relays }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -85,6 +108,16 @@ pub struct Member<'a> {
     pub id: EndpointId,
     pub name: &'a str,
     pub kind: Kind,
+    /// Where it is reached: empty for a member on n0's relays (found by
+    /// its id) and for devices.
+    pub relays: &'a [RelayUrl],
+}
+
+impl Member<'_> {
+    /// The address to dial: the id and the member's relays.
+    pub fn addr(&self) -> EndpointAddr {
+        self.relays.iter().fold(EndpointAddr::new(self.id), |addr, url| addr.with_relay_url(url.clone()))
+    }
 }
 
 impl Network {
@@ -108,9 +141,39 @@ impl Network {
 
     pub fn member(&self, id: &EndpointId) -> Option<Member<'_>> {
         match &self.records.get(id)?.state {
-            State::Member { name, kind } => Some(Member { id: *id, name, kind: *kind }),
+            State::Member { name, kind } => Some(Member { id: *id, name, kind: *kind, relays: &[] }),
+            State::MemberAt { name, kind, relays } => Some(Member { id: *id, name, kind: *kind, relays }),
             State::Removed => None,
         }
+    }
+
+    /// The address to dial `id` at: its relays from its record, if any.
+    pub fn addr(&self, id: EndpointId) -> EndpointAddr {
+        self.member(&id).map(|m| m.addr()).unwrap_or_else(|| EndpointAddr::new(id))
+    }
+
+    /// The relays of every machine, in order, once each: what a device's
+    /// endpoint uses. Empty: the network is on n0's relays.
+    pub fn relays(&self) -> Vec<RelayUrl> {
+        let mut all: Vec<RelayUrl> = Vec::new();
+        for url in self.machines().flat_map(|m| m.relays.iter()) {
+            if !all.contains(url) {
+                all.push(url.clone());
+            }
+        }
+        all
+    }
+
+    /// Sets member `id`'s relays (a new record, by `author`) if they
+    /// differ. True if the document changed.
+    pub fn set_relays(&mut self, id: EndpointId, relays: &[RelayUrl], author: EndpointId) -> bool {
+        let Some(m) = self.member(&id) else { return false };
+        if m.relays == relays {
+            return false;
+        }
+        let state = State::member(m.name.to_string(), m.kind, relays.to_vec());
+        self.set(id, state, author);
+        true
     }
 
     pub fn members(&self) -> impl Iterator<Item = Member<'_>> {
@@ -236,5 +299,33 @@ mod tests {
         let mut one = Network::new(&id(1).0, "one", a, "t");
         let two = Network::new(&id(7).0, "two", a, "t");
         assert!(one.merge(&two).is_err());
+    }
+
+    #[test]
+    fn relays_in_records() {
+        let (net, _) = id(1);
+        let (_, a) = id(2);
+        let (_, phone) = id(4);
+        let mut doc = Network::new(&net, "home", a, "trigkey");
+        doc.set(phone, State::Member { name: "phone".into(), kind: Kind::Device }, a);
+        let plain = postcard::to_stdvec(&doc).unwrap();
+        assert!(doc.relays().is_empty(), "no relays: n0");
+        assert!(!doc.set_relays(a, &[], a), "nothing to change");
+        let relay: RelayUrl = "https://relay.example./".parse().unwrap();
+        assert!(doc.set_relays(a, std::slice::from_ref(&relay), a));
+        assert!(!doc.set_relays(a, std::slice::from_ref(&relay), a), "the same relays: no new record");
+        assert_eq!(doc.relays(), vec![relay.clone()]);
+        assert_eq!(doc.member(&a).unwrap().name, "trigkey");
+        assert_eq!(doc.addr(a).relay_urls().collect::<Vec<_>>(), vec![&relay]);
+        assert_eq!(doc.addr(phone).relay_urls().count(), 0);
+        // The new variant is the last one: older peers decode old records.
+        assert_eq!(postcard::to_stdvec(&doc.records[&a].state).unwrap()[0], 2);
+        let back: Network = postcard::from_bytes(&plain).unwrap();
+        assert_eq!(back.relays(), Vec::<RelayUrl>::new());
+        // Back to n0: a plain `Member` again.
+        assert!(doc.set_relays(a, &[], a));
+        assert!(matches!(doc.records[&a].state, State::Member { .. }));
+        let signed = doc.sign(&net).unwrap();
+        signed.verify().unwrap();
     }
 }

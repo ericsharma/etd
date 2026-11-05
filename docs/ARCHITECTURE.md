@@ -5,7 +5,7 @@ iPhone ──iroh──▶ etd on each machine ──▶ tmux, or the manymux no
 mm (any machine) ──MM_SSH=etd-ssh──▶ local etd ──iroh──▶ another machine's etd ──▶ mm agent
 ```
 
-- **iroh.** Each machine and device is known by its key, not by an IP address. Connections are direct when possible, with an encrypted relay when not.
+- **iroh.** Each machine and device is known by its key, not by an IP address. Connections are direct when possible, with an encrypted relay when not: n0's public relays, or only your own (`ETD_RELAYS`; see [PROTOCOL.md](PROTOCOL.md#relays)).
 - **The network** is one list of members (machines and devices), signed by a network key. Machines hold that key. Phones and tablets do not, so only a machine can change the list. Each machine keeps a copy and sends changes to the others.
 - **tmux.** etd serves tmux on its machine in control mode: one native page per window in the app.
 - **manymux.** Sessions live on their machine and survive a dropped connection. manymux reaches other machines with `ssh <host> mm agent`. etd sets `MM_SSH=etd-ssh`, which does the same through the local etd and iroh. etd keeps manymux's machine list (`hosts.toml`) equal to the network's machines, so there is no `mm add`. `mm ls` and `mm attach` on any machine reach the sessions of every machine.

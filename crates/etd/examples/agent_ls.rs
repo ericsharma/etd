@@ -9,8 +9,7 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use et_proto::{read_frame, write_frame, ControlFrame, Request, Response, ALPN};
 use etd::config::{self, Paths};
-use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::EndpointId;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -21,9 +20,12 @@ async fn main() -> anyhow::Result<()> {
         _ => bail!("usage: agent_ls <etd-id> [host]"),
     };
     let id: EndpointId = id.parse().context("not an endpoint id")?;
-    let key = config::load_or_create_key(&Paths::from_env()?.config.join("probe.key"))?;
-    let endpoint = Endpoint::builder(presets::N0).secret_key(key).bind().await?;
-    let conn = endpoint.connect(EndpointAddr::new(id), ALPN).await?;
+    let paths = Paths::from_env()?;
+    let key = config::load_or_create_key(&paths.config.join("probe.key"))?;
+    // etd's relays ($ETD_RELAYS or the running etd's; none: n0's), and the
+    // machine's relays from the network document.
+    let endpoint = et_proto::relays::builder(&config::relays_for_command(&paths)?).secret_key(key).bind().await?;
+    let conn = endpoint.connect(etd::network::addr_of(&paths, id), ALPN).await?;
 
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(&mut send, &Request::Agent { host: host.clone() }).await?;

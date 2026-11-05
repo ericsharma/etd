@@ -10,7 +10,7 @@ final class EtLinkTests: XCTestCase {
 
     func testLinkStarts() async throws {
         let start = Date()
-        let link = try await Link.start(secretKey: generateSecretKey())
+        let link = try await Link.start(secretKey: generateSecretKey(), relays: [])
         print("Link.start took \(Date().timeIntervalSince(start)) s")
         XCTAssertEqual(link.endpointId().count, 64)
         await link.shutdown()
@@ -25,7 +25,7 @@ final class EtLinkTests: XCTestCase {
             throw XCTSkip("set ET_PAIR_URL to run")
         }
         let info = try parseTicket(url: url)
-        let link = try await Link.start(secretKey: generateSecretKey())
+        let link = try await Link.start(secretKey: generateSecretKey(), relays: [])
         let paired = try await link.pair(url: url, deviceName: "etlink-test")
         XCTAssertEqual(paired.endpointId, info.endpointId)
 

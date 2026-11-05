@@ -11,7 +11,7 @@ use std::os::unix::io::AsRawFd;
 use anyhow::{bail, Context};
 use et_proto::network::{Kind, Network, Rotation, Signed, State};
 use et_proto::{read_frame, write_frame, Request, Response, Ticket, ALPN};
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey};
 use tracing::{debug, info, warn};
 
 use crate::config::{self, Paths};
@@ -110,6 +110,21 @@ fn change_locked(paths: &Paths, f: impl FnOnce(&mut Network) -> anyhow::Result<(
     let signed = network.sign(&key)?;
     save(paths, &signed)?;
     Ok(signed)
+}
+
+/// Writes `relays` into this machine's own record if it lists others.
+/// True if the document changed (it then goes to the other machines).
+pub fn set_own_relays(paths: &Paths, me: EndpointId, relays: &[RelayUrl]) -> anyhow::Result<bool> {
+    let _lock = Lock::take(paths)?;
+    let Some(signed) = load(paths)? else { return Ok(false) };
+    if signed.network.member(&me).is_none_or(|m| m.relays == relays) {
+        return Ok(false);
+    }
+    change_locked(paths, |network| {
+        network.set_relays(me, relays, me);
+        Ok(())
+    })?;
+    Ok(true)
 }
 
 /// A name for a new member: machines need a unique name (`etd-ssh` and
@@ -345,6 +360,15 @@ pub async fn push(endpoint: &Endpoint, paths: &Paths, signed: &Signed) -> bool {
     tasks.join_all().await.into_iter().all(|sent| sent)
 }
 
+/// Where to dial member `id`: its relays from this machine's document (none
+/// in n0 mode: the address lookup finds it by id).
+pub fn addr_of(paths: &Paths, id: EndpointId) -> EndpointAddr {
+    match load(paths) {
+        Ok(Some(signed)) => signed.network.addr(id),
+        _ => EndpointAddr::new(id),
+    }
+}
+
 /// Sends this machine's document (and the last key change) to one machine.
 pub async fn push_to(endpoint: &Endpoint, paths: &Paths, id: EndpointId) -> anyhow::Result<()> {
     let signed = load(paths)?.context("no network")?;
@@ -352,7 +376,9 @@ pub async fn push_to(endpoint: &Endpoint, paths: &Paths, id: EndpointId) -> anyh
 }
 
 async fn push_one(endpoint: &Endpoint, paths: &Paths, id: EndpointId, signed: Signed) -> anyhow::Result<()> {
-    let conn = tokio::time::timeout(std::time::Duration::from_secs(15), endpoint.connect(id, ALPN)).await.context("timed out")??;
+    let conn = tokio::time::timeout(std::time::Duration::from_secs(15), endpoint.connect(signed.network.addr(id), ALPN))
+        .await
+        .context("timed out")??;
     // A machine that has not moved to the current key gets the key changes
     // first; for one that has, they change nothing.
     let chain = load_rotations(paths)?;
@@ -396,12 +422,12 @@ pub async fn pull(endpoint: &Endpoint, paths: &Paths) {
         return;
     };
     let mut tasks = tokio::task::JoinSet::new();
-    for id in signed.network.machines().map(|m| m.id).filter(|id| *id != me) {
-        let (endpoint, paths) = (endpoint.clone(), paths.clone());
+    for addr in signed.network.machines().filter(|m| m.id != me).map(|m| m.addr()) {
+        let (endpoint, paths, id) = (endpoint.clone(), paths.clone(), addr.id);
         tasks.spawn(async move {
             let pulled = async {
                 let conn =
-                    tokio::time::timeout(std::time::Duration::from_secs(15), endpoint.connect(id, ALPN)).await.context("timed out")??;
+                    tokio::time::timeout(std::time::Duration::from_secs(15), endpoint.connect(addr, ALPN)).await.context("timed out")??;
                 let (mut send, mut recv) = conn.open_bi().await?;
                 write_frame(&mut send, &Request::Network).await?;
                 send.finish()?;
