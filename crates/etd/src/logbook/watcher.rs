@@ -777,14 +777,15 @@ async fn change(logbook: &Path, files: &Mutex<()>, change_json: &str, now: u64) 
             if change.detail.trim().is_empty() {
                 bail!("a proposal needs its detail");
             }
+            let accepted = decision == "accept";
+            // Two open apps each accept every proposal of a report: the
+            // same decision again changes nothing (PLAN-logbook-v2, Owner
+            // change).
+            if choices.decided.iter().any(|d| d.accepted == accepted && d.kind == kind && d.detail == change.detail) {
+                return Ok(());
+            }
             choices.decided.retain(|d| !(d.kind == kind && d.detail == change.detail));
-            choices.decided.push(Decided {
-                accepted: decision == "accept",
-                kind: kind.into(),
-                detail: change.detail.clone(),
-                why: change.why,
-                at: now,
-            });
+            choices.decided.push(Decided { accepted, kind: kind.into(), detail: change.detail.clone(), why: change.why, at: now });
             if let Some(r) = &mut last {
                 r.proposals.retain(|p| !same(p, kind, &change.detail));
             }
@@ -1176,6 +1177,30 @@ esac
         assert!(doc.contains("## Next\n\n- merge"), "{doc}");
         assert!(section(&logbook, &all, "../x", "ci").is_err());
         assert!(section(&logbook, &all, &second.id, "nope").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_same_decision_again_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logbook = tmp.path().join("logbook");
+        let files = Mutex::new(());
+        let accept = r#"{"decision":"accept","kind":"split","detail":"Panacamera out","why":"own app"}"#;
+        let decided = || config::read_json::<Choices>(&choices_path(&logbook)).unwrap().unwrap().decided;
+        change(&logbook, &files, accept, 10).await.unwrap();
+        change(&logbook, &files, r#"{"decision":"accept","kind":"move","detail":"s to p","why":""}"#, 11).await.unwrap();
+
+        // A second app sends the same accept later: kept as it was, in its place.
+        change(&logbook, &files, accept, 20).await.unwrap();
+        let after = decided();
+        assert_eq!(after.iter().map(|d| (d.kind.as_str(), d.at)).collect::<Vec<_>>(), [("split", 10), ("move", 11)]);
+
+        // A different decision on the same proposal still replaces it.
+        change(&logbook, &files, r#"{"decision":"reject","kind":"split","detail":"Panacamera out","why":""}"#, 30).await.unwrap();
+        let after = decided();
+        assert_eq!(
+            after.iter().map(|d| (d.kind.as_str(), d.accepted, d.at)).collect::<Vec<_>>(),
+            [("move", true, 11), ("split", false, 30)]
+        );
     }
 
     #[test]
