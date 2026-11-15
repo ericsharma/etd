@@ -317,7 +317,16 @@ mod tests {
         let err = DaemonLock::take(&paths).err().expect("second lock");
         assert!(format!("{err:#}").contains("another etd already runs"), "{err:#}");
         drop(first);
-        DaemonLock::take(&paths).expect("free again after the first one ends");
+        // Other tests start processes in parallel threads. A child forked while `first` was
+        // open holds a copy of its descriptor, and so the flock, until it execs (close-on-exec).
+        // Allow it that moment: CI failed here once, 2026-11-15.
+        let again = (0..50).find_map(|_| {
+            DaemonLock::take(&paths).ok().or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                None
+            })
+        });
+        again.expect("free again after the first one ends");
         let other = tempfile::tempdir().unwrap();
         DaemonLock::take(&Paths::at(other.path().into())).expect("other files, other lock");
     }
